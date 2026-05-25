@@ -7,8 +7,12 @@
   "properties": {
     "schema_version": {
       "type": "string",
-      "description": "Schema semver. 1.0 = base export. 1.1 = adds is_group/participants/include_system_messages.",
-      "enum": ["1.0", "1.1"]
+      "description": "Schema semver. 1.0 = base. 1.1 = is_group/participants/include_system_messages. 1.2 = external_id + client_id (required by Mikoshi REST ingest).",
+      "enum": ["1.0", "1.1", "1.2"]
+    },
+    "client_id": {
+      "type": "string",
+      "description": "1.2+: identifier for the macOS host pushing the export (hostname or env MIKOSHI_CLIENT_ID). Audit trail only."
     },
     "exported_at": { "type": "string", "format": "date-time" },
     "mode": { "type": "string", "enum": ["incremental", "full", "full-contact"] },
@@ -61,11 +65,15 @@
     },
     "message": {
       "type": "object",
-      "required": ["id", "timestamp", "is_from_me"],
+      "required": ["id", "external_id", "timestamp", "is_from_me"],
       "properties": {
         "id": {
           "type": "integer",
-          "description": "Stable PK from ZWAMESSAGE.Z_PK. Use for upsert dedup."
+          "description": "Stable PK from ZWAMESSAGE.Z_PK. Use for upsert dedup (legacy v1.0/1.1; superseded by external_id)."
+        },
+        "external_id": {
+          "type": "string",
+          "description": "1.2+: Mikoshi-side stable id, encoded as 'ios:<Z_PK>'. The server uses it as platform_message_id for idempotency."
         },
         "timestamp": { "type": ["string", "null"], "format": "date-time" },
         "from_jid": { "type": ["string", "null"] },

@@ -1,37 +1,47 @@
 # mikoshi-whatsapp-sync
 
-WhatsApp → Mikoshi data pipeline. Two components:
+WhatsApp → Mikoshi push pipeline. Runs on a macOS host, extracts an iPhone
+WhatsApp backup, and pushes the result to a Mikoshi server's REST ingest API.
 
-| Component | Where it runs | What it does |
-|---|---|---|
-| **[whatsapp_export/](whatsapp_export/)** | macOS (your Mac, alongside the iPhone) | Backs up the iPhone, decrypts WhatsApp's `ChatStorage.sqlite`, exports a schema-validated JSON + filtered attachments, rsyncs to the Mikoshi server. |
-| **[server/](server/)** | Mikoshi server (Linux) | Watches the rsync target dir, validates each JSON, upserts into PostgreSQL, stores attachments in a bucketed media tree. |
+The server side lives **inside Mikoshi** itself (`src/ingestion/`, exposed at
+`/api/ingest/v1/*`). There is no standalone server component in this repo.
 
-The two halves communicate via [`whatsapp_export/schema.json`](whatsapp_export/schema.json) — the only contract. Bump its `schema_version` to coordinate breaking changes.
+| Stage | What it does |
+|---|---|
+| `setup.sh` | Installs `libimobiledevice`, Python deps. |
+| `run_pipeline.sh` | Orchestrates: device backup → decrypt → extract → push. |
+| `extract_messages.py` | Reads `ChatStorage.sqlite`, writes a v1.2 manifest + sha256-keyed attachments. |
+| `push_via_api.py` | Submits the manifest → uploads missing media → commits. |
 
 ## Quick start
 
 ```bash
-# macOS side
 cd whatsapp_export
 bash setup.sh
 bash verify_setup.sh
-# (store backup password in Keychain, edit ~/.whatsapp_export.conf)
-bash run_pipeline.sh
-
-# Linux side (on Mikoshi server)
-cd server
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-psql $DATABASE_URL -f migrations/001_init.sql
-cp .env.example /etc/mikoshi/ingestor.env  # edit
-python -m mikoshi_ingestor.cli ingest --once   # or --watch
+# Configure: ~/.mikoshi-ingest.conf
+#   MIKOSHI_URL=https://your-mikoshi.example.com
+#   MIKOSHI_TOKEN=<paste from /accounts/<id>/ingestion in Mikoshi>
+bash run_pipeline.sh                                  # incremental sync
+bash run_pipeline.sh --mode full-contact --contact "Alice"   # one chat
+bash run_pipeline.sh --mode full                      # everything
 ```
 
-Detailed docs:
-- macOS pipeline: [whatsapp_export/README.md](whatsapp_export/README.md), [whatsapp_export/QUICKSTART.md](whatsapp_export/QUICKSTART.md)
-- Mikoshi ingestor: [server/README.md](server/README.md)
-- Plan / roadmap: `~/.claude/plans/whatsapp-export-pipeline.md`
+The Mikoshi server is the **only opinionated piece**: it validates the
+manifest, dedupes media by content hash, persists messages with
+account-scoped attribution, and queues them for the configured AI scan
+(transcription, vision, observer memory). Mikoshi-side config lives at
+`/accounts/<id>/ingestion/edit` (token, filters, AI overrides, cron).
+
+Re-pushing the same export is safe — the server is idempotent on
+`(account_id, external_id)` per message and on `content_hash` per media file.
+
+## Schema
+
+[`whatsapp_export/schema.json`](whatsapp_export/schema.json) — JSON Schema
+1.2. Bumped from 1.1 to add `external_id` (per-message stable id derived
+from `ZWAMESSAGE.Z_PK`) and `client_id` (sending hostname). Earlier
+versions are rejected by the Mikoshi REST API.
 
 ## Tests
 
@@ -39,5 +49,3 @@ Detailed docs:
 source whatsapp_export/.venv/bin/activate
 python -m pytest -v
 ```
-
-30 tests cover: timestamp conversion, attachment filters (no video, ≤5MB), sha256 dedup, incremental/full/full-contact sync, group participants, system-message filtering, schema conformance, validation, attachment storage idempotency.

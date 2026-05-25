@@ -299,25 +299,42 @@ secure_cleanup() {
 
 sync_remote() {
     if [[ "$SKIP_SYNC" == true ]]; then
-        log "=== PHASE 6: Remote Sync (SKIPPED) ==="
+        log "=== PHASE 6: Mikoshi REST push (SKIPPED) ==="
         return 0
     fi
 
-    log "=== PHASE 6: Remote Sync to Mikoshi ==="
-    if [[ -z "${SSH_HOST:-}" || -z "${SSH_USER:-}" || -z "${SSH_PATH:-}" ]]; then
-        warn "SSH_HOST/USER/PATH not configured — skipping rsync."
+    log "=== PHASE 6: Mikoshi REST push ==="
+
+    # Config: ~/.mikoshi-ingest.conf or env. Required: MIKOSHI_URL, MIKOSHI_TOKEN.
+    if [[ -z "${MIKOSHI_URL:-}" || -z "${MIKOSHI_TOKEN:-}" ]]; then
+        local conf="${HOME}/.mikoshi-ingest.conf"
+        if [[ -f "$conf" ]]; then
+            # shellcheck disable=SC1090
+            source "$conf"
+        fi
+    fi
+    if [[ -z "${MIKOSHI_URL:-}" || -z "${MIKOSHI_TOKEN:-}" ]]; then
+        warn "MIKOSHI_URL / MIKOSHI_TOKEN not configured — skipping push."
         return 0
     fi
 
-    log "Syncing to $SSH_USER@$SSH_HOST:$SSH_PATH"
-    if rsync -avz --checksum \
-        -e "ssh -o StrictHostKeyChecking=accept-new" \
-        "$EXPORTS_DIR/" \
-        "${SSH_USER}@${SSH_HOST}:${SSH_PATH}/"; then
-        log "✓ Remote sync OK"
+    # Manifest is the most-recent export JSON written this run.
+    local manifest
+    manifest=$(ls -t "$EXPORTS_DIR"/whatsapp_export_*.json 2>/dev/null | head -1)
+    if [[ -z "$manifest" || ! -f "$manifest" ]]; then
+        error "No manifest found in $EXPORTS_DIR"
+        return 1
+    fi
+
+    log "Pushing $manifest to $MIKOSHI_URL"
+    if MIKOSHI_URL="$MIKOSHI_URL" MIKOSHI_TOKEN="$MIKOSHI_TOKEN" \
+        python3 "$SCRIPT_DIR/push_via_api.py" \
+            --manifest "$manifest" \
+            --attachments-dir "$ATTACHMENTS_DIR"; then
+        log "✓ Mikoshi push OK"
         SYNC_SUCCEEDED=true
     else
-        error "rsync failed"
+        error "Mikoshi push failed"
         return 1
     fi
 }

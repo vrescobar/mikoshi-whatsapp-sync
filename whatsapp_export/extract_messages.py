@@ -20,6 +20,8 @@ Sync modes:
 import argparse
 import hashlib
 import json
+import os
+import platform
 import shutil
 import sqlite3
 import sys
@@ -213,7 +215,8 @@ def extract_messages(
     new_state = dict(sync_state.get("chats", {}))
 
     export = {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
+        "client_id": os.environ.get("MIKOSHI_CLIENT_ID", platform.node() or "macos-client"),
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "mode": mode,
         "target_contact": target_contact,
@@ -289,6 +292,7 @@ def extract_messages(
 
             msg_obj = {
                 "id": m["msg_pk"],
+                "external_id": f"ios:{m['msg_pk']}",
                 "timestamp": ios_timestamp_to_iso(msg_ts),
                 "from_jid": m["from_jid"],
                 "to_jid": m["to_jid"],
