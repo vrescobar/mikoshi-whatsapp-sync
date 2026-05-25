@@ -177,12 +177,14 @@ if [[ "$TEMP_DIR_IS_EXTERNAL" == true ]]; then
     fi
 fi
 
+# Legacy SSH/rsync config — only kept for back-compat. The modern flow uses
+# MIKOSHI_URL/MIKOSHI_TOKEN from ~/.mikoshi-ingest.conf, loaded above.
+# Silently source if present; don't warn when absent (the legacy file is
+# expected to be missing on new installs).
 if [[ -f "$CONFIG_FILE" ]]; then
     # shellcheck disable=SC1090
     source "$CONFIG_FILE"
-    log "Configuration loaded from $CONFIG_FILE"
-else
-    warn "$CONFIG_FILE not found. Remote sync will be skipped."
+    log "Legacy SSH config loaded from $CONFIG_FILE"
 fi
 
 cleanup() {
