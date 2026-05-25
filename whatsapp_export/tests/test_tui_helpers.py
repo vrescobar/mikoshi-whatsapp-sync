@@ -210,6 +210,36 @@ class TestListChatsFromDb:
         assert rows[0]["jid"] == "b@s.whatsapp.net"
 
 
+# ─── _dir_size_gb (du wrapper) ─────────────────────────────────────────────
+
+class TestDirSizeGb:
+    def setup_method(self):
+        sys.modules.pop("tui", None)
+        import tui
+        self.tui = tui
+
+    def test_small_dir(self, tmp_path):
+        (tmp_path / "a").write_bytes(b"x" * 1024)
+        result = self.tui._dir_size_gb(tmp_path)
+        # Should be ≪ 1 GB, format "X.X MB"
+        assert "MB" in result or "GB" in result
+
+    def test_nonexistent_path_no_crash(self, tmp_path):
+        result = self.tui._dir_size_gb(tmp_path / "nope")
+        # du errors out → friendly fallback, not exception
+        assert isinstance(result, str)
+
+    def test_timeout_returns_placeholder(self, tmp_path, monkeypatch):
+        import subprocess
+
+        def fake_run(*args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd="du", timeout=0.01)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        result = self.tui._dir_size_gb(tmp_path, timeout=0.01)
+        assert "computing" in result or "large" in result
+
+
 # ─── ACTIONS / main loop invariants ────────────────────────────────────────
 
 class TestActionsTable:

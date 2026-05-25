@@ -136,45 +136,105 @@ def pause():
 
 # ─── actions ───────────────────────────────────────────────────────────────
 
+def _dir_size_gb(path: Path, timeout: float = 5.0) -> str:
+    """
+    Return human-readable size of `path` using `du -sk`. Capped by timeout
+    because a 200 GB backup on an external SSD with a slow file system can
+    take minutes to walk via Python's stat().
+    """
+    try:
+        result = subprocess.run(
+            ["du", "-sk", str(path)],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode != 0:
+            return "[dim](du failed)[/]"
+        kb = int(result.stdout.split()[0])
+        gb = kb / (1024 * 1024)
+        if gb >= 1:
+            return f"{gb:.1f} GB"
+        return f"{kb / 1024:.1f} MB"
+    except subprocess.TimeoutExpired:
+        return "[dim](still computing — large backup)[/]"
+    except Exception as e:
+        return f"[dim](error: {e})[/]"
+
+
 def action_status():
+    """Render the pipeline status table.
+
+    Order matters: render text-only fields first, then expensive disk
+    measurements (du). With Rich's Live wrapper the user sees progress as
+    rows fill in instead of staring at a blank screen.
+    """
+    from rich.live import Live
+
     cfg = load_ingest_conf()
     table = Table(title="Pipeline status", show_header=False, box=None)
     table.add_column("Key", style="cyan")
     table.add_column("Value")
 
-    table.add_row("Config file", str(INGEST_CONF) + (" ✓" if INGEST_CONF.exists() else " ✗ (missing)"))
+    # ── Fast fields (in-memory / single file stat) ─────────────────────────
+    table.add_row("Config file",
+                  str(INGEST_CONF) + (" ✓" if INGEST_CONF.exists() else " ✗ (missing)"))
     table.add_row("MIKOSHI_URL", cfg.get("MIKOSHI_URL", "[red]not set[/]"))
-    table.add_row("MIKOSHI_TOKEN", "[green]set[/]" if cfg.get("MIKOSHI_TOKEN") else "[red]not set[/]")
+    table.add_row("MIKOSHI_TOKEN",
+                  "[green]set[/]" if cfg.get("MIKOSHI_TOKEN") else "[red]not set[/]")
     bdir = get_backup_dir(cfg)
-    table.add_row("MIKOSHI_BACKUP_DIR", str(bdir) if bdir else "[dim](local temp/)[/]")
-
-    if bdir and bdir.exists():
-        backup_root = bdir / "backup"
-        if backup_root.exists():
-            udids = [d for d in backup_root.iterdir() if d.is_dir() and len(d.name) > 20]
-            for u in udids:
-                size_gb = sum(f.stat().st_size for f in u.rglob("*") if f.is_file()) / (1024**3)
-                table.add_row(f"  Backup {u.name[:12]}", f"{size_gb:.1f} GB")
+    table.add_row("MIKOSHI_BACKUP_DIR",
+                  str(bdir) if bdir else "[dim](local temp/)[/]")
 
     db = find_existing_chatstorage()
     table.add_row("Decrypted ChatStorage", str(db) if db else "[dim]none[/]")
 
     if STATE_FILE.exists():
-        state = json.loads(STATE_FILE.read_text())
-        table.add_row("Last global sync", state.get("last_global_sync", "—"))
-        table.add_row("Chats with cursor", str(len(state.get("chats", {}))))
+        try:
+            state = json.loads(STATE_FILE.read_text())
+            table.add_row("Last global sync", state.get("last_global_sync") or "—")
+            table.add_row("Chats with cursor", str(len(state.get("chats", {}))))
+        except Exception as e:
+            table.add_row("Sync state", f"[red]corrupt: {e}[/]")
+    else:
+        table.add_row("Last global sync", "[dim]never[/]")
 
     exports = sorted(EXPORTS_DIR.glob("whatsapp_export_*.json"))
-    table.add_row("Local exports", f"{len(exports)} files" if exports else "[dim]none[/]")
+    table.add_row("Local exports",
+                  f"{len(exports)} files" if exports else "[dim]none[/]")
 
     try:
         import favorites as _favs
         fav_count = len(_favs.load().get("favorites", []))
-        table.add_row("Favorites", f"{fav_count} chat(s)" if fav_count else "[dim]none[/]")
+        table.add_row("Favorites",
+                      f"{fav_count} chat(s)" if fav_count else "[dim]none[/]")
     except Exception:
         pass
 
-    console.print(table)
+    # Render the cheap portion immediately, then live-update with backup sizes.
+    udids: list[Path] = []
+    if bdir and bdir.exists():
+        backup_root = bdir / "backup"
+        if backup_root.exists():
+            udids = [d for d in backup_root.iterdir()
+                     if d.is_dir() and len(d.name) > 20]
+            for u in udids:
+                table.add_row(f"  Backup {u.name[:12]}", "[dim]measuring…[/]")
+
+    if not udids:
+        console.print(table)
+        pause()
+        return
+
+    # Stream `du` results into the table without re-rendering the whole screen.
+    with Live(table, console=console, refresh_per_second=4, transient=False) as live:
+        for i, u in enumerate(udids):
+            # The backup rows start after the "fixed" rows; locate them by name
+            size = _dir_size_gb(u)
+            # Rich's Table doesn't expose row updates, so rebuild that row.
+            # Simplest: keep a separate index. We know the order of udids.
+            row_idx = len(table.rows) - len(udids) + i
+            table.columns[1]._cells[row_idx] = size
+            live.refresh()
+
     pause()
 
 
