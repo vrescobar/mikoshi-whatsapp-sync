@@ -181,6 +181,7 @@ def extract_messages(
     mode="incremental",
     target_contact=None,
     include_system=False,
+    favorite_jids=None,
 ):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -195,19 +196,33 @@ def extract_messages(
         FROM ZWACHATSESSION
         WHERE ZCONTACTJID IS NOT NULL
     """
+    params: tuple = ()
     if mode == "full-contact" and target_contact:
         chats_query += " AND (ZPARTNERNAME LIKE ? OR ZCONTACTJID LIKE ?)"
-        chats = cursor.execute(
-            chats_query, (f"%{target_contact}%", f"%{target_contact}%")
-        ).fetchall()
-    else:
-        chats = cursor.execute(chats_query).fetchall()
+        params = (f"%{target_contact}%", f"%{target_contact}%")
+
+    if favorite_jids:
+        placeholders = ",".join("?" * len(favorite_jids))
+        chats_query += f" AND ZCONTACTJID IN ({placeholders})"
+        params = params + tuple(favorite_jids)
+        print(f"[INFO] Filtering to {len(favorite_jids)} favorite(s)")
+
+    chats = cursor.execute(chats_query, params).fetchall()
 
     if not chats:
         print("[ERROR] No chats found", file=sys.stderr)
         if target_contact:
             print(f"[ERROR] Searched for contact: {target_contact}", file=sys.stderr)
+        if favorite_jids:
+            print(f"[ERROR] None of the {len(favorite_jids)} favorite JIDs matched any chat",
+                  file=sys.stderr)
         return None
+
+    if favorite_jids and len(chats) < len(favorite_jids):
+        missing = set(favorite_jids) - {c["jid"] for c in chats}
+        print(f"[WARN] {len(missing)} favorite JID(s) not found in this backup: "
+              f"{', '.join(list(missing)[:3])}{'...' if len(missing) > 3 else ''}",
+              file=sys.stderr)
 
     print(f"[INFO] Processing {len(chats)} chat(s)")
 
@@ -382,6 +397,12 @@ def main():
         action="store_true",
         help="Include WhatsApp system messages (group events, encryption notices, etc.)",
     )
+    parser.add_argument(
+        "--favorites-file",
+        type=Path,
+        help="Path to favorites JSON; if set, restrict extraction to those JIDs. "
+             "Empty list aborts with exit 2.",
+    )
 
     args = parser.parse_args()
 
@@ -391,6 +412,16 @@ def main():
     if not args.db.exists():
         print(f"[ERROR] DB not found: {args.db}", file=sys.stderr)
         sys.exit(1)
+
+    favorite_jids = None
+    if args.favorites_file:
+        # Defer import so the rest of the script doesn't depend on favorites.py
+        import favorites as _favs
+        favorite_jids = _favs.jids(args.favorites_file)
+        if not favorite_jids:
+            print(f"[ERROR] Favorites file has no entries: {args.favorites_file}",
+                  file=sys.stderr)
+            sys.exit(2)
 
     sync_state = load_sync_state(args.state_file)
 
@@ -407,6 +438,7 @@ def main():
         mode=args.mode,
         target_contact=args.contact,
         include_system=args.include_system,
+        favorite_jids=favorite_jids,
     )
 
     if new_chats_state is None:

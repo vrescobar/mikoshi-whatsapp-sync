@@ -15,14 +15,22 @@ brew --version
 python3 --version  # Should be 3.8+
 ```
 
-## Step 2: Enable iPhone WiFi Sync (2 min)
+## Step 2: Trust the Mac & enable WiFi Sync (2 min)
 
-On your **iPhone**:
-1. Go to **Settings**
-2. Scroll to **General**
-3. Tap **AirDrop & Handoff**
-4. Toggle **WiFi Sync** to **ON**
-5. Make sure your iPhone is on the same WiFi as your Mac
+WiFi Sync is configured from the **Mac**, not from the iPhone. For the very
+first time you need a **USB cable**:
+
+1. Connect iPhone to Mac with USB
+2. Open **Finder** on the Mac
+3. Select the iPhone in the sidebar
+4. If prompted, tap **Trust** on the iPhone and enter the passcode
+5. In tab **General**, tick **"Show this iPhone when on Wi-Fi"** → click **Apply**
+6. Still in tab **General** → Backups section, enable **"Encrypt local backup"**
+   if it isn't already (this is what the pipeline reads). Save the password in
+   your password manager — you'll store the same one in Keychain in Step 4.
+
+After this setup, you can disconnect USB and run the pipeline over WiFi.
+**Tip:** for your first backup, leave USB connected — it's ~3× faster than WiFi.
 
 ## Step 3: Install Dependencies (2 min)
 

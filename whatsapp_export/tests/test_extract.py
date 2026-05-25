@@ -108,6 +108,7 @@ def run_extract(db, root, out, atts, state_file, **kwargs):
         mode=kwargs.get("mode", "incremental"),
         target_contact=kwargs.get("target_contact"),
         include_system=kwargs.get("include_system", False),
+        favorite_jids=kwargs.get("favorite_jids"),
     )
     if new_chats_state is not None:
         state["chats"] = new_chats_state
@@ -129,14 +130,19 @@ class TestFullSync:
         assert result["stats"]["total_messages"] == 7
         assert result["stats"]["system_messages_skipped"] == 1
 
-    def test_schema_version_is_1_1(
+    def test_schema_version_is_current(
         self, synthetic_db, extracted_root, output_path, attachments_dir, state_file
     ):
         result = run_extract(
             synthetic_db, extracted_root, output_path, attachments_dir, state_file,
             mode="full",
         )
-        assert result["schema_version"] == "1.1"
+        assert result["schema_version"] == "1.2"
+        # v1.2 adds client_id (audit trail) and external_id on each message
+        assert result["client_id"]
+        for chat in result["chats"]:
+            for msg in chat["messages"]:
+                assert msg["external_id"] == f"ios:{msg['id']}"
 
 
 class TestIncrementalSync:
@@ -282,3 +288,94 @@ class TestSchemaConformance:
         schema = json.loads(schema_path.read_text())
         data = json.loads(output_path.read_text())
         jsonschema.Draft7Validator(schema).validate(data)
+
+
+# ─── Favorites filter ──────────────────────────────────────────────────────
+
+class TestFavoritesFilter:
+    def test_filters_to_jid_list(
+        self, synthetic_db, extracted_root, output_path, attachments_dir, state_file
+    ):
+        # Restrict to Bob only — Alice and group should be excluded
+        result = run_extract(
+            synthetic_db, extracted_root, output_path, attachments_dir, state_file,
+            mode="full",
+            favorite_jids=["bob@s.whatsapp.net"],
+        )
+        assert result["stats"]["total_chats"] == 1
+        assert result["chats"][0]["jid"] == "bob@s.whatsapp.net"
+
+    def test_multiple_jids(
+        self, synthetic_db, extracted_root, output_path, attachments_dir, state_file
+    ):
+        result = run_extract(
+            synthetic_db, extracted_root, output_path, attachments_dir, state_file,
+            mode="full",
+            favorite_jids=["alice@s.whatsapp.net", "12345@g.us"],
+        )
+        jids = {c["jid"] for c in result["chats"]}
+        assert jids == {"alice@s.whatsapp.net", "12345@g.us"}
+
+    def test_unknown_jid_silently_skipped(
+        self, synthetic_db, extracted_root, output_path, attachments_dir, state_file
+    ):
+        # Bob exists, the other one doesn't — should still succeed with just Bob
+        result = run_extract(
+            synthetic_db, extracted_root, output_path, attachments_dir, state_file,
+            mode="full",
+            favorite_jids=["bob@s.whatsapp.net", "ghost@s.whatsapp.net"],
+        )
+        assert result["stats"]["total_chats"] == 1
+        assert result["chats"][0]["jid"] == "bob@s.whatsapp.net"
+
+    def test_all_unknown_jids_returns_none(
+        self, synthetic_db, extracted_root, output_path, attachments_dir, state_file
+    ):
+        from extract_messages import extract_messages, load_sync_state
+        state = load_sync_state(state_file)
+        result = extract_messages(
+            db_path=synthetic_db,
+            extracted_root=extracted_root,
+            output_path=output_path,
+            attachments_dir=attachments_dir,
+            sync_state=state,
+            mode="full",
+            favorite_jids=["ghost1@s.whatsapp.net", "ghost2@s.whatsapp.net"],
+        )
+        assert result is None  # extract_messages signals "nothing extracted"
+
+
+class TestFavoritesModule:
+    def test_add_and_remove(self, tmp_path):
+        import favorites
+        f = tmp_path / "favs.json"
+
+        added = favorites.add(
+            [
+                {"jid": "alice@s.whatsapp.net", "name": "Alice"},
+                {"jid": "bob@s.whatsapp.net", "name": "Bob"},
+            ],
+            file=f,
+        )
+        assert added == 2
+        assert set(favorites.jids(f)) == {"alice@s.whatsapp.net", "bob@s.whatsapp.net"}
+
+        # Re-adding Alice is a no-op
+        again = favorites.add([{"jid": "alice@s.whatsapp.net", "name": "Alice"}], file=f)
+        assert again == 0
+
+        removed = favorites.remove(["bob@s.whatsapp.net"], file=f)
+        assert removed == 1
+        assert favorites.jids(f) == ["alice@s.whatsapp.net"]
+
+    def test_load_missing_file(self, tmp_path):
+        import favorites
+        data = favorites.load(tmp_path / "nonexistent.json")
+        assert data == {"version": 1, "updated_at": None, "favorites": []}
+
+    def test_clear(self, tmp_path):
+        import favorites
+        f = tmp_path / "favs.json"
+        favorites.add([{"jid": "x@s.whatsapp.net", "name": "X"}], file=f)
+        assert favorites.clear(f) == 1
+        assert favorites.jids(f) == []

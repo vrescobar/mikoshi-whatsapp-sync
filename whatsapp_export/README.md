@@ -74,7 +74,19 @@ whatsapp_export/
 
 ## Initial Setup
 
-### 1. Enable WiFi Sync on iPhone
+### 1. Enable WiFi Sync (from the Mac, not the iPhone)
+
+First time requires a USB cable:
+
+1. Connect iPhone via USB
+2. Open Finder → select iPhone in sidebar → Trust if prompted
+3. Tab **General** → tick **"Show this iPhone when on Wi-Fi"** → Apply
+4. Same tab → tick **"Encrypt local backup"** and set a password (this is the
+   password you'll store in Keychain in step 2)
+
+Subsequent runs work over WiFi as long as both devices are on the same network.
+
+<!-- Legacy instructions (obsolete on modern iOS): -->
 
 ```
 iPhone Settings → General → AirDrop & Handoff → WiFi Sync → Enable

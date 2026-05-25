@@ -10,7 +10,8 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${HOME}/.whatsapp_export.conf"
+CONFIG_FILE="${HOME}/.whatsapp_export.conf"           # legacy rsync flow
+INGEST_CONF="${MIKOSHI_INGEST_CONF:-${HOME}/.mikoshi-ingest.conf}"  # HTTP API flow
 
 pass() {
     echo -e "${GREEN}✓${NC} $1"
@@ -173,7 +174,9 @@ if command -v idevice_id &> /dev/null; then
         echo ""
         echo "  This is OK if you haven't connected yet. Make sure:"
         echo "  1. iPhone and Mac are on same WiFi"
-        echo "  2. WiFi Sync is enabled: iPhone Settings > General > AirDrop & Handoff > WiFi Sync"
+        echo "  2. For the first run, connect iPhone via USB cable (easier)"
+        echo "  3. To enable WiFi sync later: connect via USB, open Finder on Mac,"
+        echo "     select iPhone in sidebar, tab 'General', tick 'Show this iPhone when on Wi-Fi'"
         echo "  3. iPhone is unlocked"
         echo ""
     fi
@@ -181,39 +184,60 @@ else
     warn "idevice_id not available (will be ready after setup.sh)"
 fi
 
-# Remote sync configuration
+# Remote sync configuration — Mikoshi HTTP ingest (current) or rsync (legacy)
 echo ""
 echo "Remote Sync Configuration:"
 echo ""
 
-if [[ -f "$CONFIG_FILE" ]]; then
-    source "$CONFIG_FILE"
-    pass "Configuration file found: $CONFIG_FILE"
-
-    if [[ -n "${SSH_HOST:-}" ]]; then
-        pass "SSH_HOST configured: $SSH_HOST"
-        info "SSH_USER: ${SSH_USER:-not set}"
-        info "SSH_PATH: ${SSH_PATH:-not set}"
-
-        # Test SSH connection
-        if ssh -o ConnectTimeout=3 "$SSH_USER@$SSH_HOST" echo "SSH connection OK" &>/dev/null; then
-            pass "SSH connection successful"
-        else
-            warn "Cannot connect to SSH server"
-            echo ""
-            echo "  To test manually:"
-            echo "  ssh $SSH_USER@$SSH_HOST echo 'test'"
-            echo ""
+# Preferred: HTTP push to Mikoshi
+if [[ -f "$INGEST_CONF" ]] || [[ -n "${MIKOSHI_URL:-}" && -n "${MIKOSHI_TOKEN:-}" ]]; then
+    if [[ -f "$INGEST_CONF" ]]; then
+        # Use env -i + parse so we don't pollute the current shell
+        MIKOSHI_URL=$(grep -E '^MIKOSHI_URL=' "$INGEST_CONF" | head -1 | cut -d= -f2- | tr -d '"' )
+        MIKOSHI_TOKEN=$(grep -E '^MIKOSHI_TOKEN=' "$INGEST_CONF" | head -1 | cut -d= -f2- | tr -d '"' )
+        pass "Mikoshi ingest config found: $INGEST_CONF"
+        # Permission check — token should not be world-readable
+        perm=$(stat -f '%Lp' "$INGEST_CONF" 2>/dev/null || stat -c '%a' "$INGEST_CONF" 2>/dev/null)
+        if [[ "$perm" != "600" ]]; then
+            warn "  Permissions are $perm; recommend 'chmod 600 $INGEST_CONF' (contains a token)"
         fi
     else
-        warn "SSH_HOST not configured (remote sync will be skipped)"
+        pass "Mikoshi ingest config via environment variables"
     fi
+
+    if [[ -n "${MIKOSHI_URL:-}" ]]; then
+        info "MIKOSHI_URL: $MIKOSHI_URL"
+        if curl -sS -o /dev/null -m 5 -w "%{http_code}" "$MIKOSHI_URL" 2>/dev/null | grep -qE '^[23]'; then
+            pass "Mikoshi server reachable"
+        else
+            warn "Could not reach $MIKOSHI_URL (server down, DNS, or VPN?)"
+        fi
+    else
+        warn "MIKOSHI_URL not set"
+    fi
+
+    if [[ -n "${MIKOSHI_TOKEN:-}" ]]; then
+        pass "MIKOSHI_TOKEN is set (${#MIKOSHI_TOKEN} chars)"
+    else
+        warn "MIKOSHI_TOKEN not set"
+    fi
+elif [[ -f "$CONFIG_FILE" ]]; then
+    # Legacy rsync flow — still supported but discouraged
+    source "$CONFIG_FILE"
+    warn "Legacy rsync config detected: $CONFIG_FILE"
+    info "  Project now uses HTTP push (push_via_api.py). Migrate when convenient:"
+    info "  see whatsapp_export/push_via_api.py for MIKOSHI_URL/MIKOSHI_TOKEN."
 else
-    warn "Configuration file not found: $CONFIG_FILE"
+    warn "No Mikoshi config found"
     echo ""
-    echo "  This is optional. To enable remote sync, create it:"
-    echo "  cp .whatsapp_export.conf.example ~/.whatsapp_export.conf"
-    echo "  # Then edit with your SSH details"
+    echo "  To push exports to your Mikoshi server, create ~/.mikoshi-ingest.conf:"
+    echo ""
+    echo "      MIKOSHI_URL=https://mikoshi.your-domain.com"
+    echo "      MIKOSHI_TOKEN=<generate-from-/accounts/<id>/ingestion-on-mikoshi>"
+    echo ""
+    echo "  Then: chmod 600 ~/.mikoshi-ingest.conf"
+    echo ""
+    echo "  This is optional — you can run --skip-remote-sync to test locally first."
     echo ""
 fi
 

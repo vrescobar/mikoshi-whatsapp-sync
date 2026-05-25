@@ -93,6 +93,8 @@ python3 -m pip install \
     pycryptodomex \
     jsonschema \
     pytest \
+    rich \
+    questionary \
     2>&1 | tee -a "$SETUP_LOG"
 
 # Verify installations
