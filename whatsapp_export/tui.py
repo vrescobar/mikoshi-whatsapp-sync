@@ -42,7 +42,13 @@ IOS_EPOCH = 978307200
 # ─── helpers ───────────────────────────────────────────────────────────────
 
 def load_ingest_conf() -> dict:
-    """Mirror the bash logic: read KEY=VALUE lines from ~/.mikoshi-ingest.conf."""
+    """Mirror the bash logic: read KEY=VALUE lines from ~/.mikoshi-ingest.conf.
+
+    Also exports each value to os.environ so that subprocess children
+    (explore_backup.py, push_via_api.py, run_pipeline.sh) inherit them
+    even when tui.py is launched directly without going through the
+    mikoshi-whatsapp.sh wrapper.
+    """
     cfg = {}
     if INGEST_CONF.exists():
         for line in INGEST_CONF.read_text().splitlines():
@@ -52,12 +58,20 @@ def load_ingest_conf() -> dict:
             if "=" in line:
                 k, v = line.split("=", 1)
                 cfg[k.strip()] = v.strip().strip('"').strip("'")
-    # Env vars override file
+    # Env vars take precedence over file values
     for key in ("MIKOSHI_URL", "MIKOSHI_TOKEN", "MIKOSHI_BACKUP_DIR",
-                "MIKOSHI_CLIENT_ID", "KEEP_LOCAL_EXPORTS"):
+                "MIKOSHI_CLIENT_ID", "KEEP_LOCAL_EXPORTS",
+                "MIKOSHI_FAVORITES_FILE"):
         if os.environ.get(key):
             cfg[key] = os.environ[key]
+        elif cfg.get(key):
+            # File-provided value: export so children inherit
+            os.environ[key] = cfg[key]
     return cfg
+
+
+# Eager load on import so the env is set before any subprocess fires
+load_ingest_conf()
 
 
 def get_backup_dir(cfg: dict) -> Path | None:
@@ -543,6 +557,12 @@ ACTIONS = [
 ]
 
 
+# Sentinel for explicit-Exit so we can distinguish it from ESC/Ctrl+C (None).
+# Using None for both made `choice()` get called with a non-callable string
+# when use_shortcuts=True returned the shortcut key for the Exit row.
+_EXIT_SENTINEL = "__exit__"
+
+
 def main():
     while True:
         console.clear()
@@ -554,12 +574,18 @@ def main():
         choice = questionary.select(
             "What do you want to do?",
             choices=[Choice(title=label, value=fn) for label, fn in ACTIONS]
-                    + [Choice(title="🚪  Exit", value=None)],
+                    + [Choice(title="🚪  Exit", value=_EXIT_SENTINEL)],
             use_shortcuts=True,
         ).ask()
 
-        if choice is None:
+        # User hit ESC / Ctrl+C, or picked Exit, or somehow got a non-callable.
+        if choice is None or choice == _EXIT_SENTINEL:
             break
+        if not callable(choice):
+            # Defensive: questionary occasionally hands back a shortcut string
+            # when use_shortcuts is enabled. Don't crash; warn and re-prompt.
+            console.print(f"[yellow]Unexpected selection: {choice!r}[/]")
+            continue
         try:
             choice()
         except KeyboardInterrupt:

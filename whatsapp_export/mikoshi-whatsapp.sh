@@ -57,6 +57,16 @@ activate_venv() {
     fi
 }
 
+# Load ~/.mikoshi-ingest.conf so child processes (tui.py, run_pipeline.sh,
+# explore_backup.py, ...) all inherit MIKOSHI_URL / TOKEN / BACKUP_DIR / etc.
+INGEST_CONF="${MIKOSHI_INGEST_CONF:-${HOME}/.mikoshi-ingest.conf}"
+if [[ -f "$INGEST_CONF" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$INGEST_CONF"
+    set +a
+fi
+
 favorites_file() {
     echo "${MIKOSHI_FAVORITES_FILE:-${HOME}/.mikoshi-favorites.json}"
 }

@@ -66,23 +66,89 @@ def find_device_backup(base: Path) -> Path:
     return udid_dirs[0]
 
 
+# Files every encrypted iOS backup must have. Used as a pre-flight check
+# so we give a clear error instead of a plistlib stacktrace when the
+# backup is mid-flight or got corrupted.
+REQUIRED_BACKUP_FILES = ("Manifest.plist", "Manifest.db", "Info.plist")
+
+
+def validate_backup_structure(device_backup: Path) -> None:
+    """Raise SystemExit with an actionable message if the backup is incomplete."""
+    missing = []
+    truncated = []
+    for fname in REQUIRED_BACKUP_FILES:
+        p = device_backup / fname
+        if not p.exists():
+            missing.append(fname)
+        elif p.stat().st_size == 0:
+            truncated.append(fname)
+
+    if missing or truncated:
+        print(f"[ERROR] Backup at {device_backup} looks incomplete:", file=sys.stderr)
+        for f in missing:
+            print(f"  • missing: {f}", file=sys.stderr)
+        for f in truncated:
+            print(f"  • empty:   {f}", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Likely causes:", file=sys.stderr)
+        print("  - A previous backup was interrupted before completing.", file=sys.stderr)
+        print("  - The backup directory got wiped or partially deleted.", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Fix: run the full pipeline to recreate the backup:", file=sys.stderr)
+        print("  ./mikoshi-whatsapp.sh sync --all", file=sys.stderr)
+        sys.exit(3)
+
+
+def _safe_decrypt(operation_label: str, fn):
+    """Run a decryption block, mapping cryptic errors to friendly messages."""
+    import plistlib
+    try:
+        return fn()
+    except plistlib.InvalidFileException:
+        print(f"[ERROR] {operation_label}: Manifest.plist is corrupted or truncated.",
+              file=sys.stderr)
+        print("Most common reason: the backup was interrupted mid-flight.", file=sys.stderr)
+        print("Fix: ./mikoshi-whatsapp.sh sync --all", file=sys.stderr)
+        sys.exit(3)
+    except ValueError as e:
+        msg = str(e).lower()
+        if "password" in msg or "passphrase" in msg or "decrypt" in msg or "keybag" in msg:
+            print(f"[ERROR] {operation_label}: backup password is wrong.", file=sys.stderr)
+            print("The password in Keychain doesn't match the one used to encrypt this backup.",
+                  file=sys.stderr)
+            print("Fix:", file=sys.stderr)
+            print("  security delete-generic-password -a iphone_backup -s iphone_backup_password",
+                  file=sys.stderr)
+            print("  security add-generic-password -a iphone_backup -s iphone_backup_password "
+                  "-w 'CORRECT_PASSWORD'", file=sys.stderr)
+            sys.exit(3)
+        raise
+    except FileNotFoundError as e:
+        print(f"[ERROR] {operation_label}: missing file — {e}", file=sys.stderr)
+        sys.exit(3)
+
+
 def decrypt_chatstorage(work_dir: Path) -> Path:
     """Decrypt ChatStorage.sqlite if not already present."""
     chat_db = work_dir / "ChatStorage.sqlite"
-    if chat_db.exists():
+    if chat_db.exists() and chat_db.stat().st_size > 0:
         return chat_db
 
     base = get_backup_dir()
     device_backup = find_device_backup(base)
+    validate_backup_structure(device_backup)
     passphrase = get_passphrase()
 
     print(f"[INFO] Decrypting ChatStorage.sqlite from {device_backup.name[:12]}...")
-    eb = EncryptedBackup(backup_directory=str(device_backup), passphrase=passphrase)
     work_dir.mkdir(parents=True, exist_ok=True)
-    eb.extract_file(
-        relative_path=RelativePath.WHATSAPP_MESSAGES,
-        output_filename=str(chat_db),
-    )
+
+    def _do():
+        eb = EncryptedBackup(backup_directory=str(device_backup), passphrase=passphrase)
+        eb.extract_file(
+            relative_path=RelativePath.WHATSAPP_MESSAGES,
+            output_filename=str(chat_db),
+        )
+    _safe_decrypt("decrypting ChatStorage", _do)
     return chat_db
 
 
@@ -94,15 +160,19 @@ def decrypt_media(work_dir: Path) -> Path:
 
     base = get_backup_dir()
     device_backup = find_device_backup(base)
+    validate_backup_structure(device_backup)
     passphrase = get_passphrase()
 
     print("[INFO] Decrypting WhatsApp media (this may take a while)...")
-    eb = EncryptedBackup(backup_directory=str(device_backup), passphrase=passphrase)
     media_dir.mkdir(parents=True, exist_ok=True)
-    eb.extract_files(
-        domain_like="AppDomainGroup-group.net.whatsapp.WhatsApp.shared",
-        output_folder=str(media_dir),
-    )
+
+    def _do():
+        eb = EncryptedBackup(backup_directory=str(device_backup), passphrase=passphrase)
+        eb.extract_files(
+            domain_like="AppDomainGroup-group.net.whatsapp.WhatsApp.shared",
+            output_folder=str(media_dir),
+        )
+    _safe_decrypt("decrypting WhatsApp media", _do)
     return media_dir
 
 

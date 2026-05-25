@@ -379,3 +379,187 @@ class TestFavoritesModule:
         favorites.add([{"jid": "x@s.whatsapp.net", "name": "X"}], file=f)
         assert favorites.clear(f) == 1
         assert favorites.jids(f) == []
+
+
+# ─── Edge cases: malformed / empty DB ──────────────────────────────────────
+
+class TestEmptyDB:
+    """Real backups can have weird states. Don't crash."""
+
+    def _build_empty_db(self, db_path):
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        conn.executescript("""
+            CREATE TABLE ZWACHATSESSION (
+                Z_PK INTEGER PRIMARY KEY,
+                ZCONTACTJID TEXT,
+                ZPARTNERNAME TEXT,
+                ZLASTMESSAGEDATE REAL
+            );
+            CREATE TABLE ZWAMESSAGE (
+                Z_PK INTEGER PRIMARY KEY,
+                ZCHATSESSION INTEGER,
+                ZTEXT TEXT,
+                ZMESSAGEDATE REAL,
+                ZFROMJID TEXT,
+                ZTOJID TEXT,
+                ZISFROMME INTEGER,
+                ZMESSAGETYPE INTEGER,
+                ZPUSHNAME TEXT
+            );
+            CREATE TABLE ZWAMEDIAITEM (
+                Z_PK INTEGER PRIMARY KEY,
+                ZMESSAGE INTEGER,
+                ZMEDIALOCALPATH TEXT,
+                ZVCARDSTRING TEXT,
+                ZTITLE TEXT,
+                ZMEDIASIZE INTEGER
+            );
+        """)
+        conn.commit()
+        conn.close()
+
+    def test_empty_db_returns_none(self, tmp_path, attachments_dir, state_file):
+        from extract_messages import extract_messages, load_sync_state
+        db = tmp_path / "empty.sqlite"
+        self._build_empty_db(db)
+        out = tmp_path / "out.json"
+        result = extract_messages(
+            db_path=db,
+            extracted_root=tmp_path / "root",
+            output_path=out,
+            attachments_dir=attachments_dir,
+            sync_state=load_sync_state(state_file),
+            mode="full",
+        )
+        assert result is None  # no chats found
+
+    def test_missing_ZWAGROUPMEMBER_table_doesnt_crash(
+        self, synthetic_db, extracted_root, output_path, attachments_dir, state_file
+    ):
+        """Old DB versions lack ZWAGROUPMEMBER. fetch_group_participants() must guard."""
+        import sqlite3
+        from extract_messages import extract_messages, load_sync_state
+
+        # Drop the group-member table from the synthetic_db fixture
+        conn = sqlite3.connect(synthetic_db)
+        conn.execute("DROP TABLE ZWAGROUPMEMBER")
+        conn.commit()
+        conn.close()
+
+        result = extract_messages(
+            db_path=synthetic_db,
+            extracted_root=extracted_root,
+            output_path=output_path,
+            attachments_dir=attachments_dir,
+            sync_state=load_sync_state(state_file),
+            mode="full",
+        )
+        assert result is not None
+        # Group chats should appear but with empty participants list
+        data = json.loads(output_path.read_text())
+        groups = [c for c in data["chats"] if c["is_group"]]
+        assert all(g["participants"] == [] for g in groups)
+
+
+class TestNullValues:
+    """Handle NULL text, NULL timestamp, NULL push_name without crashing."""
+
+    def test_null_text_message(self, tmp_path, attachments_dir, state_file):
+        import sqlite3
+        from extract_messages import extract_messages, load_sync_state
+
+        db = tmp_path / "null.sqlite"
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE ZWACHATSESSION (
+                Z_PK INTEGER PRIMARY KEY,
+                ZCONTACTJID TEXT,
+                ZPARTNERNAME TEXT,
+                ZLASTMESSAGEDATE REAL
+            );
+            CREATE TABLE ZWAMESSAGE (
+                Z_PK INTEGER PRIMARY KEY,
+                ZCHATSESSION INTEGER,
+                ZTEXT TEXT,
+                ZMESSAGEDATE REAL,
+                ZFROMJID TEXT,
+                ZTOJID TEXT,
+                ZISFROMME INTEGER,
+                ZMESSAGETYPE INTEGER,
+                ZPUSHNAME TEXT
+            );
+            CREATE TABLE ZWAMEDIAITEM (
+                Z_PK INTEGER PRIMARY KEY,
+                ZMESSAGE INTEGER,
+                ZMEDIALOCALPATH TEXT,
+                ZVCARDSTRING TEXT,
+                ZTITLE TEXT,
+                ZMEDIASIZE INTEGER
+            );
+            INSERT INTO ZWACHATSESSION VALUES (1, 'x@s.whatsapp.net', NULL, 100.0);
+            INSERT INTO ZWAMESSAGE VALUES (1, 1, NULL, 50.0, 'x@s.whatsapp.net', 'me@s.whatsapp.net', 0, 0, NULL);
+        """)
+        conn.commit()
+        conn.close()
+
+        out = tmp_path / "out.json"
+        result = extract_messages(
+            db_path=db,
+            extracted_root=tmp_path / "root",
+            output_path=out,
+            attachments_dir=attachments_dir,
+            sync_state=load_sync_state(state_file),
+            mode="full",
+        )
+        assert result is not None
+        data = json.loads(out.read_text())
+        msg = data["chats"][0]["messages"][0]
+        assert msg["text"] is None
+        assert msg["push_name"] is None
+        # Chat name falls back to JID
+        assert data["chats"][0]["name"] == "x@s.whatsapp.net"
+
+
+class TestStateOverlapWithFavorites:
+    """The state cursor should only advance for JIDs we actually processed."""
+
+    def test_favorites_dont_touch_other_chats_cursors(
+        self, synthetic_db, extracted_root, tmp_path, attachments_dir, state_file
+    ):
+        from extract_messages import (
+            extract_messages, load_sync_state, save_sync_state
+        )
+        # Full sync first to seed all cursors
+        out1 = tmp_path / "1.json"
+        state = load_sync_state(state_file)
+        s1 = extract_messages(
+            db_path=synthetic_db,
+            extracted_root=extracted_root,
+            output_path=out1,
+            attachments_dir=attachments_dir,
+            sync_state=state,
+            mode="full",
+        )
+        state["chats"] = s1
+        save_sync_state(state_file, state)
+        bob_cursor_before = state["chats"]["bob@s.whatsapp.net"]
+
+        # Now run favorites-only with just Alice
+        out2 = tmp_path / "2.json"
+        state2 = load_sync_state(state_file)
+        s2 = extract_messages(
+            db_path=synthetic_db,
+            extracted_root=extracted_root,
+            output_path=out2,
+            attachments_dir=attachments_dir,
+            sync_state=state2,
+            mode="incremental",
+            favorite_jids=["alice@s.whatsapp.net"],
+        )
+        # When no new messages exist, extract_messages returns None
+        if s2 is not None:
+            state2["chats"] = s2
+
+        # Bob's cursor must remain untouched
+        assert state2["chats"].get("bob@s.whatsapp.net") == bob_cursor_before
