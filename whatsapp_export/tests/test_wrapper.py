@@ -161,6 +161,35 @@ class TestSyncDispatch:
         assert "--favorites" not in forwarded
         assert "no favorites file" in result.stdout
 
+    def test_sync_all_with_no_other_args(self, stub_pipeline):
+        """Regression: bash 3.2 + set -u crashes on empty array expansion.
+
+        `sync --all` with no other flags previously emitted
+        'args[@]: unbound variable' because `${args[@]}` is not a safe
+        expansion when the array is empty.
+        """
+        result = _run_stub(stub_pipeline, ["sync", "--all"], favorites=None)
+        assert result.returncode == 0, (
+            f"sync --all crashed:\nstdout={result.stdout}\nstderr={result.stderr}"
+        )
+        assert "unbound variable" not in result.stderr
+        # Pipeline got called with no args at all
+        forwarded = stub_pipeline["args_log"].read_text().strip()
+        assert forwarded == ""
+
+    def test_sync_with_no_args_at_all(self, stub_pipeline):
+        """Plain `sync` without favorites and without flags."""
+        result = _run_stub(stub_pipeline, ["sync"], favorites=None)
+        assert result.returncode == 0
+        assert "unbound variable" not in result.stderr
+
+    def test_sync_full_alone(self, stub_pipeline):
+        """sync --full alone: args has 2 elements (--mode, full), not empty."""
+        result = _run_stub(stub_pipeline, ["sync", "--full"], favorites=None)
+        assert result.returncode == 0
+        forwarded = stub_pipeline["args_log"].read_text().strip()
+        assert "--mode" in forwarded and "full" in forwarded
+
 
 # ─── status / tui subcommand presence ──────────────────────────────────────
 

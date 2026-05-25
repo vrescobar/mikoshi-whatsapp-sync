@@ -123,8 +123,11 @@ cmd_sync() {
 
     echo "[mikoshi] $(date '+%Y-%m-%d %H:%M:%S') starting sync: ${args[*]:-(default)}"
     echo "[mikoshi] full log: $cron_log"
-    # Pipe to both terminal and cron log
-    "$PIPELINE" "${args[@]}" 2>&1 | tee "$cron_log"
+    # Pipe to both terminal and cron log.
+    # ${args[@]+"${args[@]}"} is the portable idiom for "expand only if set":
+    # bash 3.2 (macOS default) trips on plain "${args[@]}" under `set -u`
+    # when the array is empty, e.g. `sync --all` with no other flags.
+    "$PIPELINE" ${args[@]+"${args[@]}"} 2>&1 | tee "$cron_log"
     local rc=${PIPESTATUS[0]}
     echo "[mikoshi] $(date '+%Y-%m-%d %H:%M:%S') sync finished (exit $rc)"
     exit "$rc"
