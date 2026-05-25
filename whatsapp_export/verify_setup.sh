@@ -105,7 +105,7 @@ echo ""
 echo "Python Packages:"
 echo ""
 
-PACKAGES=("iphone_backup_decrypt" "whatsapp_chat_exporter" "cryptography")
+PACKAGES=("iphone_backup_decrypt" "cryptography" "rich" "questionary" "jsonschema")
 for package in "${PACKAGES[@]}"; do
     if python3 -c "import ${package//-/_}" 2>/dev/null; then
         pass "$(python3 -c "import ${package//-/_}; print('${package//-/_}')")"

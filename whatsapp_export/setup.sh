@@ -88,7 +88,6 @@ python3 -m pip install --upgrade pip 2>&1 | tee -a "$SETUP_LOG"
 log "Installing Python packages..."
 python3 -m pip install \
     iphone-backup-decrypt \
-    whatsapp-chat-exporter \
     cryptography \
     pycryptodomex \
     jsonschema \
@@ -113,7 +112,7 @@ done
 # Check Python packages
 log ""
 log "Installed Python packages:"
-python3 -m pip list | grep -E "iphone-backup-decrypt|whatsapp-chat-exporter|cryptography" | tee -a "$SETUP_LOG" || warn "Some packages may not be listed"
+python3 -m pip list | grep -E "iphone-backup-decrypt|cryptography|rich|questionary|jsonschema" | tee -a "$SETUP_LOG" || warn "Some packages may not be listed"
 
 # Setup macOS Keychain
 log ""
