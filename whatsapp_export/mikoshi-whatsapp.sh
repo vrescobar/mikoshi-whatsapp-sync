@@ -31,6 +31,10 @@ Subcommands:
                   --skip-remote-sync   Run extraction but don't push.
                   Anything else gets forwarded to run_pipeline.sh.
   status       Print pipeline status (config, backup, sync state).
+  reset-backup [--force]
+               Delete the partial/corrupt iPhone backup so the next sync
+               can start fresh. Asks for confirmation unless --force.
+               Only touches MIKOSHI_BACKUP_DIR/backup/<UDID>/.
   -h, --help   This message.
 
 Examples:
@@ -59,12 +63,29 @@ activate_venv() {
 
 # Load ~/.mikoshi-ingest.conf so child processes (tui.py, run_pipeline.sh,
 # explore_backup.py, ...) all inherit MIKOSHI_URL / TOKEN / BACKUP_DIR / etc.
+# Precedence: env vars set by the user > values from the file.
 INGEST_CONF="${MIKOSHI_INGEST_CONF:-${HOME}/.mikoshi-ingest.conf}"
 if [[ -f "$INGEST_CONF" ]]; then
+    # Snapshot env-provided values so we can restore them after sourcing.
+    _saved_MIKOSHI_URL="${MIKOSHI_URL:-}"
+    _saved_MIKOSHI_TOKEN="${MIKOSHI_TOKEN:-}"
+    _saved_MIKOSHI_BACKUP_DIR="${MIKOSHI_BACKUP_DIR:-}"
+    _saved_MIKOSHI_CLIENT_ID="${MIKOSHI_CLIENT_ID:-}"
+    _saved_KEEP_LOCAL_EXPORTS="${KEEP_LOCAL_EXPORTS:-}"
+    _saved_MIKOSHI_FAVORITES_FILE="${MIKOSHI_FAVORITES_FILE:-}"
+
     set -a
     # shellcheck disable=SC1090
     source "$INGEST_CONF"
     set +a
+
+    # Env vars trump file values.
+    [[ -n "$_saved_MIKOSHI_URL" ]] && export MIKOSHI_URL="$_saved_MIKOSHI_URL"
+    [[ -n "$_saved_MIKOSHI_TOKEN" ]] && export MIKOSHI_TOKEN="$_saved_MIKOSHI_TOKEN"
+    [[ -n "$_saved_MIKOSHI_BACKUP_DIR" ]] && export MIKOSHI_BACKUP_DIR="$_saved_MIKOSHI_BACKUP_DIR"
+    [[ -n "$_saved_MIKOSHI_CLIENT_ID" ]] && export MIKOSHI_CLIENT_ID="$_saved_MIKOSHI_CLIENT_ID"
+    [[ -n "$_saved_KEEP_LOCAL_EXPORTS" ]] && export KEEP_LOCAL_EXPORTS="$_saved_KEEP_LOCAL_EXPORTS"
+    [[ -n "$_saved_MIKOSHI_FAVORITES_FILE" ]] && export MIKOSHI_FAVORITES_FILE="$_saved_MIKOSHI_FAVORITES_FILE"
 fi
 
 favorites_file() {
@@ -143,6 +164,72 @@ tui.action_status()
 PYEOF
 }
 
+cmd_reset_backup() {
+    local force=false
+    if [[ "${1:-}" == "--force" ]]; then
+        force=true
+    fi
+
+    local base="${MIKOSHI_BACKUP_DIR:-${SCRIPT_DIR}/temp}"
+    local backup_root="${base}/backup"
+
+    if [[ ! -d "$backup_root" ]]; then
+        echo "[mikoshi] no backup found at $backup_root — nothing to reset"
+        return 0
+    fi
+
+    # Find UDID-named subdirs via simple globbing — avoids bash 3.2 quirks
+    # with `< <(find ...)` and arrays under set -u.
+    local found=0
+    local victim
+    for victim in "$backup_root"/*; do
+        [[ -d "$victim" ]] || continue
+        local name; name=$(basename "$victim")
+        if [[ ${#name} -le 20 ]]; then
+            continue
+        fi
+        found=1
+        local size
+        size=$(du -sh "$victim" 2>/dev/null | cut -f1)
+        echo "[mikoshi] candidate for deletion: $victim  ($size)"
+    done
+
+    if [[ $found -eq 0 ]]; then
+        echo "[mikoshi] no UDID-named directories under $backup_root — nothing to reset"
+        return 0
+    fi
+
+    echo ""
+    echo "This will NOT touch: $base itself, any other files there, or your config."
+
+    if [[ "$force" != true ]]; then
+        echo ""
+        read -r -p "Type 'yes' to confirm: " ans
+        if [[ "$ans" != "yes" ]]; then
+            echo "[mikoshi] aborted"
+            return 1
+        fi
+    fi
+
+    for victim in "$backup_root"/*; do
+        [[ -d "$victim" ]] || continue
+        local name; name=$(basename "$victim")
+        if [[ ${#name} -le 20 ]]; then
+            continue
+        fi
+        rm -rf "$victim"
+        echo "[mikoshi] ✓ removed $victim"
+    done
+
+    # Also wipe any decrypted artifacts from previous runs
+    if [[ -d "${base}/extracted" ]]; then
+        rm -rf "${base}/extracted"
+        echo "[mikoshi] ✓ removed decrypted artifacts"
+    fi
+
+    echo "[mikoshi] done. Next sync will start a fresh full backup."
+}
+
 # ─── dispatch ──────────────────────────────────────────────────────────────
 
 if [[ $# -eq 0 ]]; then
@@ -150,9 +237,10 @@ if [[ $# -eq 0 ]]; then
 fi
 
 case "$1" in
-    tui)         shift; cmd_tui "$@" ;;
-    sync)        shift; cmd_sync "$@" ;;
-    status)      shift; cmd_status "$@" ;;
-    -h|--help)   usage ;;
-    *)           echo "Unknown subcommand: $1"; echo; usage; exit 1 ;;
+    tui)           shift; cmd_tui "$@" ;;
+    sync)          shift; cmd_sync "$@" ;;
+    status)        shift; cmd_status "$@" ;;
+    reset-backup)  shift; cmd_reset_backup "$@" ;;
+    -h|--help)     usage ;;
+    *)             echo "Unknown subcommand: $1"; echo; usage; exit 1 ;;
 esac

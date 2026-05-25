@@ -95,6 +95,10 @@ class TestHelp:
         result = _run(["--help"])
         assert "cron" in result.stdout.lower()
 
+    def test_help_lists_reset_backup(self):
+        result = _run(["--help"])
+        assert "reset-backup" in result.stdout
+
 
 # ─── unknown subcommand ────────────────────────────────────────────────────
 
@@ -192,6 +196,150 @@ class TestSyncDispatch:
 
 
 # ─── status / tui subcommand presence ──────────────────────────────────────
+
+class TestResetBackup:
+    def _setup_fake_backup(self, tmp_path, monkeypatch):
+        """Create a fake backup tree and stub script."""
+        fake_root = tmp_path / "fake_export"
+        fake_root.mkdir()
+        (fake_root / "mikoshi-whatsapp.sh").symlink_to(WRAPPER)
+        (fake_root / "run_pipeline.sh").write_text("#!/bin/bash\nexit 0\n")
+        (fake_root / "run_pipeline.sh").chmod(0o755)
+        (fake_root / "tui.py").write_text("print('stub')\n")
+        venv = fake_root / ".venv" / "bin"
+        venv.mkdir(parents=True)
+        (venv / "activate").write_text("# stub\n")
+
+        # Backup tree with a UDID-like dir
+        backup_dir = tmp_path / "backup_root"
+        udid_dir = backup_dir / "backup" / "00008130-0001184C1E46001C"
+        udid_dir.mkdir(parents=True)
+        (udid_dir / "Manifest.plist").write_bytes(b"\x00" * 1024)
+        (udid_dir / "stale.bin").write_bytes(b"x" * 1024)
+
+        return fake_root, backup_dir, udid_dir
+
+    def test_aborts_when_no_yes(self, tmp_path):
+        fake_root, backup_dir, udid_dir = self._setup_fake_backup(tmp_path, None)
+        env = os.environ.copy()
+        env["MIKOSHI_BACKUP_DIR"] = str(backup_dir)
+        result = subprocess.run(
+            ["bash", str(fake_root / "mikoshi-whatsapp.sh"), "reset-backup"],
+            env=env, capture_output=True, text=True, input="no\n", timeout=10,
+        )
+        assert result.returncode == 1
+        assert udid_dir.exists(), "Should not have deleted without confirmation"
+        assert "aborted" in result.stdout
+
+    def test_deletes_on_yes(self, tmp_path):
+        fake_root, backup_dir, udid_dir = self._setup_fake_backup(tmp_path, None)
+        env = os.environ.copy()
+        env["MIKOSHI_BACKUP_DIR"] = str(backup_dir)
+        result = subprocess.run(
+            ["bash", str(fake_root / "mikoshi-whatsapp.sh"), "reset-backup"],
+            env=env, capture_output=True, text=True, input="yes\n", timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        assert not udid_dir.exists()
+        assert "removed" in result.stdout
+
+    def test_force_skips_prompt(self, tmp_path):
+        fake_root, backup_dir, udid_dir = self._setup_fake_backup(tmp_path, None)
+        env = os.environ.copy()
+        env["MIKOSHI_BACKUP_DIR"] = str(backup_dir)
+        result = subprocess.run(
+            ["bash", str(fake_root / "mikoshi-whatsapp.sh"), "reset-backup", "--force"],
+            env=env, capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        assert not udid_dir.exists()
+
+    def test_no_backup_present(self, tmp_path):
+        fake_root, backup_dir, _ = self._setup_fake_backup(tmp_path, None)
+        # Nuke the UDID dir manually first
+        import shutil
+        shutil.rmtree(backup_dir / "backup")
+        env = os.environ.copy()
+        env["MIKOSHI_BACKUP_DIR"] = str(backup_dir)
+        result = subprocess.run(
+            ["bash", str(fake_root / "mikoshi-whatsapp.sh"), "reset-backup", "--force"],
+            env=env, capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 0
+        assert "nothing to reset" in result.stdout
+
+    def test_preserves_sibling_dirs(self, tmp_path):
+        """reset-backup must NOT touch other files in MIKOSHI_BACKUP_DIR."""
+        fake_root, backup_dir, udid_dir = self._setup_fake_backup(tmp_path, None)
+        sibling = backup_dir / "my-other-data.txt"
+        sibling.write_text("important")
+
+        env = os.environ.copy()
+        env["MIKOSHI_BACKUP_DIR"] = str(backup_dir)
+        subprocess.run(
+            ["bash", str(fake_root / "mikoshi-whatsapp.sh"), "reset-backup", "--force"],
+            env=env, capture_output=True, text=True, timeout=10,
+        )
+        assert sibling.exists()
+        assert sibling.read_text() == "important"
+
+
+class TestDiagnoseBackupError:
+    """Test the bash-level diagnose function by invoking run_pipeline.sh with
+    crafted log files. We can't run a real backup, but we can sneak in a
+    fake log via a shell wrapper that sources the function."""
+
+    def _diagnose(self, log_content):
+        """Source run_pipeline.sh's diagnose function and run it on log_content."""
+        with subprocess.Popen(
+            ["bash", "-c", f"""
+                set +e
+                # Stub out functions that diagnose_backup_error doesn't need
+                error() {{ echo "$@" >&2; }}
+                # Define TEMP_DIR_IS_EXTERNAL so the conditional branch works
+                TEMP_DIR_IS_EXTERNAL=true
+                TEMP_DIR=/tmp/fake
+                # Source the function from run_pipeline.sh
+                eval "$(sed -n '/^diagnose_backup_error()/,/^}}/p' {Path(__file__).parent.parent / 'run_pipeline.sh'})"
+                # Create the log file
+                tmp=$(mktemp)
+                cat > "$tmp" <<'LOGEOF'
+{log_content}
+LOGEOF
+                diagnose_backup_error "$tmp"
+                rm -f "$tmp"
+            """],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        ) as proc:
+            out, err = proc.communicate(timeout=10)
+            return err
+
+    def test_status_plist_corruption_detected(self):
+        log = (
+            "Starting backup...\n"
+            "Sending '00008130-XXX/Status.plist' (4.1 KB)\n"
+            "ErrorCode 205: Error reading status (MBErrorDomain/205). "
+            "Underlying error: Error deserializing property list: Unexpected character"
+        )
+        err = self._diagnose(log)
+        assert "CORRUPT" in err or "corrupt" in err.lower()
+        assert "reset-backup" in err
+
+    def test_info_plist_corruption_detected(self):
+        log = "Could not read Info.plist"
+        err = self._diagnose(log)
+        assert "CORRUPT" in err or "corrupt" in err.lower()
+
+    def test_locked_device_detected(self):
+        log = "device is locked - cannot backup"
+        err = self._diagnose(log)
+        assert "locked" in err.lower()
+
+    def test_trust_not_established(self):
+        log = "User did not trust this computer"
+        err = self._diagnose(log)
+        assert "Trust" in err or "trust" in err.lower()
+
 
 class TestSubcommandPresence:
     def test_status_subcommand_exists(self):

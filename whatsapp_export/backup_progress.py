@@ -46,8 +46,19 @@ def to_bytes(value: float, unit: str) -> int:
 
 
 def run_plain(cmd: list[str]) -> int:
-    """No rich — just stream output through."""
-    return subprocess.call(cmd)
+    """No rich — just stream output through (and to MIKOSHI_BACKUP_LOG if set)."""
+    log_path = os.environ.get("MIKOSHI_BACKUP_LOG")
+    if not log_path:
+        return subprocess.call(cmd)
+    # Tee through a pipe so the user sees output AND it's logged.
+    with open(log_path, "w", encoding="utf-8", buffering=1) as fp:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1)
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            fp.write(line)
+        return proc.wait()
 
 
 def run_with_progress(cmd: list[str]) -> int:
@@ -59,6 +70,13 @@ def run_with_progress(cmd: list[str]) -> int:
         bufsize=1,
         text=True,
     )
+
+    # When MIKOSHI_BACKUP_LOG is set, mirror every line of idevicebackup2's
+    # output to that file. Necessary because the parent shell pipeline can't
+    # capture our stdout (we own the TTY for Rich) — without this, the
+    # diagnose_backup_error() heuristic has nothing to grep.
+    log_path = os.environ.get("MIKOSHI_BACKUP_LOG")
+    log_fp = open(log_path, "w", encoding="utf-8", buffering=1) if log_path else None
 
     file_size_seen = {}        # file index -> bytes (de-dup by what we've added)
     files_done = 0
@@ -84,6 +102,11 @@ def run_with_progress(cmd: list[str]) -> int:
         try:
             for line in proc.stdout:
                 line = line.rstrip("\n")
+
+                # Mirror raw line to log file before any filtering, so the
+                # diagnose pass sees the unmodified output.
+                if log_fp:
+                    log_fp.write(line + "\n")
 
                 if RECEIVING_RE.search(line):
                     current_file_idx += 1
@@ -125,8 +148,12 @@ def run_with_progress(cmd: list[str]) -> int:
 
         except KeyboardInterrupt:
             proc.terminate()
+            if log_fp:
+                log_fp.close()
             raise
 
+    if log_fp:
+        log_fp.close()
     return proc.wait()
 
 

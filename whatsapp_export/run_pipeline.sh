@@ -23,11 +23,26 @@ SCHEMA_FILE="${SCRIPT_DIR}/schema.json"
 # Load ~/.mikoshi-ingest.conf early so env vars defined there (MIKOSHI_BACKUP_DIR,
 # MIKOSHI_CLIENT_ID, KEEP_LOCAL_EXPORTS, ...) take effect before we compute paths.
 # Lines must be KEY=VALUE (no `export` needed — set -a auto-exports).
+# Precedence: env vars set by the user > values from the file.
 if [[ -f "$INGEST_CONF" ]]; then
+    _saved_MIKOSHI_URL="${MIKOSHI_URL:-}"
+    _saved_MIKOSHI_TOKEN="${MIKOSHI_TOKEN:-}"
+    _saved_MIKOSHI_BACKUP_DIR="${MIKOSHI_BACKUP_DIR:-}"
+    _saved_MIKOSHI_CLIENT_ID="${MIKOSHI_CLIENT_ID:-}"
+    _saved_KEEP_LOCAL_EXPORTS="${KEEP_LOCAL_EXPORTS:-}"
+    _saved_MIKOSHI_FAVORITES_FILE="${MIKOSHI_FAVORITES_FILE:-}"
+
     set -a
     # shellcheck disable=SC1090
     source "$INGEST_CONF"
     set +a
+
+    [[ -n "$_saved_MIKOSHI_URL" ]] && export MIKOSHI_URL="$_saved_MIKOSHI_URL"
+    [[ -n "$_saved_MIKOSHI_TOKEN" ]] && export MIKOSHI_TOKEN="$_saved_MIKOSHI_TOKEN"
+    [[ -n "$_saved_MIKOSHI_BACKUP_DIR" ]] && export MIKOSHI_BACKUP_DIR="$_saved_MIKOSHI_BACKUP_DIR"
+    [[ -n "$_saved_MIKOSHI_CLIENT_ID" ]] && export MIKOSHI_CLIENT_ID="$_saved_MIKOSHI_CLIENT_ID"
+    [[ -n "$_saved_KEEP_LOCAL_EXPORTS" ]] && export KEEP_LOCAL_EXPORTS="$_saved_KEEP_LOCAL_EXPORTS"
+    [[ -n "$_saved_MIKOSHI_FAVORITES_FILE" ]] && export MIKOSHI_FAVORITES_FILE="$_saved_MIKOSHI_FAVORITES_FILE"
 fi
 
 # Temp / backup location. Override with MIKOSHI_BACKUP_DIR to use an external
@@ -225,21 +240,43 @@ setup_python_env() {
     fi
 }
 
-# Map idevicebackup2 stderr patterns to actionable messages
+# Map idevicebackup2 output patterns to actionable messages.
+# Patterns are ordered from most-specific to most-generic.
 diagnose_backup_error() {
     local err_file="$1"
-    if grep -qiE "password|passcode|wrong" "$err_file"; then
+    [[ -f "$err_file" ]] || return
+
+    # Most specific first: backup dir has corrupt metadata from a prior failed run
+    if grep -qiE "deserializing property list|Error reading status|Could not read Info\\.plist|ErrorCode 205" "$err_file"; then
+        error "Backup directory has CORRUPT metadata from a previous failed attempt."
+        error "Symptoms in idevicebackup2 output: 'Status.plist' / 'Info.plist' deserialization errors."
+        error ""
+        error "Fix: wipe the partial backup so a fresh one can start:"
+        if [[ "$TEMP_DIR_IS_EXTERNAL" == true ]]; then
+            error "  ./mikoshi-whatsapp.sh reset-backup"
+            error "  (this deletes ${TEMP_DIR}/backup/<UDID>/ only — the rest of MIKOSHI_BACKUP_DIR is untouched)"
+        else
+            error "  rm -rf ${TEMP_DIR}/backup"
+        fi
+        return
+    fi
+    if grep -qiE "MBErrorDomain/104|MBErrorDomain/106|backup is encrypted with a different password" "$err_file"; then
+        error "Backup password mismatch: this device's backup was created with a different password."
+        error "Either delete the backup dir, or update Keychain to the right one."
+        return
+    fi
+    if grep -qiE "wrong password|incorrect password" "$err_file"; then
         error "Backup password rejected by device."
         error "Either the password in Keychain is wrong, or you changed it on the iPhone."
         error "Fix: security delete-generic-password -a iphone_backup -s iphone_backup_password"
         error "     security add-generic-password -a iphone_backup -s iphone_backup_password -w 'NEW_PASSWORD'"
         return
     fi
-    if grep -qiE "locked|passcode protected" "$err_file"; then
+    if grep -qiE "device is locked|passcode protected" "$err_file"; then
         error "iPhone is locked. Unlock the device and re-run."
         return
     fi
-    if grep -qiE "trust|pairing|not paired" "$err_file"; then
+    if grep -qiE "trust this computer|pairing.*fail|not paired" "$err_file"; then
         error "iPhone has not trusted this Mac yet."
         error "On iPhone: tap 'Trust' when prompted, then re-run."
         return
@@ -296,6 +333,11 @@ create_backup() {
 
     log "Creating backup (first run can be hours; subsequent are incremental)..."
     local err_file="${TEMP_DIR}/backup.stderr"
+    # Full output log — backup_progress.py mirrors all idevicebackup2 lines
+    # here via MIKOSHI_BACKUP_LOG so diagnose_backup_error has something to
+    # grep. (Plain stderr capture isn't enough since backup_progress.py owns
+    # the TTY for Rich rendering.)
+    local backup_log="${TEMP_DIR}/backup.log"
 
     # Use the rich progress wrapper unless explicitly disabled.
     # Falls back to plain idevicebackup2 if rich isn't importable.
@@ -305,8 +347,13 @@ create_backup() {
         backup_cmd=(python3 "${SCRIPT_DIR}/backup_progress.py" --udid "$DEVICE_UDID" "$BACKUP_PATH")
     fi
 
-    if ! "${backup_cmd[@]}" 2> >(tee "$err_file" >&2); then
-        diagnose_backup_error "$err_file"
+    if ! MIKOSHI_BACKUP_LOG="$backup_log" "${backup_cmd[@]}" 2> >(tee "$err_file" >&2); then
+        # Diagnose against the full log (preferred) or stderr (fallback).
+        if [[ -s "$backup_log" ]]; then
+            diagnose_backup_error "$backup_log"
+        else
+            diagnose_backup_error "$err_file"
+        fi
         return 1
     fi
     log "✓ Backup created"
