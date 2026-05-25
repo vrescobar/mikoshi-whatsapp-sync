@@ -1,0 +1,5 @@
+[tool.pytest.ini_options]
+# Run each test subtree under its own rootdir to avoid namespace clashes
+# between whatsapp_export/tests/ and server/tests/.
+testpaths = ["whatsapp_export/tests", "server/tests"]
+addopts = "--import-mode=importlib"

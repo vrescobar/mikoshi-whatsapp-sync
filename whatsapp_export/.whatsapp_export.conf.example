@@ -1,0 +1,21 @@
+# WhatsApp Export Pipeline Configuration
+# Copy this file to ~/.whatsapp_export.conf and fill in your values
+# This file should NOT be committed to version control
+
+# Remote server details for rsync sync
+SSH_HOST="your.server.com"
+SSH_USER="whatsapp_user"
+SSH_PATH="/home/whatsapp_user/whatsapp_exports"
+
+# Optional: SSH key path (if not using default ~/.ssh/id_rsa)
+# SSH_KEY="~/.ssh/id_whatsapp_export"
+
+# Optional: Enable verbose logging
+VERBOSE=false
+
+# Notes on setup:
+# 1. SSH_HOST, SSH_USER, SSH_PATH must be configured to enable remote sync
+# 2. SSH key-based auth is required (not password)
+# 3. Create SSH key: ssh-keygen -t ed25519 -f ~/.ssh/id_whatsapp_export
+# 4. Add public key to server: ssh-copy-id -i ~/.ssh/id_whatsapp_export.pub $SSH_USER@$SSH_HOST
+# 5. Verify connection: ssh -i ~/.ssh/id_whatsapp_export $SSH_USER@$SSH_HOST echo "OK"

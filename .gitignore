@@ -1,0 +1,61 @@
+# ─── Secrets / personal config ─────────────────────────────────────────────
+# Never commit anything with credentials, hostnames, or contact data.
+
+.whatsapp_export.conf
+~/.whatsapp_export.conf
+.env
+.env.local
+*.env
+!*.env.example
+
+# Claude Code local permissions (per-user, machine-specific)
+.claude/settings.local.json
+
+# ─── Runtime data (sensitive: contains chat content / JIDs / attachments) ──
+
+# WhatsApp exports — chats, attachments, sha256 media
+whatsapp_export/exports/*
+!whatsapp_export/exports/.gitkeep
+
+# Pipeline logs (may include device UDIDs, paths, names)
+whatsapp_export/logs/*
+!whatsapp_export/logs/.gitkeep
+
+# Temp working dir (decrypted ChatStorage, plists)
+whatsapp_export/temp/
+whatsapp_export/.pipeline.lock
+
+# Sync cursor (contains JIDs of every contact)
+whatsapp_export/.sync_state.json
+
+# Server-side runtime
+server/processed/
+server/quarantine/
+server/media/
+
+# ─── Python ────────────────────────────────────────────────────────────────
+
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ─── OS / editors ──────────────────────────────────────────────────────────
+
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

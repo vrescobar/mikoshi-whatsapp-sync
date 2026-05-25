@@ -1,0 +1,109 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Mikoshi WhatsApp Export Schema",
+  "description": "Schema for WhatsApp export consumed by the Mikoshi server. Each pipeline run produces one JSON file conforming to this schema, plus a sibling 'attachments/' directory keyed by sha256.",
+  "type": "object",
+  "required": ["schema_version", "exported_at", "mode", "chats", "stats"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "description": "Schema semver. 1.0 = base export. 1.1 = adds is_group/participants/include_system_messages.",
+      "enum": ["1.0", "1.1"]
+    },
+    "exported_at": { "type": "string", "format": "date-time" },
+    "mode": { "type": "string", "enum": ["incremental", "full", "full-contact"] },
+    "target_contact": { "type": ["string", "null"] },
+    "include_system_messages": {
+      "type": "boolean",
+      "description": "When true, WhatsApp system events (group changes, encryption notices) are included in messages[]."
+    },
+    "chats": { "type": "array", "items": { "$ref": "#/definitions/chat" } },
+    "stats": {
+      "type": "object",
+      "required": ["total_chats", "total_messages", "attachments_kept", "attachments_skipped"],
+      "properties": {
+        "total_chats": { "type": "integer" },
+        "total_messages": { "type": "integer" },
+        "system_messages_skipped": { "type": "integer" },
+        "attachments_kept": { "type": "integer" },
+        "attachments_skipped": { "type": "integer" }
+      }
+    }
+  },
+  "definitions": {
+    "chat": {
+      "type": "object",
+      "required": ["jid", "name", "messages"],
+      "properties": {
+        "jid": {
+          "type": "string",
+          "description": "WhatsApp JID, e.g. '34600123456@s.whatsapp.net' or '<id>@g.us'."
+        },
+        "name": { "type": "string" },
+        "is_group": {
+          "type": "boolean",
+          "description": "True for group chats (@g.us)."
+        },
+        "participants": {
+          "type": "array",
+          "description": "Group members. Empty for 1-1 chats.",
+          "items": {
+            "type": "object",
+            "required": ["jid"],
+            "properties": {
+              "jid": { "type": "string" },
+              "name": { "type": ["string", "null"] }
+            }
+          }
+        },
+        "messages": { "type": "array", "items": { "$ref": "#/definitions/message" } }
+      }
+    },
+    "message": {
+      "type": "object",
+      "required": ["id", "timestamp", "is_from_me"],
+      "properties": {
+        "id": {
+          "type": "integer",
+          "description": "Stable PK from ZWAMESSAGE.Z_PK. Use for upsert dedup."
+        },
+        "timestamp": { "type": ["string", "null"], "format": "date-time" },
+        "from_jid": { "type": ["string", "null"] },
+        "to_jid": { "type": ["string", "null"] },
+        "is_from_me": { "type": "boolean" },
+        "push_name": { "type": ["string", "null"] },
+        "text": { "type": ["string", "null"] },
+        "type": { "type": ["integer", "null"] },
+        "attachment": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/definitions/attachment_kept" },
+            { "$ref": "#/definitions/attachment_skipped" }
+          ]
+        }
+      }
+    },
+    "attachment_kept": {
+      "type": "object",
+      "required": ["skipped", "sha256", "filename", "size_bytes"],
+      "properties": {
+        "skipped": { "const": false },
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "filename": { "type": "string" },
+        "mime": { "type": ["string", "null"] },
+        "size_bytes": { "type": "integer", "maximum": 5242880 },
+        "title": { "type": ["string", "null"] }
+      }
+    },
+    "attachment_skipped": {
+      "type": "object",
+      "required": ["skipped", "reason"],
+      "properties": {
+        "skipped": { "const": true },
+        "reason": { "type": "string" },
+        "mime": { "type": ["string", "null"] },
+        "original_path": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

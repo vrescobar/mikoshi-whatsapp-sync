@@ -1,0 +1,24 @@
+[Unit]
+Description=Mikoshi WhatsApp Export Ingestor
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=mikoshi
+Group=mikoshi
+WorkingDirectory=/opt/mikoshi
+EnvironmentFile=/etc/mikoshi/ingestor.env
+ExecStart=/opt/mikoshi/.venv/bin/python -m mikoshi_ingestor.cli ingest --watch
+Restart=on-failure
+RestartSec=10s
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/mikoshi /home/mikoshi/whatsapp_exports
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,284 @@
+"""Tests for extract_messages.py — incremental/full/full-contact + filters."""
+
+import json
+from datetime import datetime, timezone
+
+import pytest
+
+from extract_messages import (
+    IOS_EPOCH_OFFSET,
+    MAX_ATTACHMENT_SIZE,
+    attachment_is_allowed,
+    extract_messages,
+    ios_timestamp_to_iso,
+    iso_to_ios_timestamp,
+    load_sync_state,
+    sha256_file,
+)
+
+
+# ─── Pure helpers ──────────────────────────────────────────────────────────
+
+class TestTimestamps:
+    def test_roundtrip(self):
+        # 2026-05-25 12:00 UTC
+        original = datetime(2026, 5, 25, 12, 0, tzinfo=timezone.utc).timestamp() - IOS_EPOCH_OFFSET
+        iso = ios_timestamp_to_iso(original)
+        back = iso_to_ios_timestamp(iso)
+        assert abs(back - original) < 0.001
+
+    def test_none_in_returns_none(self):
+        assert ios_timestamp_to_iso(None) is None
+
+    def test_empty_string_returns_zero(self):
+        assert iso_to_ios_timestamp("") == 0.0
+        assert iso_to_ios_timestamp(None) == 0.0
+
+
+class TestAttachmentFilters:
+    def test_video_mime_rejected(self, tmp_path):
+        f = tmp_path / "x.mp4"
+        f.write_bytes(b"x")
+        allowed, reason = attachment_is_allowed("video/mp4", f)
+        assert not allowed
+        assert "video" in reason
+
+    def test_video_extension_rejected(self, tmp_path):
+        f = tmp_path / "x.mp4"
+        f.write_bytes(b"x")
+        allowed, reason = attachment_is_allowed(None, f)
+        assert not allowed
+
+    def test_oversize_rejected(self, tmp_path):
+        f = tmp_path / "big.pdf"
+        f.write_bytes(b"x" * (MAX_ATTACHMENT_SIZE + 1))
+        allowed, reason = attachment_is_allowed("application/pdf", f)
+        assert not allowed
+        assert "size" in reason
+
+    def test_image_kept(self, tmp_path):
+        f = tmp_path / "a.jpg"
+        f.write_bytes(b"x" * 1024)
+        allowed, reason = attachment_is_allowed("image/jpeg", f)
+        assert allowed
+
+    def test_audio_kept(self, tmp_path):
+        f = tmp_path / "a.opus"
+        f.write_bytes(b"x" * 1024)
+        allowed, _ = attachment_is_allowed("audio/opus", f)
+        assert allowed
+
+    def test_pdf_under_5mb_kept(self, tmp_path):
+        f = tmp_path / "a.pdf"
+        f.write_bytes(b"x" * 1024)
+        allowed, _ = attachment_is_allowed("application/pdf", f)
+        assert allowed
+
+
+class TestSha256:
+    def test_consistent(self, tmp_path):
+        f = tmp_path / "x"
+        f.write_bytes(b"hello world")
+        assert sha256_file(f) == sha256_file(f)
+        assert len(sha256_file(f)) == 64
+
+
+class TestSyncState:
+    def test_missing_returns_default(self, tmp_path):
+        state = load_sync_state(tmp_path / "nope.json")
+        assert state == {"version": 1, "last_global_sync": None, "chats": {}}
+
+
+# ─── End-to-end extraction ─────────────────────────────────────────────────
+
+def run_extract(db, root, out, atts, state_file, **kwargs):
+    """Helper: load state, extract, save state."""
+    from extract_messages import save_sync_state
+
+    state = load_sync_state(state_file)
+    if kwargs.get("mode") == "full":
+        state = {"version": 1, "last_global_sync": None, "chats": {}}
+
+    new_chats_state = extract_messages(
+        db_path=db,
+        extracted_root=root,
+        output_path=out,
+        attachments_dir=atts,
+        sync_state=state,
+        mode=kwargs.get("mode", "incremental"),
+        target_contact=kwargs.get("target_contact"),
+        include_system=kwargs.get("include_system", False),
+    )
+    if new_chats_state is not None:
+        state["chats"] = new_chats_state
+        save_sync_state(state_file, state)
+    return json.loads(out.read_text())
+
+
+class TestFullSync:
+    def test_extracts_all_chats(
+        self, synthetic_db, extracted_root, output_path, attachments_dir, state_file
+    ):
+        result = run_extract(
+            synthetic_db, extracted_root, output_path, attachments_dir, state_file,
+            mode="full",
+        )
+        # 3 chats expected
+        assert result["stats"]["total_chats"] == 3
+        # 3 + 2 + 2 = 7 user messages (system 401 filtered by default)
+        assert result["stats"]["total_messages"] == 7
+        assert result["stats"]["system_messages_skipped"] == 1
+
+    def test_schema_version_is_1_1(
+        self, synthetic_db, extracted_root, output_path, attachments_dir, state_file
+    ):
+        result = run_extract(
+            synthetic_db, extracted_root, output_path, attachments_dir, state_file,
+            mode="full",
+        )
+        assert result["schema_version"] == "1.1"
+
+
+class TestIncrementalSync:
+    def test_second_run_returns_nothing_new(
+        self, synthetic_db, extracted_root, tmp_path, attachments_dir, state_file
+    ):
+        # First run — full
+        first = tmp_path / "first.json"
+        run_extract(synthetic_db, extracted_root, first, attachments_dir, state_file,
+                    mode="full")
+
+        # Second run — incremental
+        second = tmp_path / "second.json"
+        result = run_extract(synthetic_db, extracted_root, second, attachments_dir, state_file,
+                             mode="incremental")
+        assert result["stats"]["total_messages"] == 0
+        assert result["stats"]["total_chats"] == 0  # no chat had new messages
+
+
+class TestFullContactSync:
+    def test_only_targets_named_contact(
+        self, synthetic_db, extracted_root, output_path, attachments_dir, state_file
+    ):
+        result = run_extract(
+            synthetic_db, extracted_root, output_path, attachments_dir, state_file,
+            mode="full-contact", target_contact="Alice",
+        )
+        assert result["stats"]["total_chats"] == 1
+        assert result["chats"][0]["name"] == "Alice"
+
+    def test_state_unchanged_for_other_chats(
+        self, synthetic_db, extracted_root, tmp_path, attachments_dir, state_file
+    ):
+        # Initial full sync sets all cursors
+        out1 = tmp_path / "1.json"
+        run_extract(synthetic_db, extracted_root, out1, attachments_dir, state_file, mode="full")
+        state_after_full = json.loads(state_file.read_text())
+
+        # full-contact on Alice should NOT touch Bob's cursor
+        out2 = tmp_path / "2.json"
+        run_extract(synthetic_db, extracted_root, out2, attachments_dir, state_file,
+                    mode="full-contact", target_contact="Alice")
+        state_after_contact = json.loads(state_file.read_text())
+
+        assert state_after_full["chats"]["bob@s.whatsapp.net"] == \
+               state_after_contact["chats"]["bob@s.whatsapp.net"]
+
+
+class TestAttachments:
+    def test_image_attached_and_copied(
+        self, synthetic_db, extracted_root, output_path, attachments_dir, state_file
+    ):
+        result = run_extract(
+            synthetic_db, extracted_root, output_path, attachments_dir, state_file,
+            mode="full",
+        )
+        # Find Bob's chat
+        bob = next(c for c in result["chats"] if c["name"] == "Bob")
+        media_msg = next(m for m in bob["messages"] if m["attachment"])
+        assert media_msg["attachment"]["skipped"] is False
+        assert media_msg["attachment"]["sha256"]
+        # File copied
+        copied = attachments_dir / media_msg["attachment"]["filename"]
+        assert copied.exists()
+
+    def test_video_attachment_skipped(
+        self, synthetic_db, extracted_root, output_path, attachments_dir, state_file
+    ):
+        result = run_extract(
+            synthetic_db, extracted_root, output_path, attachments_dir, state_file,
+            mode="full",
+        )
+        # Find group chat
+        group = next(c for c in result["chats"] if c["is_group"])
+        video_msg = next((m for m in group["messages"] if m["attachment"]), None)
+        # Either skipped or filtered
+        assert video_msg is not None
+        assert video_msg["attachment"]["skipped"] is True
+
+
+class TestGroupParticipants:
+    def test_group_chat_has_participants(
+        self, synthetic_db, extracted_root, output_path, attachments_dir, state_file
+    ):
+        result = run_extract(
+            synthetic_db, extracted_root, output_path, attachments_dir, state_file,
+            mode="full",
+        )
+        group = next(c for c in result["chats"] if c["is_group"])
+        assert len(group["participants"]) == 3
+        jids = {p["jid"] for p in group["participants"]}
+        assert "alice@s.whatsapp.net" in jids
+
+    def test_one_to_one_no_participants(
+        self, synthetic_db, extracted_root, output_path, attachments_dir, state_file
+    ):
+        result = run_extract(
+            synthetic_db, extracted_root, output_path, attachments_dir, state_file,
+            mode="full",
+        )
+        alice = next(c for c in result["chats"] if c["name"] == "Alice")
+        assert alice["is_group"] is False
+        assert alice["participants"] == []
+
+
+class TestSystemMessages:
+    def test_system_filtered_by_default(
+        self, synthetic_db, extracted_root, output_path, attachments_dir, state_file
+    ):
+        result = run_extract(
+            synthetic_db, extracted_root, output_path, attachments_dir, state_file,
+            mode="full",
+        )
+        group = next(c for c in result["chats"] if c["is_group"])
+        # Group has 1 system msg (type 10) — should NOT appear
+        types = [m["type"] for m in group["messages"]]
+        assert 10 not in types
+
+    def test_include_system_keeps_them(
+        self, synthetic_db, extracted_root, output_path, attachments_dir, state_file
+    ):
+        result = run_extract(
+            synthetic_db, extracted_root, output_path, attachments_dir, state_file,
+            mode="full", include_system=True,
+        )
+        group = next(c for c in result["chats"] if c["is_group"])
+        types = [m["type"] for m in group["messages"]]
+        assert 10 in types
+
+
+class TestSchemaConformance:
+    def test_output_validates_against_schema(
+        self, synthetic_db, extracted_root, output_path, attachments_dir, state_file
+    ):
+        import jsonschema
+        from pathlib import Path as _P
+
+        run_extract(
+            synthetic_db, extracted_root, output_path, attachments_dir, state_file,
+            mode="full",
+        )
+        schema_path = _P(__file__).parent.parent / "schema.json"
+        schema = json.loads(schema_path.read_text())
+        data = json.loads(output_path.read_text())
+        jsonschema.Draft7Validator(schema).validate(data)
