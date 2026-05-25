@@ -177,14 +177,26 @@ if [[ "$TEMP_DIR_IS_EXTERNAL" == true ]]; then
     fi
 fi
 
-# Legacy SSH/rsync config — only kept for back-compat. The modern flow uses
-# MIKOSHI_URL/MIKOSHI_TOKEN from ~/.mikoshi-ingest.conf, loaded above.
-# Silently source if present; don't warn when absent (the legacy file is
-# expected to be missing on new installs).
+# Report on the actual config that matters for the modern HTTP push flow.
+if [[ -f "$INGEST_CONF" ]]; then
+    log "Mikoshi config loaded from $INGEST_CONF"
+    if [[ -z "${MIKOSHI_URL:-}" ]]; then
+        warn "MIKOSHI_URL is empty — push to Mikoshi will be skipped."
+    fi
+    if [[ -z "${MIKOSHI_TOKEN:-}" ]]; then
+        warn "MIKOSHI_TOKEN is empty — push to Mikoshi will be skipped."
+    fi
+else
+    warn "$INGEST_CONF not found. Push to Mikoshi will be skipped (extraction still runs)."
+    warn "To enable push, create the file with: MIKOSHI_URL=... and MIKOSHI_TOKEN=..."
+fi
+
+# Legacy SSH/rsync config — kept for back-compat only. Silently source if
+# present; don't warn when absent (it's expected to be missing on new installs).
 if [[ -f "$CONFIG_FILE" ]]; then
     # shellcheck disable=SC1090
     source "$CONFIG_FILE"
-    log "Legacy SSH config loaded from $CONFIG_FILE"
+    log "Legacy SSH config also loaded from $CONFIG_FILE"
 fi
 
 cleanup() {
