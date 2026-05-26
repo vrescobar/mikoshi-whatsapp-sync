@@ -163,16 +163,41 @@ class TestSafeDecrypt:
 
 class TestDecryptChatstorage:
     def test_skips_if_already_decrypted(self, tmp_path):
-        """If ChatStorage.sqlite already exists and is non-empty, no decrypt."""
+        """If ChatStorage.sqlite already exists with a valid SQLite header, no decrypt."""
         work_dir = tmp_path / "work"
         work_dir.mkdir()
         existing = work_dir / "ChatStorage.sqlite"
-        existing.write_bytes(b"already here" + b"\x00" * 100)
+        # Must look like a real SQLite file — the validation in decrypt_chatstorage
+        # checks the magic header now (size>0 alone is no longer enough).
+        existing.write_bytes(b"SQLite format 3\x00" + b"\x00" * 100)
 
         # Patch decrypt machinery — if it gets called, the test fails
         with patch.object(eb, "EncryptedBackup", side_effect=AssertionError("should not decrypt")):
             result = eb.decrypt_chatstorage(work_dir)
         assert result == existing
+
+    def test_re_decrypts_if_header_is_corrupt(self, fake_backup_dir, monkeypatch):
+        """A 1.1 GB file of zeros (from a killed Phase 3) passes size>0 but
+        isn't a real SQLite file. decrypt_chatstorage must reject and re-extract."""
+        work_dir = fake_backup_dir / "extracted"
+        work_dir.mkdir()
+        # Looks fine to the eye, fails the header check
+        corrupt = work_dir / "ChatStorage.sqlite"
+        corrupt.write_bytes(b"\x00" * 4096)
+
+        monkeypatch.setattr(eb, "get_passphrase", lambda: "fake-pw")
+        fake_call = {"n": 0}
+
+        class FakeBackup:
+            def __init__(self, **kw): pass
+            def extract_file(self, **kw):
+                fake_call["n"] += 1
+                Path(kw["output_filename"]).write_bytes(b"SQLite format 3\x00decrypted")
+
+        monkeypatch.setattr(eb, "EncryptedBackup", FakeBackup)
+        result = eb.decrypt_chatstorage(work_dir)
+        assert fake_call["n"] == 1, "must re-decrypt when header is invalid"
+        assert result.read_bytes().startswith(b"SQLite format 3\x00")
 
     def test_re_decrypts_if_zero_size(self, fake_backup_dir, monkeypatch):
         """A 0-byte ChatStorage from a previous failed run shouldn't be trusted."""
@@ -195,6 +220,44 @@ class TestDecryptChatstorage:
         result = eb.decrypt_chatstorage(work_dir)
         assert fake_call["n"] == 1
         assert result.read_bytes() == b"decrypted db"
+
+
+# ─── decrypt_media no longer skips when media/ is non-empty ────────────────
+
+class TestDecryptMediaIncremental:
+    """Regression: the old decrypt_media() short-circuited the entire decrypt
+    if `media/` had any file in it. That meant once you decrypted once,
+    later iPhone backups would never bring in new attachments. The new
+    body delegates to selective_decrypt with incremental=True, which
+    skips per-file by mtime, not whole-domain by directory presence.
+    """
+
+    def test_does_not_skip_when_media_dir_is_non_empty(self, fake_backup_dir, monkeypatch):
+        work_dir = fake_backup_dir / "extracted"
+        media_dir = work_dir / "media"
+        media_dir.mkdir(parents=True)
+        # Pre-populate media/ with a stale file (the old code's footgun)
+        (media_dir / "stale.jpg").write_bytes(b"old contents")
+
+        monkeypatch.setattr(eb, "get_passphrase", lambda: "fake-pw")
+
+        called = {"n": 0, "kwargs": None}
+
+        def fake_decrypt_whatsapp(**kwargs):
+            called["n"] += 1
+            called["kwargs"] = kwargs
+            # Simulate the real call: it would write into out_dir/media/
+            from selective_decrypt import DecryptStats
+            return DecryptStats()
+
+        import selective_decrypt
+        monkeypatch.setattr(selective_decrypt, "decrypt_whatsapp", fake_decrypt_whatsapp)
+
+        eb.decrypt_media(work_dir)
+
+        assert called["n"] == 1, "decrypt_media must NOT skip when media/ is non-empty"
+        assert called["kwargs"]["incremental"] is True
+        assert called["kwargs"]["out_dir"] == work_dir
 
 
 # ─── decrypt_chatstorage validates structure ───────────────────────────────

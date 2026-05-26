@@ -31,6 +31,26 @@ bash verify_setup.sh
 ./mikoshi-whatsapp.sh status           # show config & state
 ```
 
+## Updating after a few days away
+
+Plug the iPhone. Open `./mikoshi-whatsapp.sh`. Pick **🔁 Sync — incremental**
+(or **🔂 Sync favorites now**). When asked *"How do you want to sync?"*,
+choose **🔄 Refresh from iPhone**. All four phases are incremental:
+
+- **Phase 2** (`idevicebackup2`) reuses the existing backup directory and
+  only fetches files whose hash changed since the last backup.
+- **Phase 3** (`selective_decrypt.py`, `incremental=True`) skips any media
+  file already on disk with a fresher-or-equal mtime than the manifest.
+- **Phase 4** (`extract_messages.py`) reads the per-JID watermark from
+  `.sync_state.json` and only emits messages newer than the cursor.
+- **Phase 6** (`push_via_api.py`) sends the manifest first; the server
+  responds with `needs_media[]` so only attachments the server lacks are
+  uploaded, and message rows dedup server-side via `external_id="ios:<Z_PK>"`.
+
+Picking **⚡ Extract-only** instead skips Phases 2+3 entirely — useful when
+you've just changed favorites or filters and want a re-export without
+touching the iPhone.
+
 ## Selective sync (single chat)
 
 When you only care about one DM or group, pass `--chat-jid` to short-circuit

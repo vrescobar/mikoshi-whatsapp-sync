@@ -724,6 +724,18 @@ main() {
                 error "--from-phase $FROM_PHASE needs $CHAT_STORAGE to exist."
                 exit 1
             fi
+            # A killed Phase 3 leaves a size-extended but garbage-headered file.
+            # Validate the SQLite magic so we fail fast with an actionable
+            # message instead of crashing in Phase 4 with "file is not a database".
+            if ! python3 -c "
+import sys
+with open('$CHAT_STORAGE', 'rb') as f:
+    sys.exit(0 if f.read(16) == b'SQLite format 3\\x00' else 1)
+" 2>/dev/null; then
+                error "$CHAT_STORAGE is corrupt (bad SQLite header) — likely from a killed Phase 3."
+                error "  rm '$CHAT_STORAGE' && ./mikoshi-whatsapp.sh sync --from-phase 3"
+                exit 1
+            fi
             log "  Reusing decrypted ChatStorage at $CHAT_STORAGE"
         fi
     fi

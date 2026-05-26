@@ -126,7 +126,10 @@ class TestBestFromPhase:
         tui = self._reload_tui(monkeypatch, None)
         phase, label = tui._best_from_phase()
         assert phase == 1
+        # Label must surface that Phase 1 is incremental (regression: it used
+        # to say "full sync" which scared users away from the right choice)
         assert "iPhone" in label
+        assert "incremental" in label.lower()
 
     def test_encrypted_only_returns_phase_3(self, tmp_path, monkeypatch):
         # Set up a fake encrypted backup
@@ -138,6 +141,7 @@ class TestBestFromPhase:
         phase, label = tui._best_from_phase()
         assert phase == 3
         assert "no iphone" in label.lower()
+        assert "re-decrypt" in label.lower()
 
     def test_decrypted_returns_phase_4(self, tmp_path, monkeypatch):
         # Both encrypted backup and decrypted ChatStorage available
@@ -151,6 +155,7 @@ class TestBestFromPhase:
         tui = self._reload_tui(monkeypatch, tmp_path)
         phase, label = tui._best_from_phase()
         assert phase == 4
+        assert "extract-only" in label.lower()
 
     def test_empty_manifest_doesnt_count_as_encrypted(self, tmp_path, monkeypatch):
         # Zero-byte Manifest.plist means the backup is corrupt → don't claim phase 3
@@ -160,6 +165,24 @@ class TestBestFromPhase:
         tui = self._reload_tui(monkeypatch, tmp_path)
         phase, _ = tui._best_from_phase()
         assert phase == 1
+
+    def test_corrupt_chatstorage_falls_back_to_phase_3(self, tmp_path, monkeypatch):
+        """Regression: a 1.1 GB ChatStorage.sqlite full of zeros (from a
+        killed Phase 3 mid-write) used to pass `size > 0` and crash
+        Phase 4 with 'file is not a database'. _best_from_phase must
+        validate the SQLite header and fall back to re-decrypt."""
+        udid_dir = tmp_path / "backup" / "00008130-00011234567890ABCDEF"
+        udid_dir.mkdir(parents=True)
+        (udid_dir / "Manifest.plist").write_bytes(b"bplist00" + b"\x00" * 1000)
+        extracted = tmp_path / "extracted"
+        extracted.mkdir()
+        # Looks fine to the eye (large, non-empty) but invalid header
+        (extracted / "ChatStorage.sqlite").write_bytes(b"\x00" * 4096)
+
+        tui = self._reload_tui(monkeypatch, tmp_path)
+        phase, label = tui._best_from_phase()
+        assert phase == 3, "Corrupt SQLite must not be trusted; fall back to Phase 3"
+        assert "re-decrypt" in label.lower()
 
 
 class TestFmtTs:

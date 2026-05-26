@@ -449,6 +449,25 @@ def action_full_backup():
     pause()
 
 
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+def _looks_like_sqlite(path: Path) -> bool:
+    """Cheapest possible 'is this a real SQLite DB?' check.
+
+    A 1.1 GB file of zeroes passes `size > 0` but blows up later with
+    `sqlite3.DatabaseError: file is not a database` deep in Phase 4.
+    We've been bitten by that — a Phase 3 run killed mid-write leaves
+    the output file size-extended but with the first pages still zero.
+    Header check catches both empty headers and other obvious garbage.
+    """
+    try:
+        with path.open("rb") as f:
+            return f.read(16) == _SQLITE_MAGIC
+    except OSError:
+        return False
+
+
 def _best_from_phase() -> tuple[int, str]:
     """
     Inspect the on-disk state and pick the cheapest --from-phase we can
@@ -470,12 +489,15 @@ def _best_from_phase() -> tuple[int, str]:
             (d / "Manifest.plist").exists() and (d / "Manifest.plist").stat().st_size > 0
             for d in (bdir / "backup").iterdir() if d.is_dir() and len(d.name) > 20
         )
-        decrypted_ok = (bdir / "extracted" / "ChatStorage.sqlite").exists()
+        # File must exist AND have a valid SQLite header — guards against
+        # truncated/zero-header artifacts from a killed decrypt run.
+        chat_db = bdir / "extracted" / "ChatStorage.sqlite"
+        decrypted_ok = chat_db.exists() and _looks_like_sqlite(chat_db)
         if decrypted_ok:
-            return 4, "reuse decrypted ChatStorage (no iPhone needed)"
+            return 4, "Extract-only (seconds, reuses decrypted DB)"
         if encrypted_ok:
-            return 3, "re-decrypt existing backup (no iPhone needed)"
-    return 1, "full sync from iPhone (USB/WiFi required)"
+            return 3, "Re-decrypt existing backup (~30 min, no iPhone)"
+    return 1, "Refresh from iPhone (incremental — fetches only new data)"
 
 
 def _pick_phase_with_user(default_phase: int, default_label: str) -> int | None:
@@ -488,10 +510,14 @@ def _pick_phase_with_user(default_phase: int, default_label: str) -> int | None:
         return 1
     options = [
         Choice(f"⚡ {default_label}", default_phase),
-        Choice("🔄 Full sync from iPhone (slower, requires connection)", 1),
+        Choice("🔄 Refresh from iPhone (incremental — fetches only new data)", 1),
         Choice("← Cancel", None),
     ]
-    return questionary.select("How do you want to sync?", choices=options).ask()
+    return questionary.select(
+        "How do you want to sync?",
+        choices=options,
+        instruction="(all options are incremental — they differ in how far back to restart)",
+    ).ask()
 
 
 def action_backup_one_contact():
