@@ -58,6 +58,8 @@ PIPELINE_LOG="${LOG_DIR}/pipeline_${TIMESTAMP}.log"
 
 SYNC_MODE="incremental"
 TARGET_CONTACT=""
+TARGET_CHAT_JID=""
+SINCE=""
 SKIP_SYNC=false
 INCLUDE_SYSTEM=false
 KEEP_LOCAL_EXPORTS="${KEEP_LOCAL_EXPORTS:-5}"
@@ -73,7 +75,17 @@ Options:
   --mode <incremental|full|full-contact>
         Default: incremental.
   --contact <name-or-jid>
-        Required when --mode=full-contact.
+        Required when --mode=full-contact. Substring match against
+        ZPARTNERNAME / ZCONTACTJID — use --chat-jid for an exact match.
+  --chat-jid <jid>
+        Restrict the run to messages of this exact ZCONTACTJID. When set,
+        Phase 3 ALSO switches to selective decryption: only ChatStorage.sqlite
+        plus the media attachments belonging to this chat are decrypted,
+        instead of the whole WhatsApp shared domain. Massive speedup when
+        you only care about one DM.
+  --since <YYYY-MM-DD>
+        Only extract messages whose timestamp is >= this date. Combines with
+        the per-chat incremental cursor: never rewinds, never goes earlier.
   --include-system
         Include WhatsApp system messages (group events, encryption notices).
   --skip-remote-sync
@@ -125,6 +137,8 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --mode) SYNC_MODE="$2"; shift 2 ;;
         --contact) TARGET_CONTACT="$2"; shift 2 ;;
+        --chat-jid) TARGET_CHAT_JID="$2"; shift 2 ;;
+        --since) SINCE="$2"; shift 2 ;;
         --include-system) INCLUDE_SYSTEM=true; shift ;;
         --skip-remote-sync) SKIP_SYNC=true; shift ;;
         --keep-local) KEEP_LOCAL_EXPORTS="$2"; shift 2 ;;
@@ -151,6 +165,11 @@ done
 
 if [[ "$SYNC_MODE" == "full-contact" && -z "$TARGET_CONTACT" ]]; then
     echo "ERROR: --mode full-contact requires --contact"
+    exit 1
+fi
+
+if [[ -n "$TARGET_CHAT_JID" && -n "$TARGET_CONTACT" ]]; then
+    echo "ERROR: --chat-jid and --contact are mutually exclusive"
     exit 1
 fi
 
@@ -423,29 +442,26 @@ decrypt_backup() {
     EXTRACT_DIR="${TEMP_DIR}/extracted"
     mkdir -p "$EXTRACT_DIR"
 
-    python3 - <<PYEOF
-import sys
-from pathlib import Path
-from iphone_backup_decrypt import EncryptedBackup, RelativePath
+    # Both decrypt paths (3A whole-domain and 3B chat-only) go through
+    # selective_decrypt.py — the bash side just chooses the args. Keeping
+    # the Python logic in a module means it's unit-testable; embedded
+    # heredocs aren't.
+    local sel_args=(
+        --backup-dir "${BACKUP_PATH}/${DEVICE_UDID}"
+        --out-dir "$EXTRACT_DIR"
+    )
+    if [[ -n "$TARGET_CHAT_JID" ]]; then
+        log "  Selective decrypt: chat $TARGET_CHAT_JID"
+        sel_args+=(--chat-jid "$TARGET_CHAT_JID")
+    else
+        log "  Decrypting WhatsApp shared domain (full)"
+    fi
 
-backup_dir = Path("$BACKUP_PATH") / "$DEVICE_UDID"
-out = Path("$EXTRACT_DIR")
-out.mkdir(parents=True, exist_ok=True)
-
-try:
-    eb = EncryptedBackup(backup_directory=str(backup_dir), passphrase="$BACKUP_PASSWORD")
-    eb.extract_file(relative_path=RelativePath.WHATSAPP_MESSAGES,
-                    output_filename=str(out / "ChatStorage.sqlite"))
-    eb.extract_files(domain_like="AppDomainGroup-group.net.whatsapp.WhatsApp.shared",
-                     output_folder=str(out / "media"))
-except Exception as e:
-    msg = str(e).lower()
-    if "password" in msg or "passphrase" in msg or "decrypt" in msg:
-        print(f"[ERROR] Decryption failed — password is wrong: {e}", file=sys.stderr)
-    else:
-        print(f"[ERROR] Decryption failed: {e}", file=sys.stderr)
-    sys.exit(1)
-PYEOF
+    if ! BACKUP_PASSWORD="$BACKUP_PASSWORD" \
+        python3 "${SCRIPT_DIR}/selective_decrypt.py" "${sel_args[@]}"; then
+        error "Decryption failed"
+        return 1
+    fi
 
     CHAT_STORAGE="${EXTRACT_DIR}/ChatStorage.sqlite"
     if [[ ! -f "$CHAT_STORAGE" ]]; then
@@ -471,6 +487,8 @@ extract_and_export() {
         --mode "$SYNC_MODE"
     )
     [[ -n "$TARGET_CONTACT" ]] && args+=(--contact "$TARGET_CONTACT")
+    [[ -n "$TARGET_CHAT_JID" ]] && args+=(--chat-jid "$TARGET_CHAT_JID")
+    [[ -n "$SINCE" ]] && args+=(--since "$SINCE")
     [[ "$INCLUDE_SYSTEM" == true ]] && args+=(--include-system)
     if [[ "$USE_FAVORITES" == true ]]; then
         args+=(--favorites-file "$FAVORITES_FILE")

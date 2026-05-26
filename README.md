@@ -31,6 +31,35 @@ bash verify_setup.sh
 ./mikoshi-whatsapp.sh status           # show config & state
 ```
 
+## Selective sync (single chat)
+
+When you only care about one DM or group, pass `--chat-jid` to short-circuit
+two expensive steps:
+
+- **Phase 3 (decryption)** only decrypts `ChatStorage.sqlite` plus the media
+  attachments that belong to that chat (queried from `ZWAMEDIAITEM`),
+  instead of the whole WhatsApp shared domain. Cuts disk usage and
+  runtime by 1-2 orders of magnitude for a single-chat dump.
+- **Phase 4 (extraction)** filters on `ZCONTACTJID = ?` (exact match — no
+  substring surprises like `--contact`).
+
+```bash
+# Decrypt + extract only this one chat, since 2026-01-01, no remote push:
+./mikoshi-whatsapp.sh sync \
+    --chat-jid '34xxxxxxxxx@s.whatsapp.net' \
+    --since 2026-01-01 \
+    --skip-remote-sync
+```
+
+`--since` combines with the per-chat incremental cursor: it lifts the
+lower bound for fresh chats, but never rewinds a chat whose cursor is
+already past that date.
+
+The TUI's "Backup one contact" picker now propagates the chosen JID as
+`--chat-jid` automatically when you select from the chat list (selective
+decrypt kicks in for free). Free-form typing still uses `--contact`
+(substring match) unless what you typed looks like a JID.
+
 ## Favorites + cron
 
 You can mark a subset of chats as "favorites" — those are the only ones

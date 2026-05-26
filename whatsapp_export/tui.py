@@ -278,19 +278,27 @@ def action_list_chats():
     pause()
 
 
-def pick_contact() -> str | None:
-    """Either pick from existing DB or type free-form."""
+def pick_contact() -> tuple[str, str] | None:
+    """
+    Either pick from the existing DB or type free-form.
+
+    Returns a (flag, value) pair ready to splice into a run_pipeline.sh
+    invocation: ("--chat-jid", "<jid>") when the user picked a known chat
+    (exact-match decrypt + extract), or ("--contact", "<text>") when they
+    typed something free-form (substring match).
+    """
     db = find_existing_chatstorage()
 
     if db:
         chats = list_chats_from_db(db)
-        # Top 50 most recent
+        # Top 50 most recent. Use JID as the *value* so we can flow it
+        # through as --chat-jid (enables selective decryption in Phase 3).
         choices = [
             Choice(
                 title=f"{fmt_ts(c['last_ts']):<12} {c['msg_count']:>5} msgs  {(c['name'] or '—')[:30]}",
-                value=c["name"] or c["jid"],
+                value=c["jid"],
             )
-            for c in chats[:50] if c["name"] or c["jid"]
+            for c in chats[:50] if c["jid"]
         ]
         choices.append(Choice(title="✎ Type name/JID manually", value="__manual__"))
         choices.append(Choice(title="← Cancel", value=None))
@@ -301,16 +309,22 @@ def pick_contact() -> str | None:
             use_search_filter=True,
             use_jk_keys=False,
         ).ask()
-        if pick is None or pick == "__manual__":
-            if pick is None:
-                return None
-        else:
-            return pick
+        if pick is None:
+            return None
+        if pick != "__manual__":
+            return ("--chat-jid", pick)
 
-    return questionary.text(
+    text = questionary.text(
         "Contact name (partial match) or JID:",
         validate=lambda x: bool(x.strip()) or "Required",
     ).ask()
+    if not text:
+        return None
+    # If the user typed something that looks like a JID, prefer the exact
+    # path. Otherwise fall back to substring contact match.
+    if "@" in text:
+        return ("--chat-jid", text.strip())
+    return ("--contact", text.strip())
 
 
 def action_full_backup():
@@ -331,12 +345,21 @@ def action_full_backup():
 
 
 def action_backup_one_contact():
-    contact = pick_contact()
-    if not contact:
+    picked = pick_contact()
+    if not picked:
         return
+    flag, value = picked
     skip_remote = not questionary.confirm("Push to Mikoshi at the end?", default=True).ask()
-    cmd = ["bash", str(SCRIPT_DIR / "run_pipeline.sh"),
-           "--mode", "full-contact", "--contact", contact]
+
+    cmd = ["bash", str(SCRIPT_DIR / "run_pipeline.sh")]
+    if flag == "--chat-jid":
+        # Exact-JID path: selective decrypt in Phase 3 + exact filter in
+        # Phase 4. Massive speedup when only one chat is wanted.
+        cmd += [flag, value]
+    else:
+        # Substring match — legacy path, decrypts the whole shared domain.
+        cmd += ["--mode", "full-contact", flag, value]
+
     if skip_remote:
         cmd.append("--skip-remote-sync")
     run(cmd)

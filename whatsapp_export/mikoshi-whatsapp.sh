@@ -28,6 +28,8 @@ Subcommands:
   sync [OPTS]  Non-interactive sync. Suitable for cron.
                   --all                Sync all chats (ignore favorites).
                   --full               Full re-sync from scratch.
+                  --chat-jid <jid>     Restrict to one chat (selective decrypt).
+                  --since <date>       Only messages since YYYY-MM-DD.
                   --skip-remote-sync   Run extraction but don't push.
                   Anything else gets forwarded to run_pipeline.sh.
   status       Print pipeline status (config, backup, sync state).
@@ -46,6 +48,9 @@ Examples:
   $(basename "$0") sync                           # favorites if any, else all
   $(basename "$0") sync --all                     # force all-chats incremental
   $(basename "$0") sync --skip-remote-sync        # dry run, no push
+
+  # Single chat, since a date — selectively decrypts only that chat's media:
+  $(basename "$0") sync --chat-jid '34xxxxxxxxx@s.whatsapp.net' --since 2026-01-01
 
 Cron example (every 6h):
   0 */6 * * * $SCRIPT_DIR/$(basename "$0") sync >> ~/mikoshi-cron.log 2>&1
