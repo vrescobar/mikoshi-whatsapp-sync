@@ -217,6 +217,20 @@ fi
 cleanup() {
     local exit_code=$?
     log "=== Cleanup (exit $exit_code) ==="
+
+    # When the pipeline fails AFTER Phase 3 (decrypt succeeded) but before
+    # Phase 5 (own cleanup), preserving extracted/ lets the user iterate
+    # with `--from-phase 4` (or 5/6) instead of paying ~30 min for a fresh
+    # decrypt. Safe because extracted/ never contains the encrypted backup.
+    # Set MIKOSHI_PRESERVE_EXTRACTED=0 to opt out.
+    local preserve_extracted=false
+    if [[ $exit_code -ne 0 \
+        && "${MIKOSHI_PRESERVE_EXTRACTED:-1}" != "0" \
+        && "$TEMP_DIR_IS_EXTERNAL" == true \
+        && -f "${TEMP_DIR}/extracted/ChatStorage.sqlite" ]]; then
+        preserve_extracted=true
+    fi
+
     if [[ -d "$TEMP_DIR" ]]; then
         # CRITICAL: the shred target MUST be restricted to the decrypted
         # working area, NEVER the whole $TEMP_DIR. When MIKOSHI_BACKUP_DIR
@@ -229,7 +243,7 @@ cleanup() {
         # The decrypted artifacts only ever live in $TEMP_DIR/extracted/.
         # Anything in $TEMP_DIR/backup/<UDID>/ is the iPhone's encrypted
         # backup and must remain untouched.
-        if [[ -d "${TEMP_DIR}/extracted" ]]; then
+        if [[ -d "${TEMP_DIR}/extracted" && "$preserve_extracted" != true ]]; then
             find "${TEMP_DIR}/extracted" -type f \( \
                 -name "ChatStorage.sqlite" -o \
                 -name "*.plist" -o \
@@ -238,7 +252,11 @@ cleanup() {
             \) -exec shred -vfz -n 7 {} \; 2>/dev/null || true
         fi
 
-        if [[ "$TEMP_DIR_IS_EXTERNAL" == true ]]; then
+        if [[ "$preserve_extracted" == true ]]; then
+            log "✓ Keeping extracted/ for iteration (pipeline failed at exit $exit_code)"
+            log "  Re-run with: ./mikoshi-whatsapp.sh sync --all --from-phase 4"
+            rm -f "${TEMP_DIR}/backup.stderr"
+        elif [[ "$TEMP_DIR_IS_EXTERNAL" == true ]]; then
             # External backup dir (MIKOSHI_BACKUP_DIR): preserve the encrypted
             # iPhone backup so future incremental backups are fast. Only nuke
             # the per-run extracted/ subdir which contains decrypted data.

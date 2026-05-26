@@ -172,6 +172,31 @@ def is_group_chat(jid):
     return bool(jid) and jid.endswith("@g.us")
 
 
+def _resolve_media_size_expr(cursor) -> str:
+    """
+    WhatsApp iOS has used different column names for attachment size across
+    versions: ZMEDIASIZE on older builds, ZFILESIZE on newer ones, and some
+    builds carry both. Inspect ZWAMEDIAITEM to build an expression that
+    works against whichever schema this backup uses.
+
+    Returns the SQL fragment to substitute for `mi.<media_size_col> as media_size`.
+    Picks a sensible NULL if neither column exists.
+    """
+    rows = cursor.execute("PRAGMA table_info(ZWAMEDIAITEM)").fetchall()
+    cols = {row["name"].upper() for row in rows}
+    has_filesize = "ZFILESIZE" in cols
+    has_mediasize = "ZMEDIASIZE" in cols
+    if has_filesize and has_mediasize:
+        return "COALESCE(mi.ZFILESIZE, mi.ZMEDIASIZE) as media_size"
+    if has_filesize:
+        return "mi.ZFILESIZE as media_size"
+    if has_mediasize:
+        return "mi.ZMEDIASIZE as media_size"
+    # Neither — pipeline doesn't actually need this value anyway (size_bytes
+    # is recomputed from the file on disk), so a NULL placeholder is safe.
+    return "NULL as media_size"
+
+
 def extract_messages(
     db_path,
     extracted_root,
@@ -186,6 +211,8 @@ def extract_messages(
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
+
+    media_size_expr = _resolve_media_size_expr(cursor)
 
     chats_query = """
         SELECT
@@ -270,7 +297,7 @@ def extract_messages(
                 mi.ZMEDIALOCALPATH as media_path,
                 mi.ZVCARDSTRING as media_mime,
                 mi.ZTITLE as media_title,
-                mi.ZMEDIASIZE as media_size
+                """ + media_size_expr + """
             FROM ZWAMESSAGE m
             LEFT JOIN ZWAMEDIAITEM mi ON mi.ZMESSAGE = m.Z_PK
             WHERE m.ZCHATSESSION = ? AND m.ZMESSAGEDATE > ?

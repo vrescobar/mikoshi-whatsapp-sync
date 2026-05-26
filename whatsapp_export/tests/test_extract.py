@@ -521,6 +521,61 @@ class TestNullValues:
         assert data["chats"][0]["name"] == "x@s.whatsapp.net"
 
 
+class TestSchemaCompatibility:
+    """Different WhatsApp iOS versions name the attachment size column
+    differently. extract_messages should query the schema at runtime."""
+
+    def _db_with_cols(self, tmp_path, cols):
+        """Build a DB whose ZWAMEDIAITEM has exactly `cols` (plus Z_PK and
+        the always-present columns extract_messages reads)."""
+        import sqlite3
+        db = tmp_path / "schema.sqlite"
+        always = "Z_PK INTEGER PRIMARY KEY, ZMESSAGE INTEGER, " \
+                 "ZMEDIALOCALPATH TEXT, ZVCARDSTRING TEXT, ZTITLE TEXT"
+        extra = ", ".join(f"{c} INTEGER" for c in cols)
+        defn = always + (", " + extra if extra else "")
+        conn = sqlite3.connect(db)
+        conn.execute(f"CREATE TABLE ZWAMEDIAITEM ({defn})")
+        conn.commit()
+        return db
+
+    def test_picks_zfilesize_when_only_filesize(self, tmp_path):
+        from extract_messages import _resolve_media_size_expr
+        import sqlite3
+        db = self._db_with_cols(tmp_path, ["ZFILESIZE"])
+        with sqlite3.connect(db) as c:
+            c.row_factory = sqlite3.Row
+            expr = _resolve_media_size_expr(c.cursor())
+        assert expr == "mi.ZFILESIZE as media_size"
+
+    def test_picks_zmediasize_when_only_mediasize(self, tmp_path):
+        from extract_messages import _resolve_media_size_expr
+        import sqlite3
+        db = self._db_with_cols(tmp_path, ["ZMEDIASIZE"])
+        with sqlite3.connect(db) as c:
+            c.row_factory = sqlite3.Row
+            expr = _resolve_media_size_expr(c.cursor())
+        assert expr == "mi.ZMEDIASIZE as media_size"
+
+    def test_coalesces_when_both_present(self, tmp_path):
+        from extract_messages import _resolve_media_size_expr
+        import sqlite3
+        db = self._db_with_cols(tmp_path, ["ZFILESIZE", "ZMEDIASIZE"])
+        with sqlite3.connect(db) as c:
+            c.row_factory = sqlite3.Row
+            expr = _resolve_media_size_expr(c.cursor())
+        assert expr == "COALESCE(mi.ZFILESIZE, mi.ZMEDIASIZE) as media_size"
+
+    def test_falls_back_to_null_when_neither(self, tmp_path):
+        from extract_messages import _resolve_media_size_expr
+        import sqlite3
+        db = self._db_with_cols(tmp_path, [])
+        with sqlite3.connect(db) as c:
+            c.row_factory = sqlite3.Row
+            expr = _resolve_media_size_expr(c.cursor())
+        assert expr == "NULL as media_size"
+
+
 class TestStateOverlapWithFavorites:
     """The state cursor should only advance for JIDs we actually processed."""
 
