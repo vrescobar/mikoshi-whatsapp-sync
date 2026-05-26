@@ -439,6 +439,23 @@ def action_run_tests():
     pause()
 
 
+def action_verify_backup():
+    """Interactively pick a level then run verify_backup.py."""
+    level = questionary.select(
+        "Which checks?",
+        choices=[
+            Choice("Level 4 — full (extracts ChatStorage, slowest, definitive)", 4),
+            Choice("Level 3 — keybag (passphrase + Manifest.db decrypt, no extract)", 3),
+            Choice("Level 2 — Status.plist parses + 'finished'", 2),
+            Choice("Level 1 — file presence + magic bytes (instant)", 1),
+        ],
+    ).ask()
+    if not level:
+        return
+    run([sys.executable, str(SCRIPT_DIR / "verify_backup.py"), "--level", str(level)])
+    pause()
+
+
 def action_edit_config():
     if not INGEST_CONF.exists():
         if not questionary.confirm(f"{INGEST_CONF} doesn't exist. Create with template?", default=True).ask():
@@ -603,6 +620,7 @@ def action_sync_favorites():
 ACTIONS = [
     ("📊  Show status / config",                action_status),
     ("✅  Verify setup (run checks)",           action_verify),
+    ("🔍  Verify backup integrity",             action_verify_backup),
     ("📋  List chats from backup",              action_list_chats),
     ("📌  Manage favorites",                    action_manage_favorites),
     ("🔂  Sync favorites now",                  action_sync_favorites),

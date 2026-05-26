@@ -35,6 +35,10 @@ Subcommands:
                Delete the partial/corrupt iPhone backup so the next sync
                can start fresh. Asks for confirmation unless --force.
                Only touches MIKOSHI_BACKUP_DIR/backup/<UDID>/.
+  verify-backup [--level 1-4]
+               Run integrity checks against the existing encrypted backup
+               without touching it. Level 1=files+magic, 2=status, 3=keybag,
+               4=ChatStorage extract (default). Useful before/after a sync.
   -h, --help   This message.
 
 Examples:
@@ -164,6 +168,11 @@ tui.action_status()
 PYEOF
 }
 
+cmd_verify_backup() {
+    activate_venv
+    exec python3 "${SCRIPT_DIR}/verify_backup.py" "$@"
+}
+
 cmd_reset_backup() {
     local force=false
     if [[ "${1:-}" == "--force" ]]; then
@@ -237,10 +246,11 @@ if [[ $# -eq 0 ]]; then
 fi
 
 case "$1" in
-    tui)           shift; cmd_tui "$@" ;;
-    sync)          shift; cmd_sync "$@" ;;
-    status)        shift; cmd_status "$@" ;;
-    reset-backup)  shift; cmd_reset_backup "$@" ;;
-    -h|--help)     usage ;;
-    *)             echo "Unknown subcommand: $1"; echo; usage; exit 1 ;;
+    tui)            shift; cmd_tui "$@" ;;
+    sync)           shift; cmd_sync "$@" ;;
+    status)         shift; cmd_status "$@" ;;
+    reset-backup)   shift; cmd_reset_backup "$@" ;;
+    verify-backup)  shift; cmd_verify_backup "$@" ;;
+    -h|--help)      usage ;;
+    *)              echo "Unknown subcommand: $1"; echo; usage; exit 1 ;;
 esac
