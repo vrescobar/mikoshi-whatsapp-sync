@@ -223,6 +223,11 @@ def run(cmd: list[str], env_extra: dict | None = None) -> int:
 
 def pause():
     console.print()
+    if not sys.stdin.isatty():
+        # Non-interactive contexts (cron, `mikoshi-whatsapp.sh status` piped,
+        # pytest subprocess) have no human to press a key. Returning makes the
+        # caller terminate cleanly instead of blocking forever on read().
+        return
     questionary.press_any_key_to_continue("Press any key to return to menu...").ask()
 
 

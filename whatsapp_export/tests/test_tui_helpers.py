@@ -233,6 +233,9 @@ class TestFindExistingChatstorage:
     def test_returns_none_when_missing(self, tmp_path, monkeypatch):
         sys.modules.pop("tui", None)
         monkeypatch.delenv("MIKOSHI_BACKUP_DIR", raising=False)
+        # Point INGEST_CONF at a nonexistent path so the developer's real
+        # ~/.mikoshi-ingest.conf doesn't leak MIKOSHI_BACKUP_DIR into the test.
+        monkeypatch.setenv("MIKOSHI_INGEST_CONF", str(tmp_path / "nope.conf"))
         import tui
         monkeypatch.setattr(tui, "SCRIPT_DIR", tmp_path)
         assert tui.find_existing_chatstorage() is None
