@@ -444,11 +444,62 @@ def action_full_backup():
     pause()
 
 
+def _best_from_phase() -> tuple[int, str]:
+    """
+    Inspect the on-disk state and pick the cheapest --from-phase we can
+    safely start from.
+
+    Returns (phase, label). Phases mean:
+      1 — no usable backup at all → need iPhone connected (Phase 1+)
+      3 — encrypted backup exists, decryption hasn't happened (or was wiped)
+      4 — decrypted ChatStorage exists → extraction-only, seconds
+
+    Avoids the "Sync — one contact only" → Phase 1 → no iPhone → failure
+    trap we hit when the user already has a perfectly good backup on disk.
+    """
+    cfg = load_ingest_conf()
+    bdir = get_backup_dir(cfg)
+    if bdir:
+        # Has the backup completed?
+        encrypted_ok = (bdir / "backup").exists() and any(
+            (d / "Manifest.plist").exists() and (d / "Manifest.plist").stat().st_size > 0
+            for d in (bdir / "backup").iterdir() if d.is_dir() and len(d.name) > 20
+        )
+        decrypted_ok = (bdir / "extracted" / "ChatStorage.sqlite").exists()
+        if decrypted_ok:
+            return 4, "reuse decrypted ChatStorage (no iPhone needed)"
+        if encrypted_ok:
+            return 3, "re-decrypt existing backup (no iPhone needed)"
+    return 1, "full sync from iPhone (USB/WiFi required)"
+
+
+def _pick_phase_with_user(default_phase: int, default_label: str) -> int | None:
+    """
+    Surface the auto-detected phase to the user and let them override.
+    Returns the selected phase, or None if cancelled.
+    """
+    if default_phase == 1:
+        # Nothing else to offer
+        return 1
+    options = [
+        Choice(f"⚡ {default_label}", default_phase),
+        Choice("🔄 Full sync from iPhone (slower, requires connection)", 1),
+        Choice("← Cancel", None),
+    ]
+    return questionary.select("How do you want to sync?", choices=options).ask()
+
+
 def action_backup_one_contact():
     picked = pick_contact()
     if not picked:
         return
     flag, value = picked
+
+    default_phase, default_label = _best_from_phase()
+    phase = _pick_phase_with_user(default_phase, default_label)
+    if phase is None:
+        return
+
     skip_remote = not questionary.confirm("Push to Mikoshi at the end?", default=True).ask()
 
     cmd = ["bash", str(SCRIPT_DIR / "run_pipeline.sh")]
@@ -460,6 +511,8 @@ def action_backup_one_contact():
         # Substring match — legacy path, decrypts the whole shared domain.
         cmd += ["--mode", "full-contact", flag, value]
 
+    if phase > 1:
+        cmd += ["--from-phase", str(phase)]
     if skip_remote:
         cmd.append("--skip-remote-sync")
     run(cmd)
@@ -467,8 +520,15 @@ def action_backup_one_contact():
 
 
 def action_incremental():
+    default_phase, default_label = _best_from_phase()
+    phase = _pick_phase_with_user(default_phase, default_label)
+    if phase is None:
+        return
+
     skip_remote = not questionary.confirm("Push to Mikoshi at the end?", default=True).ask()
     cmd = ["bash", str(SCRIPT_DIR / "run_pipeline.sh")]
+    if phase > 1:
+        cmd += ["--from-phase", str(phase)]
     if skip_remote:
         cmd.append("--skip-remote-sync")
     run(cmd)

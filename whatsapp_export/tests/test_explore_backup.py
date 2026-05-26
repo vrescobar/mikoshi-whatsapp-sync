@@ -216,3 +216,62 @@ class TestRequiredFiles:
     def test_includes_manifest_plist(self):
         assert "Manifest.plist" in eb.REQUIRED_BACKUP_FILES
         assert "Manifest.db" in eb.REQUIRED_BACKUP_FILES
+
+
+# ─── list-chats survives garbage timestamps ───────────────────────────────
+
+class TestListChatsTimestampSafety:
+    """Regression: ZLASTMESSAGEDATE occasionally carries values that overflow
+    datetime ('year must be in 1..9999, not 11001'). The whole listing
+    must not crash because of one bad row.
+    """
+
+    def _build_db_with_bad_ts(self, path):
+        import sqlite3
+        conn = sqlite3.connect(path)
+        conn.executescript("""
+            CREATE TABLE ZWACHATSESSION (
+                Z_PK INTEGER PRIMARY KEY,
+                ZCONTACTJID TEXT,
+                ZPARTNERNAME TEXT,
+                ZLASTMESSAGEDATE REAL
+            );
+            CREATE TABLE ZWAMESSAGE (
+                Z_PK INTEGER PRIMARY KEY,
+                ZCHATSESSION INTEGER
+            );
+            -- A normal chat
+            INSERT INTO ZWACHATSESSION VALUES
+                (1, 'alice@s.whatsapp.net', 'Alice', 700000000.0);
+            -- A row with an absurd timestamp (year 11001)
+            INSERT INTO ZWACHATSESSION VALUES
+                (2, 'ghost@s.whatsapp.net', 'Ghost', 285170400000.0);
+            -- A row with a negative timestamp
+            INSERT INTO ZWACHATSESSION VALUES
+                (3, 'neg@s.whatsapp.net', 'Neg', -9999999999.0);
+        """)
+        conn.commit()
+        conn.close()
+
+    def test_cmd_list_chats_doesnt_crash_on_bad_ts(self, tmp_path, monkeypatch, capsys):
+        from unittest.mock import patch
+
+        db = tmp_path / "ChatStorage.sqlite"
+        self._build_db_with_bad_ts(db)
+
+        # cmd_list_chats calls decrypt_chatstorage which will try to decrypt;
+        # short-circuit that by patching it to return the prebuilt DB.
+        with patch.object(eb, "decrypt_chatstorage", return_value=db):
+            from argparse import Namespace
+            # Should NOT raise — print all 3 rows with "—" for the bad ones
+            eb.cmd_list_chats(Namespace())
+
+        out = capsys.readouterr().out
+        # All three chats appeared
+        assert "Alice" in out
+        assert "Ghost" in out
+        assert "Neg" in out
+        # The bad-ts row's date got replaced with the placeholder
+        assert "—" in out
+        # And the good one still has a real date (700000000 iOS ts ≈ 2023)
+        assert "2023-" in out

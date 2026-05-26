@@ -201,14 +201,24 @@ def cmd_list_chats(args):
         ORDER BY s.ZLASTMESSAGEDATE DESC NULLS LAST
     """).fetchall()
 
+    def _fmt_ts(ios_ts):
+        # Real ChatStorage rows occasionally carry garbage values (year 11001
+        # from uninitialised system events / corrupted entries). Don't crash
+        # the whole listing because of one bad row.
+        if not ios_ts:
+            return ""
+        try:
+            unix = ios_ts + IOS_EPOCH
+            if not 0 <= unix <= 4_102_444_800:  # 1970 .. 2100
+                return "—"
+            return datetime.fromtimestamp(unix, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+        except (ValueError, OverflowError, OSError):
+            return "—"
+
     print(f"\n{'Last msg':<20} {'Msgs':>7}  {'Type':<6} {'Name':<35} JID")
     print("-" * 110)
     for r in rows:
-        last = ""
-        if r["last_ts"]:
-            last = datetime.fromtimestamp(
-                r["last_ts"] + IOS_EPOCH, tz=timezone.utc
-            ).strftime("%Y-%m-%d %H:%M")
+        last = _fmt_ts(r["last_ts"])
         kind = "group" if (r["jid"] or "").endswith("@g.us") else "1-on-1"
         name = (r["name"] or "—")[:34]
         print(f"{last:<20} {r['msg_count']:>7}  {kind:<6} {name:<35} {r['jid']}")

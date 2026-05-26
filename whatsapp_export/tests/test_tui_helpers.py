@@ -104,6 +104,64 @@ class TestLoadIngestConf:
 
 # ─── fmt_ts ────────────────────────────────────────────────────────────────
 
+class TestBestFromPhase:
+    """The 'Sync — one contact only' bug: pipeline started at Phase 1
+    (Device Detection) and failed when the iPhone wasn't connected, even
+    though a perfectly good backup was on disk. _best_from_phase picks
+    the cheapest --from-phase based on what's already decrypted/encrypted.
+    """
+
+    def _reload_tui(self, monkeypatch, backup_dir):
+        sys.modules.pop("tui", None)
+        if backup_dir is None:
+            monkeypatch.delenv("MIKOSHI_BACKUP_DIR", raising=False)
+        else:
+            monkeypatch.setenv("MIKOSHI_BACKUP_DIR", str(backup_dir))
+        # Strip any inherited conf path that could shadow our env
+        monkeypatch.setenv("MIKOSHI_INGEST_CONF", "/tmp/__test_no_conf__")
+        import tui
+        return tui
+
+    def test_no_backup_at_all_returns_phase_1(self, tmp_path, monkeypatch):
+        tui = self._reload_tui(monkeypatch, None)
+        phase, label = tui._best_from_phase()
+        assert phase == 1
+        assert "iPhone" in label
+
+    def test_encrypted_only_returns_phase_3(self, tmp_path, monkeypatch):
+        # Set up a fake encrypted backup
+        udid_dir = tmp_path / "backup" / "00008130-00011234567890ABCDEF"
+        udid_dir.mkdir(parents=True)
+        (udid_dir / "Manifest.plist").write_bytes(b"bplist00" + b"\x00" * 1000)
+
+        tui = self._reload_tui(monkeypatch, tmp_path)
+        phase, label = tui._best_from_phase()
+        assert phase == 3
+        assert "no iphone" in label.lower()
+
+    def test_decrypted_returns_phase_4(self, tmp_path, monkeypatch):
+        # Both encrypted backup and decrypted ChatStorage available
+        udid_dir = tmp_path / "backup" / "00008130-00011234567890ABCDEF"
+        udid_dir.mkdir(parents=True)
+        (udid_dir / "Manifest.plist").write_bytes(b"bplist00" + b"\x00" * 1000)
+        extracted = tmp_path / "extracted"
+        extracted.mkdir()
+        (extracted / "ChatStorage.sqlite").write_bytes(b"SQLite format 3\x00")
+
+        tui = self._reload_tui(monkeypatch, tmp_path)
+        phase, label = tui._best_from_phase()
+        assert phase == 4
+
+    def test_empty_manifest_doesnt_count_as_encrypted(self, tmp_path, monkeypatch):
+        # Zero-byte Manifest.plist means the backup is corrupt → don't claim phase 3
+        udid_dir = tmp_path / "backup" / "00008130-00011234567890ABCDEF"
+        udid_dir.mkdir(parents=True)
+        (udid_dir / "Manifest.plist").write_bytes(b"")
+        tui = self._reload_tui(monkeypatch, tmp_path)
+        phase, _ = tui._best_from_phase()
+        assert phase == 1
+
+
 class TestFmtTs:
     def setup_method(self):
         sys.modules.pop("tui", None)
