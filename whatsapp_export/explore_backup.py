@@ -128,11 +128,31 @@ def _safe_decrypt(operation_label: str, fn):
         sys.exit(3)
 
 
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+def _looks_like_sqlite(path: Path) -> bool:
+    """A killed decrypt run leaves the output file size-extended but with
+    a zero (or garbage) header. `size > 0` passes, but Phase 4 then dies
+    with `sqlite3.DatabaseError: file is not a database`. Header check
+    catches that footgun without opening the DB."""
+    try:
+        with path.open("rb") as f:
+            return f.read(16) == _SQLITE_MAGIC
+    except OSError:
+        return False
+
+
 def decrypt_chatstorage(work_dir: Path) -> Path:
-    """Decrypt ChatStorage.sqlite if not already present."""
+    """Decrypt ChatStorage.sqlite if not already present and valid."""
     chat_db = work_dir / "ChatStorage.sqlite"
-    if chat_db.exists() and chat_db.stat().st_size > 0:
+    if chat_db.exists() and _looks_like_sqlite(chat_db):
         return chat_db
+    if chat_db.exists():
+        # File present but header looks wrong — almost certainly a truncated
+        # write from a killed decrypt. Drop it so we re-extract cleanly.
+        print(f"[WARN] {chat_db} has an invalid SQLite header — re-extracting.")
+        chat_db.unlink()
 
     base = get_backup_dir()
     device_backup = find_device_backup(base)
@@ -153,24 +173,31 @@ def decrypt_chatstorage(work_dir: Path) -> Path:
 
 
 def decrypt_media(work_dir: Path) -> Path:
-    """Decrypt the WhatsApp media domain (for full extract)."""
-    media_dir = work_dir / "media"
-    if media_dir.exists() and any(media_dir.iterdir()):
-        return media_dir
+    """
+    Decrypt the WhatsApp media domain into work_dir/media/.
 
+    Delegates to selective_decrypt.decrypt_whatsapp(..., incremental=True) so
+    files already on disk with fresher-or-equal mtime are skipped at the
+    file level. The previous wholesale "if media/ is non-empty, skip
+    everything" shortcut meant new attachments from later backups were
+    never fetched.
+    """
+    media_dir = work_dir / "media"
     base = get_backup_dir()
     device_backup = find_device_backup(base)
     validate_backup_structure(device_backup)
     passphrase = get_passphrase()
 
-    print("[INFO] Decrypting WhatsApp media (this may take a while)...")
-    media_dir.mkdir(parents=True, exist_ok=True)
+    print("[INFO] Decrypting WhatsApp media (incremental — skips files already on disk)...")
+    work_dir.mkdir(parents=True, exist_ok=True)
 
     def _do():
-        eb = EncryptedBackup(backup_directory=str(device_backup), passphrase=passphrase)
-        eb.extract_files(
-            domain_like="AppDomainGroup-group.net.whatsapp.WhatsApp.shared",
-            output_folder=str(media_dir),
+        import selective_decrypt
+        selective_decrypt.decrypt_whatsapp(
+            backup_dir=device_backup,
+            password=passphrase,
+            out_dir=work_dir,
+            incremental=True,
         )
     _safe_decrypt("decrypting WhatsApp media", _do)
     return media_dir
@@ -201,14 +228,24 @@ def cmd_list_chats(args):
         ORDER BY s.ZLASTMESSAGEDATE DESC NULLS LAST
     """).fetchall()
 
+    def _fmt_ts(ios_ts):
+        # Real ChatStorage rows occasionally carry garbage values (year 11001
+        # from uninitialised system events / corrupted entries). Don't crash
+        # the whole listing because of one bad row.
+        if not ios_ts:
+            return ""
+        try:
+            unix = ios_ts + IOS_EPOCH
+            if not 0 <= unix <= 4_102_444_800:  # 1970 .. 2100
+                return "—"
+            return datetime.fromtimestamp(unix, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+        except (ValueError, OverflowError, OSError):
+            return "—"
+
     print(f"\n{'Last msg':<20} {'Msgs':>7}  {'Type':<6} {'Name':<35} JID")
     print("-" * 110)
     for r in rows:
-        last = ""
-        if r["last_ts"]:
-            last = datetime.fromtimestamp(
-                r["last_ts"] + IOS_EPOCH, tz=timezone.utc
-            ).strftime("%Y-%m-%d %H:%M")
+        last = _fmt_ts(r["last_ts"])
         kind = "group" if (r["jid"] or "").endswith("@g.us") else "1-on-1"
         name = (r["name"] or "—")[:34]
         print(f"{last:<20} {r['msg_count']:>7}  {kind:<6} {name:<35} {r['jid']}")

@@ -126,10 +126,76 @@ def attachment_is_allowed(mime, file_path):
     return True, "ok"
 
 
-def find_attachment_file(media_local_path, extracted_root):
+def build_attachments_index(extracted_root):
+    """
+    Walk extracted_root ONCE and build two lookup tables.
+
+    - `by_relpath`: maps the WhatsApp-internal media path (the value stored in
+      ZWAMEDIAITEM.ZMEDIALOCALPATH, e.g. "Media/abc/xyz.jpg") to its absolute
+      path on disk. Exact-match, unambiguous.
+    - `by_basename`: maps just the filename to a list of absolute paths.
+      Fallback for the (rare) case where ZMEDIALOCALPATH on iOS doesn't
+      match how the file landed under `extracted/`.
+
+    Building the index once is the difference between O(N) and O(N²) lookups
+    over hundreds of thousands of messages. Before this refactor each message
+    triggered an `rglob` over the entire decrypted media tree.
+    """
+    by_relpath: dict[str, str] = {}
+    by_basename: dict[str, list[str]] = {}
+    if not extracted_root.exists():
+        return {"by_relpath": by_relpath, "by_basename": by_basename}
+    root_str = str(extracted_root)
+    root_len = len(root_str.rstrip(os.sep)) + 1
+    for dirpath, _dirnames, filenames in os.walk(extracted_root):
+        for fname in filenames:
+            full = os.path.join(dirpath, fname)
+            # Relative path from extracted_root, normalised to forward slashes
+            # so it can match WhatsApp's "Media/foo/bar.jpg" style.
+            rel = full[root_len:].replace(os.sep, "/")
+            by_relpath[rel] = full
+            by_basename.setdefault(fname, []).append(full)
+    return {"by_relpath": by_relpath, "by_basename": by_basename}
+
+
+def find_attachment_file(media_local_path, extracted_root, attachments_index=None):
+    """
+    Resolve ZMEDIALOCALPATH to an on-disk file.
+
+    Prefers the prebuilt `attachments_index` (O(1) dict lookup) when provided.
+    Falls back to a one-shot rglob ONLY when no index is supplied — this path
+    exists for callers that don't go through the bulk extractor (tests,
+    scripting), and is never hit during a normal pipeline run.
+    """
     if not media_local_path:
         return None
-    candidates = list(extracted_root.rglob(Path(media_local_path).name))
+    target_rel = str(media_local_path).replace(os.sep, "/").lstrip("/")
+    target_name = Path(media_local_path).name
+
+    if attachments_index is not None:
+        by_relpath = attachments_index.get("by_relpath", {})
+        by_basename = attachments_index.get("by_basename", {})
+
+        # Exact relpath match — the happy path for current WhatsApp iOS
+        # backups where ZMEDIALOCALPATH and the decrypted tree layout agree.
+        if target_rel in by_relpath:
+            return Path(by_relpath[target_rel])
+
+        # The decrypter may write WhatsApp shared media under an extra
+        # prefix (e.g. "media/Media/foo.jpg" when the relpath in the DB is
+        # just "Media/foo.jpg"). Try the suffix match.
+        for rel, full in by_relpath.items():
+            if rel.endswith("/" + target_rel) or rel == target_rel:
+                return Path(full)
+
+        # Last resort: any file with the same basename.
+        candidates = by_basename.get(target_name)
+        if candidates:
+            return Path(candidates[0])
+        return None
+
+    # No index — fallback for tests / one-off callers.
+    candidates = list(extracted_root.rglob(target_name))
     return candidates[0] if candidates else None
 
 
@@ -205,6 +271,8 @@ def extract_messages(
     sync_state,
     mode="incremental",
     target_contact=None,
+    target_chat_jid=None,
+    since_iso=None,
     include_system=False,
     favorite_jids=None,
 ):
@@ -224,7 +292,14 @@ def extract_messages(
         WHERE ZCONTACTJID IS NOT NULL
     """
     params: tuple = ()
-    if mode == "full-contact" and target_contact:
+    if target_chat_jid:
+        # Exact-match filter — preferred when the caller already has a JID
+        # (e.g. from /memory/scopes flows or a previous run). Unlike
+        # --contact this never matches partial names.
+        chats_query += " AND ZCONTACTJID = ?"
+        params = (target_chat_jid,)
+        print(f"[INFO] Filtering to chat JID {target_chat_jid}")
+    elif mode == "full-contact" and target_contact:
         chats_query += " AND (ZPARTNERNAME LIKE ? OR ZCONTACTJID LIKE ?)"
         params = (f"%{target_contact}%", f"%{target_contact}%")
 
@@ -256,12 +331,30 @@ def extract_messages(
     attachments_dir.mkdir(parents=True, exist_ok=True)
     new_state = dict(sync_state.get("chats", {}))
 
+    # Build the attachments index ONCE for the whole run. Was the smoking gun
+    # behind the ~5-9h Phase-4 projection: each message used to trigger an
+    # rglob over the entire decrypted media tree (40k+ files), turning the
+    # extractor into an O(N*M) operation. Now it's O(N+M).
+    print(f"[INFO] Indexing decrypted media tree under {extracted_root}…")
+    _idx_start = datetime.now(timezone.utc)
+    attachments_index = build_attachments_index(extracted_root)
+    _idx_files = len(attachments_index.get("by_relpath", {}))
+    _idx_elapsed = (datetime.now(timezone.utc) - _idx_start).total_seconds()
+    print(f"[INFO] Indexed {_idx_files} file(s) in {_idx_elapsed:.1f}s")
+
+    # since_iso → iOS cutoff (clamped against per-chat cursors).
+    since_ios = iso_to_ios_timestamp(since_iso) if since_iso else 0.0
+    if since_iso:
+        print(f"[INFO] Applying --since cutoff {since_iso} (iOS ts {since_ios:.0f})")
+
     export = {
         "schema_version": "1.2",
         "client_id": os.environ.get("MIKOSHI_CLIENT_ID", platform.node() or "macos-client"),
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "mode": mode,
         "target_contact": target_contact,
+        "target_chat_jid": target_chat_jid,
+        "since": since_iso,
         "include_system_messages": include_system,
         "chats": [],
     }
@@ -281,6 +374,13 @@ def extract_messages(
             cutoff_ios = iso_to_ios_timestamp(last_ts_iso) if last_ts_iso else 0.0
         else:
             cutoff_ios = 0.0
+
+        # --since acts as a *lower bound* relative to the chat cursor: a user
+        # asking "give me everything since 2024-01-01" never wants messages
+        # older than that, even if the per-chat cursor hasn't been set yet.
+        # Conversely we never *rewind* the cursor with --since.
+        if since_ios and since_ios > cutoff_ios:
+            cutoff_ios = since_ios
 
         messages = cursor.execute(
             """
@@ -346,7 +446,9 @@ def extract_messages(
             }
 
             if m["media_pk"]:
-                source_file = find_attachment_file(m["media_path"], extracted_root)
+                source_file = find_attachment_file(
+                    m["media_path"], extracted_root, attachments_index=attachments_index
+                )
                 allowed, reason = attachment_is_allowed(m["media_mime"], source_file)
 
                 if not allowed:
@@ -362,7 +464,12 @@ def extract_messages(
                     ext = source_file.suffix or ".bin"
                     dest_name = f"{file_hash}{ext}"
                     dest = attachments_dir / dest_name
-                    if not dest.exists():
+                    # Skip-if-exists with size check — preserves the ~40k
+                    # attachments already on disk from earlier (killed) runs.
+                    src_size = source_file.stat().st_size
+                    if dest.exists() and dest.stat().st_size == src_size:
+                        pass  # already there from a prior run
+                    else:
                         shutil.copy2(source_file, dest)
 
                     total_attachments += 1
@@ -371,16 +478,23 @@ def extract_messages(
                         "sha256": file_hash,
                         "filename": dest_name,
                         "mime": m["media_mime"],
-                        "size_bytes": source_file.stat().st_size,
+                        "size_bytes": src_size,
                         "title": m["media_title"],
                     }
 
             chat_obj["messages"].append(msg_obj)
             total_msgs += 1
+            if total_msgs % 5000 == 0:
+                print(f"[INFO] …progress: {total_msgs} messages processed", flush=True)
 
         export["chats"].append(chat_obj)
 
-        if mode != "full-contact" or chat_jid == chat["jid"]:
+        # Advance the watermark only for chats we actually processed in this
+        # run. Both `full-contact` and `--chat-jid` are *scoped* runs by
+        # design — they must not touch cursors for chats they didn't touch,
+        # or the next incremental sync will silently skip messages.
+        scoped_run = mode == "full-contact" or target_chat_jid is not None
+        if (not scoped_run) or chat_jid == chat["jid"]:
             new_state[chat_jid] = ios_timestamp_to_iso(latest_ts_in_chat)
 
         print(
@@ -419,6 +533,19 @@ def main():
         "--mode", choices=["incremental", "full", "full-contact"], default="incremental"
     )
     parser.add_argument("--contact", help="Required when --mode=full-contact")
+    parser.add_argument(
+        "--chat-jid",
+        help="Restrict extraction to this exact ZCONTACTJID. Stronger and "
+             "more predictable than --contact (which does a substring match "
+             "against name and JID).",
+    )
+    parser.add_argument(
+        "--since",
+        help="Only emit messages whose timestamp is >= this ISO-8601 date "
+             "(e.g. 2026-01-01). Combines with the per-chat watermark: "
+             "we never rewind, but we never go further back than --since "
+             "either.",
+    )
     parser.add_argument(
         "--include-system",
         action="store_true",
@@ -464,6 +591,8 @@ def main():
         sync_state=sync_state,
         mode=args.mode,
         target_contact=args.contact,
+        target_chat_jid=args.chat_jid,
+        since_iso=args.since,
         include_system=args.include_system,
         favorite_jids=favorite_jids,
     )

@@ -31,6 +31,78 @@ bash verify_setup.sh
 ./mikoshi-whatsapp.sh status           # show config & state
 ```
 
+## Updating after a few days away
+
+Plug the iPhone. Open `./mikoshi-whatsapp.sh`. Pick **🔁 Sync — incremental**
+(or **🔂 Sync favorites now**). When asked *"How do you want to sync?"*,
+choose **🔄 Refresh from iPhone**. All four phases are incremental:
+
+- **Phase 2** (`idevicebackup2`) reuses the existing backup directory and
+  only fetches files whose hash changed since the last backup.
+- **Phase 3** (`selective_decrypt.py`, `incremental=True`) skips any media
+  file already on disk with a fresher-or-equal mtime than the manifest.
+- **Phase 4** (`extract_messages.py`) reads the per-JID watermark from
+  `.sync_state.json` and only emits messages newer than the cursor.
+- **Phase 6** (`push_via_api.py`) sends the manifest first; the server
+  responds with `needs_media[]` so only attachments the server lacks are
+  uploaded, and message rows dedup server-side via `external_id="ios:<Z_PK>"`.
+
+Picking **⚡ Extract-only** instead skips Phases 2+3 entirely — useful when
+you've just changed favorites or filters and want a re-export without
+touching the iPhone.
+
+## Selective sync (single chat)
+
+When you only care about one DM or group, pass `--chat-jid` to short-circuit
+two expensive steps:
+
+- **Phase 3 (decryption)** only decrypts `ChatStorage.sqlite` plus the media
+  attachments that belong to that chat (queried from `ZWAMEDIAITEM`),
+  instead of the whole WhatsApp shared domain. Cuts disk usage and
+  runtime by 1-2 orders of magnitude for a single-chat dump.
+- **Phase 4 (extraction)** filters on `ZCONTACTJID = ?` (exact match — no
+  substring surprises like `--contact`).
+
+```bash
+# Decrypt + extract only this one chat, since 2026-01-01, no remote push:
+./mikoshi-whatsapp.sh sync \
+    --chat-jid '34xxxxxxxxx@s.whatsapp.net' \
+    --since 2026-01-01 \
+    --skip-remote-sync
+```
+
+`--since` combines with the per-chat incremental cursor: it lifts the
+lower bound for fresh chats, but never rewinds a chat whose cursor is
+already past that date.
+
+### Iterating without re-decrypting
+
+By default the pipeline now **keeps the decrypted artifacts** under
+`MIKOSHI_BACKUP_DIR/extracted/` between runs (defaults to *preserve*),
+so the next invocation can pass `--from-phase 4` and skip the ~30 min
+of decryption. Persist the flag in `~/.mikoshi-ingest.conf`:
+
+```
+# Default — keep ChatStorage.sqlite + media decrypted across runs.
+# Flip to false if you want extracted/ wiped after every successful run.
+MIKOSHI_PRESERVE_EXTRACTED=true
+```
+
+TUI exposes this as a one-key toggle:
+
+```
+mikoshi-whatsapp.sh   →   🔐  Toggle keep decrypted between runs
+```
+
+Accepted values (case-insensitive): `true/yes/on/1` vs `false/no/off/0`.
+The encrypted iPhone backup under `backup/<UDID>/` is always preserved —
+only the decrypted subtree is affected by this flag.
+
+The TUI's "Backup one contact" picker now propagates the chosen JID as
+`--chat-jid` automatically when you select from the chat list (selective
+decrypt kicks in for free). Free-form typing still uses `--contact`
+(substring match) unless what you typed looks like a JID.
+
 ## Favorites + cron
 
 You can mark a subset of chats as "favorites" — those are the only ones

@@ -163,16 +163,41 @@ class TestSafeDecrypt:
 
 class TestDecryptChatstorage:
     def test_skips_if_already_decrypted(self, tmp_path):
-        """If ChatStorage.sqlite already exists and is non-empty, no decrypt."""
+        """If ChatStorage.sqlite already exists with a valid SQLite header, no decrypt."""
         work_dir = tmp_path / "work"
         work_dir.mkdir()
         existing = work_dir / "ChatStorage.sqlite"
-        existing.write_bytes(b"already here" + b"\x00" * 100)
+        # Must look like a real SQLite file — the validation in decrypt_chatstorage
+        # checks the magic header now (size>0 alone is no longer enough).
+        existing.write_bytes(b"SQLite format 3\x00" + b"\x00" * 100)
 
         # Patch decrypt machinery — if it gets called, the test fails
         with patch.object(eb, "EncryptedBackup", side_effect=AssertionError("should not decrypt")):
             result = eb.decrypt_chatstorage(work_dir)
         assert result == existing
+
+    def test_re_decrypts_if_header_is_corrupt(self, fake_backup_dir, monkeypatch):
+        """A 1.1 GB file of zeros (from a killed Phase 3) passes size>0 but
+        isn't a real SQLite file. decrypt_chatstorage must reject and re-extract."""
+        work_dir = fake_backup_dir / "extracted"
+        work_dir.mkdir()
+        # Looks fine to the eye, fails the header check
+        corrupt = work_dir / "ChatStorage.sqlite"
+        corrupt.write_bytes(b"\x00" * 4096)
+
+        monkeypatch.setattr(eb, "get_passphrase", lambda: "fake-pw")
+        fake_call = {"n": 0}
+
+        class FakeBackup:
+            def __init__(self, **kw): pass
+            def extract_file(self, **kw):
+                fake_call["n"] += 1
+                Path(kw["output_filename"]).write_bytes(b"SQLite format 3\x00decrypted")
+
+        monkeypatch.setattr(eb, "EncryptedBackup", FakeBackup)
+        result = eb.decrypt_chatstorage(work_dir)
+        assert fake_call["n"] == 1, "must re-decrypt when header is invalid"
+        assert result.read_bytes().startswith(b"SQLite format 3\x00")
 
     def test_re_decrypts_if_zero_size(self, fake_backup_dir, monkeypatch):
         """A 0-byte ChatStorage from a previous failed run shouldn't be trusted."""
@@ -197,6 +222,44 @@ class TestDecryptChatstorage:
         assert result.read_bytes() == b"decrypted db"
 
 
+# ─── decrypt_media no longer skips when media/ is non-empty ────────────────
+
+class TestDecryptMediaIncremental:
+    """Regression: the old decrypt_media() short-circuited the entire decrypt
+    if `media/` had any file in it. That meant once you decrypted once,
+    later iPhone backups would never bring in new attachments. The new
+    body delegates to selective_decrypt with incremental=True, which
+    skips per-file by mtime, not whole-domain by directory presence.
+    """
+
+    def test_does_not_skip_when_media_dir_is_non_empty(self, fake_backup_dir, monkeypatch):
+        work_dir = fake_backup_dir / "extracted"
+        media_dir = work_dir / "media"
+        media_dir.mkdir(parents=True)
+        # Pre-populate media/ with a stale file (the old code's footgun)
+        (media_dir / "stale.jpg").write_bytes(b"old contents")
+
+        monkeypatch.setattr(eb, "get_passphrase", lambda: "fake-pw")
+
+        called = {"n": 0, "kwargs": None}
+
+        def fake_decrypt_whatsapp(**kwargs):
+            called["n"] += 1
+            called["kwargs"] = kwargs
+            # Simulate the real call: it would write into out_dir/media/
+            from selective_decrypt import DecryptStats
+            return DecryptStats()
+
+        import selective_decrypt
+        monkeypatch.setattr(selective_decrypt, "decrypt_whatsapp", fake_decrypt_whatsapp)
+
+        eb.decrypt_media(work_dir)
+
+        assert called["n"] == 1, "decrypt_media must NOT skip when media/ is non-empty"
+        assert called["kwargs"]["incremental"] is True
+        assert called["kwargs"]["out_dir"] == work_dir
+
+
 # ─── decrypt_chatstorage validates structure ───────────────────────────────
 
 class TestDecryptValidatesStructure:
@@ -216,3 +279,62 @@ class TestRequiredFiles:
     def test_includes_manifest_plist(self):
         assert "Manifest.plist" in eb.REQUIRED_BACKUP_FILES
         assert "Manifest.db" in eb.REQUIRED_BACKUP_FILES
+
+
+# ─── list-chats survives garbage timestamps ───────────────────────────────
+
+class TestListChatsTimestampSafety:
+    """Regression: ZLASTMESSAGEDATE occasionally carries values that overflow
+    datetime ('year must be in 1..9999, not 11001'). The whole listing
+    must not crash because of one bad row.
+    """
+
+    def _build_db_with_bad_ts(self, path):
+        import sqlite3
+        conn = sqlite3.connect(path)
+        conn.executescript("""
+            CREATE TABLE ZWACHATSESSION (
+                Z_PK INTEGER PRIMARY KEY,
+                ZCONTACTJID TEXT,
+                ZPARTNERNAME TEXT,
+                ZLASTMESSAGEDATE REAL
+            );
+            CREATE TABLE ZWAMESSAGE (
+                Z_PK INTEGER PRIMARY KEY,
+                ZCHATSESSION INTEGER
+            );
+            -- A normal chat
+            INSERT INTO ZWACHATSESSION VALUES
+                (1, 'alice@s.whatsapp.net', 'Alice', 700000000.0);
+            -- A row with an absurd timestamp (year 11001)
+            INSERT INTO ZWACHATSESSION VALUES
+                (2, 'ghost@s.whatsapp.net', 'Ghost', 285170400000.0);
+            -- A row with a negative timestamp
+            INSERT INTO ZWACHATSESSION VALUES
+                (3, 'neg@s.whatsapp.net', 'Neg', -9999999999.0);
+        """)
+        conn.commit()
+        conn.close()
+
+    def test_cmd_list_chats_doesnt_crash_on_bad_ts(self, tmp_path, monkeypatch, capsys):
+        from unittest.mock import patch
+
+        db = tmp_path / "ChatStorage.sqlite"
+        self._build_db_with_bad_ts(db)
+
+        # cmd_list_chats calls decrypt_chatstorage which will try to decrypt;
+        # short-circuit that by patching it to return the prebuilt DB.
+        with patch.object(eb, "decrypt_chatstorage", return_value=db):
+            from argparse import Namespace
+            # Should NOT raise — print all 3 rows with "—" for the bad ones
+            eb.cmd_list_chats(Namespace())
+
+        out = capsys.readouterr().out
+        # All three chats appeared
+        assert "Alice" in out
+        assert "Ghost" in out
+        assert "Neg" in out
+        # The bad-ts row's date got replaced with the placeholder
+        assert "—" in out
+        # And the good one still has a real date (700000000 iOS ts ≈ 2023)
+        assert "2023-" in out
