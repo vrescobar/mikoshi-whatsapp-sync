@@ -159,7 +159,13 @@ def get_backup_dir(cfg: dict) -> Path | None:
 
 
 def find_existing_chatstorage() -> Path | None:
-    """Either freshly-decrypted or kept from a previous run."""
+    """Either freshly-decrypted or kept from a previous run.
+
+    Validates the SQLite magic header so callers (pick_contact →
+    list_chats_from_db) don't open a zero-filled or shredded file and
+    crash with 'file is not a database'. The file is left in place so
+    a future Phase 3 run can overwrite it cleanly.
+    """
     candidates = [
         SCRIPT_DIR / "temp" / "extracted" / "ChatStorage.sqlite",
     ]
@@ -167,7 +173,7 @@ def find_existing_chatstorage() -> Path | None:
     if backup_dir := get_backup_dir(cfg):
         candidates.append(backup_dir / "extracted" / "ChatStorage.sqlite")
     for c in candidates:
-        if c.exists():
+        if c.exists() and _looks_like_sqlite(c):
             return c
     return None
 
@@ -406,7 +412,9 @@ def pick_contact() -> tuple[str, str] | None:
             for c in chats[:50] if c["jid"]
         ]
         choices.append(Choice(title="✎ Type name/JID manually", value="__manual__"))
-        choices.append(Choice(title="← Cancel", value=None))
+        # See _pick_phase_with_user: Choice(value=None) leaks the title back
+        # to the caller. Use a sentinel.
+        choices.append(Choice(title="← Cancel", value="__cancel__"))
 
         pick = questionary.select(
             "Select a contact (or type to filter):",
@@ -414,7 +422,7 @@ def pick_contact() -> tuple[str, str] | None:
             use_search_filter=True,
             use_jk_keys=False,
         ).ask()
-        if pick is None:
+        if pick is None or pick == "__cancel__":
             return None
         if pick != "__manual__":
             return ("--chat-jid", pick)
@@ -500,10 +508,18 @@ def _best_from_phase() -> tuple[int, str]:
     return 1, "Refresh from iPhone (incremental — fetches only new data)"
 
 
+_CANCEL_SENTINEL = "__cancel__"
+
+
 def _pick_phase_with_user(default_phase: int, default_label: str) -> int | None:
     """
     Surface the auto-detected phase to the user and let them override.
     Returns the selected phase, or None if cancelled.
+
+    Uses a sentinel for the Cancel choice because questionary treats a
+    Choice with `value=None` as "no explicit value" and returns the title
+    string instead — which then propagates as `phase` and crashes the
+    caller with `'>' not supported between str and int`.
     """
     if default_phase == 1:
         # Nothing else to offer
@@ -511,13 +527,17 @@ def _pick_phase_with_user(default_phase: int, default_label: str) -> int | None:
     options = [
         Choice(f"⚡ {default_label}", default_phase),
         Choice("🔄 Refresh from iPhone (incremental — fetches only new data)", 1),
-        Choice("← Cancel", None),
+        Choice("← Cancel", _CANCEL_SENTINEL),
     ]
-    return questionary.select(
+    result = questionary.select(
         "How do you want to sync?",
         choices=options,
         instruction="(all options are incremental — they differ in how far back to restart)",
     ).ask()
+    # ESC / Ctrl+C → None; explicit Cancel → _CANCEL_SENTINEL. Both mean "abort".
+    if result is None or result == _CANCEL_SENTINEL:
+        return None
+    return result
 
 
 def action_backup_one_contact():

@@ -238,3 +238,96 @@ secure_cleanup
         assert result.returncode == 0
         assert (udid_dir / "Manifest.plist").read_bytes() == manifest_before, \
             "secure_cleanup destroyed encrypted Manifest.plist"
+
+    def test_phase5_respects_preserve_extracted(self, tmp_path):
+        """secure_cleanup was unconditionally shredding ChatStorage.sqlite,
+        burning ~13 min of decrypt every push. With MIKOSHI_PRESERVE_EXTRACTED
+        on (default + explicit truthy), the file must survive."""
+        script_text = PIPELINE.read_text()
+        start = script_text.find("secure_cleanup() {")
+        depth = 0
+        end = start
+        for i, ch in enumerate(script_text[start:], start=start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        fn = script_text[start:end]
+
+        extracted = tmp_path / "extracted"
+        extracted.mkdir()
+        chat = extracted / "ChatStorage.sqlite"
+        original = b"SQLite format 3\x00" + b"x" * 4096
+        chat.write_bytes(original)
+
+        runner = f"""
+set +e
+log() {{ echo "$@"; }}
+error() {{ echo "ERR: $@" >&2; }}
+warn() {{ echo "WARN: $@"; }}
+TEMP_DIR="{tmp_path}"
+TEMP_DIR_IS_EXTERNAL=true
+MIKOSHI_PRESERVE_EXTRACTED=true
+{fn}
+secure_cleanup
+"""
+        env = {k: v for k, v in os.environ.items()
+               if k != "MIKOSHI_PRESERVE_EXTRACTED"}
+        env["MIKOSHI_PRESERVE_EXTRACTED"] = "true"
+        result = subprocess.run(
+            ["bash", "-c", runner], env=env,
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 0, result.stderr
+        assert chat.read_bytes() == original, \
+            "secure_cleanup ignored MIKOSHI_PRESERVE_EXTRACTED=true and shredded ChatStorage"
+
+    def test_phase5_shreds_when_preserve_off(self, tmp_path):
+        """The opt-out path must still work: MIKOSHI_PRESERVE_EXTRACTED=false
+        means the user actively wants the decrypted artifacts gone."""
+        script_text = PIPELINE.read_text()
+        start = script_text.find("secure_cleanup() {")
+        depth = 0
+        end = start
+        for i, ch in enumerate(script_text[start:], start=start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        fn = script_text[start:end]
+
+        extracted = tmp_path / "extracted"
+        extracted.mkdir()
+        chat = extracted / "ChatStorage.sqlite"
+        chat.write_bytes(b"SQLite format 3\x00" + b"x" * 4096)
+
+        runner = f"""
+set +e
+log() {{ echo "$@"; }}
+error() {{ echo "ERR: $@" >&2; }}
+warn() {{ echo "WARN: $@"; }}
+TEMP_DIR="{tmp_path}"
+TEMP_DIR_IS_EXTERNAL=true
+{fn}
+secure_cleanup
+"""
+        env = {k: v for k, v in os.environ.items()
+               if k != "MIKOSHI_PRESERVE_EXTRACTED"}
+        env["MIKOSHI_PRESERVE_EXTRACTED"] = "false"
+        result = subprocess.run(
+            ["bash", "-c", runner], env=env,
+            capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 0, result.stderr
+        # shred -vfz fills with zeros; whatever the exact behaviour, content
+        # must NOT equal the original.
+        # The file might be unlinked too — both are valid "shredded".
+        if chat.exists():
+            assert chat.read_bytes() != b"SQLite format 3\x00" + b"x" * 4096, \
+                "secure_cleanup did not shred when explicitly opted in"

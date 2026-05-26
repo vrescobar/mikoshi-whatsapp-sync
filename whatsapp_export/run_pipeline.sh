@@ -563,6 +563,26 @@ secure_cleanup() {
     # Scoped to $TEMP_DIR/extracted/ ONLY — see cleanup() comment for why.
     # Recursing $TEMP_DIR with MIKOSHI_BACKUP_DIR active would destroy the
     # encrypted iPhone backup.
+    #
+    # Honour MIKOSHI_PRESERVE_EXTRACTED (default ON when an external backup
+    # dir is configured) — otherwise this function shreds the very file the
+    # user just spent 13 min decrypting, forcing a re-decrypt on the next
+    # `--from-phase 4`. The cleanup() exit trap had this gate; secure_cleanup
+    # didn't, and was silently destroying ChatStorage.sqlite on every success.
+    local raw="${MIKOSHI_PRESERVE_EXTRACTED:-}"
+    local lc; lc=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')
+    case "$lc" in
+        false|no|off|0)
+            # User explicitly opted out → shred as before.
+            ;;
+        *)
+            # Default + true/yes/on/1 → preserve. Skip the shred entirely.
+            if [[ "$TEMP_DIR_IS_EXTERNAL" == true ]]; then
+                log "✓ Skipping shred (MIKOSHI_PRESERVE_EXTRACTED=${raw:-default}; keeping extracted/ for next run)"
+                return 0
+            fi
+            ;;
+    esac
     if [[ -d "${TEMP_DIR}/extracted" ]]; then
         find "${TEMP_DIR}/extracted" -type f \( \
             -name "ChatStorage.sqlite" -o \

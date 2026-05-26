@@ -185,6 +185,8 @@ class TestBestFromPhase:
         assert "re-decrypt" in label.lower()
 
 
+
+
 class TestFmtTs:
     def setup_method(self):
         sys.modules.pop("tui", None)
@@ -231,7 +233,7 @@ class TestFindExistingChatstorage:
         extracted = tmp_path / "temp" / "extracted"
         extracted.mkdir(parents=True)
         db = extracted / "ChatStorage.sqlite"
-        db.write_bytes(b"x")
+        db.write_bytes(b"SQLite format 3\x00")  # validation requires real header
 
         # Reload load_ingest_conf to refresh internal state
         tui.load_ingest_conf()
@@ -248,7 +250,7 @@ class TestFindExistingChatstorage:
         ext_extracted = tmp_path / "backup" / "extracted"
         ext_extracted.mkdir(parents=True)
         db = ext_extracted / "ChatStorage.sqlite"
-        db.write_bytes(b"x")
+        db.write_bytes(b"SQLite format 3\x00")  # validation requires real header
 
         result = tui.find_existing_chatstorage()
         assert result == db
