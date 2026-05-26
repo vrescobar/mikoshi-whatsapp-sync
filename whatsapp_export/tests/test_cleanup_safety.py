@@ -39,8 +39,17 @@ def _make_fake_backup_tree(root: Path):
     return udid_dir
 
 
-def _run_cleanup(temp_dir: Path, external: bool):
-    """Source run_pipeline.sh's cleanup function and run it against temp_dir."""
+def _run_cleanup(temp_dir: Path, external: bool, *, preserve: str | None = "false"):
+    """
+    Source run_pipeline.sh's cleanup function and run it against temp_dir.
+
+    `preserve` controls MIKOSHI_PRESERVE_EXTRACTED in the subprocess env:
+      - "false" (default for THIS test module) — exercises the legacy
+        wipe-on-success path. Without this we'd test the new default-preserve
+        behaviour (which has dedicated tests in test_preserve_extracted.py).
+      - None  → unset, so cleanup falls into "default" (= preserve).
+      - "true"/"yes"/etc → explicit preserve.
+    """
     # Extract the cleanup() function from the script
     script_text = PIPELINE.read_text()
     start = script_text.find("cleanup() {")
@@ -71,8 +80,14 @@ LOCK_FILE="/tmp/test-lock-$$"
 trap - EXIT
 cleanup
 """
+    # Don't inherit MIKOSHI_PRESERVE_EXTRACTED from the parent — earlier
+    # tests in the suite may have exported it via load_ingest_conf().
+    env = {k: v for k, v in os.environ.items()
+           if k != "MIKOSHI_PRESERVE_EXTRACTED"}
+    if preserve is not None:
+        env["MIKOSHI_PRESERVE_EXTRACTED"] = preserve
     return subprocess.run(
-        ["bash", "-c", runner],
+        ["bash", "-c", runner], env=env,
         capture_output=True, text=True, timeout=30,
     )
 
@@ -101,7 +116,13 @@ class TestCleanupPreservesEncryptedBackup:
         assert (udid_dir / "Info.plist").read_bytes() == info_before
 
     def test_decrypted_artifacts_are_still_shredded(self, tmp_path):
-        """The cleanup should still scrub the decrypted area."""
+        """
+        When the user explicitly opts OUT of preservation
+        (MIKOSHI_PRESERVE_EXTRACTED=false) the cleanup must scrub the
+        decrypted area. NB: this is now opt-in — the default changed to
+        "preserve". The preserve-by-default path has its own test in
+        test_preserve_extracted.py.
+        """
         # Set up a fake decrypted artifact directory
         extracted = tmp_path / "extracted"
         extracted.mkdir()
@@ -113,7 +134,7 @@ class TestCleanupPreservesEncryptedBackup:
         # Also put the encrypted tree alongside to make sure scoping works
         _make_fake_backup_tree(tmp_path)
 
-        result = _run_cleanup(tmp_path, external=True)
+        result = _run_cleanup(tmp_path, external=True, preserve="false")
         assert result.returncode == 0
 
         # extracted/ should be gone entirely

@@ -41,6 +41,40 @@ IOS_EPOCH = 978307200
 
 # ─── helpers ───────────────────────────────────────────────────────────────
 
+# Keys that flow from ~/.mikoshi-ingest.conf into the process env so all
+# child processes (run_pipeline.sh, push_via_api.py, explore_backup.py)
+# pick them up. Order doesn't matter — we export every one that's set in
+# the file unless the env already has a value (env wins).
+INGEST_CONF_KEYS = (
+    "MIKOSHI_URL",
+    "MIKOSHI_TOKEN",
+    "MIKOSHI_BACKUP_DIR",
+    "MIKOSHI_CLIENT_ID",
+    "KEEP_LOCAL_EXPORTS",
+    "MIKOSHI_FAVORITES_FILE",
+    "MIKOSHI_PRESERVE_EXTRACTED",
+)
+
+
+def parse_bool(value: str | None, *, default: bool) -> bool:
+    """
+    Parse a human-friendly boolean string. Accepted forms (case-insensitive):
+      true / false, yes / no, on / off, 1 / 0
+    Empty / None / unparseable → `default`.
+
+    Centralised so the bash side and the Python side agree on what
+    'MIKOSHI_PRESERVE_EXTRACTED=True' means.
+    """
+    if value is None:
+        return default
+    v = value.strip().lower()
+    if v in ("true", "yes", "on", "1"):
+        return True
+    if v in ("false", "no", "off", "0"):
+        return False
+    return default
+
+
 def load_ingest_conf() -> dict:
     """Mirror the bash logic: read KEY=VALUE lines from ~/.mikoshi-ingest.conf.
 
@@ -59,15 +93,60 @@ def load_ingest_conf() -> dict:
                 k, v = line.split("=", 1)
                 cfg[k.strip()] = v.strip().strip('"').strip("'")
     # Env vars take precedence over file values
-    for key in ("MIKOSHI_URL", "MIKOSHI_TOKEN", "MIKOSHI_BACKUP_DIR",
-                "MIKOSHI_CLIENT_ID", "KEEP_LOCAL_EXPORTS",
-                "MIKOSHI_FAVORITES_FILE"):
+    for key in INGEST_CONF_KEYS:
         if os.environ.get(key):
             cfg[key] = os.environ[key]
         elif cfg.get(key):
             # File-provided value: export so children inherit
             os.environ[key] = cfg[key]
     return cfg
+
+
+def set_conf_value(key: str, value: str, *, conf_path: Path | None = None) -> None:
+    """
+    Persist `KEY=VALUE` into ~/.mikoshi-ingest.conf, preserving every other
+    line as-is (comments, ordering, formatting).
+
+    - If `key` already appears in the file, the existing assignment line is
+      replaced (in place — same line number, neighbours untouched).
+    - Otherwise the new assignment is appended.
+    - The file is written atomically (tmp + os.replace) so a crash between
+      open() and close() can't leave a half-written conf behind.
+    - The corresponding env var is also exported in-process so subsequent
+      load_ingest_conf() calls (and any subprocess we spawn from this
+      session) see the new value immediately.
+
+    Quotes are NOT added — the user can edit the file by hand and we don't
+    want to mangle their formatting. Bash's `set -a; source` accepts bare
+    values fine for the kind of bool/path/url we store here.
+    """
+    path = conf_path or INGEST_CONF
+    path.parent.mkdir(parents=True, exist_ok=True)
+    new_line = f"{key}={value}"
+
+    if path.exists():
+        lines = path.read_text().splitlines()
+    else:
+        lines = []
+
+    replaced = False
+    for i, raw in enumerate(lines):
+        stripped = raw.strip()
+        if stripped.startswith("#") or "=" not in stripped:
+            continue
+        k = stripped.split("=", 1)[0].strip()
+        if k == key:
+            lines[i] = new_line
+            replaced = True
+            break
+    if not replaced:
+        lines.append(new_line)
+
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text("\n".join(lines) + "\n")
+    tmp.replace(path)
+
+    os.environ[key] = value
 
 
 # Eager load on import so the env is set before any subprocess fires
@@ -199,6 +278,14 @@ def action_status():
 
     db = find_existing_chatstorage()
     table.add_row("Decrypted ChatStorage", str(db) if db else "[dim]none[/]")
+
+    preserve = parse_bool(cfg.get("MIKOSHI_PRESERVE_EXTRACTED"),
+                          default=PRESERVE_EXTRACTED_DEFAULT)
+    table.add_row(
+        "Keep decrypted between runs",
+        "[green]ON[/] (extracted/ survives cleanup)" if preserve
+        else "[yellow]OFF[/] (extracted/ wiped on success)",
+    )
 
     if STATE_FILE.exists():
         try:
@@ -503,10 +590,55 @@ def action_edit_config():
             "# MIKOSHI_BACKUP_DIR=/Volumes/ExternalSSD/iphone_backup\n"
             "# MIKOSHI_CLIENT_ID=my-mac\n"
             "# KEEP_LOCAL_EXPORTS=5\n"
+            "# Keep decrypted ChatStorage + media between runs so --from-phase 4\n"
+            "# works without re-decrypting. Default: true (data already lives\n"
+            "# on your encrypted backup disk anyway).\n"
+            "MIKOSHI_PRESERVE_EXTRACTED=true\n"
         )
         INGEST_CONF.chmod(0o600)
     editor = os.environ.get("EDITOR", "nano")
     subprocess.call([editor, str(INGEST_CONF)])
+
+
+# Single source of truth for what "unset" means. The cleanup() in
+# run_pipeline.sh defaults the same way (see PRESERVE_EXTRACTED_DEFAULT
+# constant there). Keep these in sync.
+PRESERVE_EXTRACTED_DEFAULT = True
+
+
+def action_toggle_preserve_extracted():
+    """
+    Flip MIKOSHI_PRESERVE_EXTRACTED in ~/.mikoshi-ingest.conf and persist.
+
+    Why this matters: when enabled, the decrypted ChatStorage.sqlite + media
+    tree under extracted/ survive the pipeline's EXIT trap, so the next
+    --from-phase 4 run doesn't pay another ~30 min decrypt. Default is ON;
+    users worried about decrypted artifacts sitting on disk can flip it OFF.
+    """
+    cfg = load_ingest_conf()
+    current = parse_bool(cfg.get("MIKOSHI_PRESERVE_EXTRACTED"),
+                         default=PRESERVE_EXTRACTED_DEFAULT)
+
+    console.print(Panel(
+        f"[bold]Preserve decrypted artifacts across runs[/]\n\n"
+        f"Currently: [{'green' if current else 'yellow'}]"
+        f"{'ON — extracted/ kept' if current else 'OFF — extracted/ wiped after each run'}[/]\n\n"
+        "[dim]When ON, the decrypted ChatStorage.sqlite + media live in\n"
+        "MIKOSHI_BACKUP_DIR/extracted/ between runs. Saves ~30 min of\n"
+        "decryption per iteration. When OFF, those files are removed\n"
+        "after every successful run (encrypted backup is kept either way).[/]",
+        title="MIKOSHI_PRESERVE_EXTRACTED",
+    ))
+
+    new_val = not current
+    label = "Turn OFF" if current else "Turn ON"
+    if not questionary.confirm(f"{label}?", default=True).ask():
+        return
+
+    set_conf_value("MIKOSHI_PRESERVE_EXTRACTED", "true" if new_val else "false")
+    console.print(f"[green]✓ Saved to {INGEST_CONF}[/]")
+    console.print(f"  MIKOSHI_PRESERVE_EXTRACTED={'true' if new_val else 'false'}")
+    pause()
 
 
 # ─── favorites ─────────────────────────────────────────────────────────────
@@ -666,6 +798,7 @@ ACTIONS = [
     ("♻️   Re-extract from existing backup",    action_reextract),
     ("📤  Push existing export to Mikoshi",     action_push_existing),
     ("🐚  Open sqlite3 shell on ChatStorage",   action_sqlite_shell),
+    ("🔐  Toggle keep decrypted between runs",  action_toggle_preserve_extracted),
     ("✏️   Edit ~/.mikoshi-ingest.conf",        action_edit_config),
     ("🧪  Run tests",                            action_run_tests),
 ]

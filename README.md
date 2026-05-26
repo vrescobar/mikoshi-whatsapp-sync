@@ -55,6 +55,29 @@ two expensive steps:
 lower bound for fresh chats, but never rewinds a chat whose cursor is
 already past that date.
 
+### Iterating without re-decrypting
+
+By default the pipeline now **keeps the decrypted artifacts** under
+`MIKOSHI_BACKUP_DIR/extracted/` between runs (defaults to *preserve*),
+so the next invocation can pass `--from-phase 4` and skip the ~30 min
+of decryption. Persist the flag in `~/.mikoshi-ingest.conf`:
+
+```
+# Default — keep ChatStorage.sqlite + media decrypted across runs.
+# Flip to false if you want extracted/ wiped after every successful run.
+MIKOSHI_PRESERVE_EXTRACTED=true
+```
+
+TUI exposes this as a one-key toggle:
+
+```
+mikoshi-whatsapp.sh   →   🔐  Toggle keep decrypted between runs
+```
+
+Accepted values (case-insensitive): `true/yes/on/1` vs `false/no/off/0`.
+The encrypted iPhone backup under `backup/<UDID>/` is always preserved —
+only the decrypted subtree is affected by this flag.
+
 The TUI's "Backup one contact" picker now propagates the chosen JID as
 `--chat-jid` automatically when you select from the chat list (selective
 decrypt kicks in for free). Free-form typing still uses `--contact`

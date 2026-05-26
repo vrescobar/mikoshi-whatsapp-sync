@@ -26,10 +26,13 @@ class TestLoadIngestConf:
         for mod in ("tui",):
             sys.modules.pop(mod, None)
         monkeypatch.setenv("MIKOSHI_INGEST_CONF", str(conf_path))
-        # Strip out any pre-existing config-derived vars
+        # Strip out any pre-existing config-derived vars. The list MUST stay
+        # in sync with tui.INGEST_CONF_KEYS — otherwise a stale env value
+        # from an earlier test leaks into load_ingest_conf's output and
+        # breaks the "empty conf → empty cfg" expectation.
         for k in ("MIKOSHI_URL", "MIKOSHI_TOKEN", "MIKOSHI_BACKUP_DIR",
                   "MIKOSHI_CLIENT_ID", "KEEP_LOCAL_EXPORTS",
-                  "MIKOSHI_FAVORITES_FILE"):
+                  "MIKOSHI_FAVORITES_FILE", "MIKOSHI_PRESERVE_EXTRACTED"):
             monkeypatch.delenv(k, raising=False)
         import tui  # re-import
         return tui

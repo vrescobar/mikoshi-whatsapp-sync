@@ -117,10 +117,11 @@ Environment variables:
   KEEP_LOCAL_EXPORTS
         See --keep-local.
   MIKOSHI_PRESERVE_EXTRACTED
-        '1' → keep extracted/ on disk even after a successful run, so the
-              next invocation can use --from-phase 4 without re-decrypting.
-        '0' → wipe extracted/ even on failure (no recovery shortcut).
-        unset (default) → preserve only when the pipeline fails after Phase 3.
+        Persist decrypted ChatStorage.sqlite + media between runs so the
+        next --from-phase 4 doesn't re-decrypt. Accepts true/yes/on/1 vs
+        false/no/off/0 (case-insensitive). DEFAULT: true.
+        Lives in ~/.mikoshi-ingest.conf — TUI exposes a one-key toggle:
+        "Toggle keep decrypted between runs".
   MIKOSHI_CLIENT_ID
         Override the hostname recorded in each export.
   MIKOSHI_URL / MIKOSHI_TOKEN
@@ -242,27 +243,45 @@ cleanup() {
     local exit_code=$?
     log "=== Cleanup (exit $exit_code) ==="
 
-    # Preserve extracted/ across runs in two cases:
+    # Preserve extracted/ (decrypted ChatStorage + media) across runs.
     #
-    #  (a) Pipeline FAILED after Phase 3 — default ON. Lets the user fix
-    #      whatever broke and re-run with --from-phase 4 instead of paying
-    #      ~30 min for a fresh decrypt. Opt out with MIKOSHI_PRESERVE_EXTRACTED=0.
+    # Source of truth: MIKOSHI_PRESERVE_EXTRACTED in ~/.mikoshi-ingest.conf
+    # (auto-sourced at script start) or as an env var. Accepts the same
+    # boolean forms tui.parse_bool() does — true/yes/on/1 vs false/no/off/0,
+    # case-insensitive.
     #
-    #  (b) MIKOSHI_PRESERVE_EXTRACTED=1 explicitly. Use this when iterating
-    #      locally (e.g. multiple --chat-jid / --since runs in a row, or
-    #      A/B-ing extractor changes). Otherwise the cleanup nukes extracted/
-    #      after the first successful run and the next --from-phase 4 fails.
+    # Default (unset) is TRUE: decrypted artifacts live alongside the
+    # encrypted backup on the external disk anyway, and keeping them lets
+    # the user iterate with --from-phase 4 without paying ~30 min per
+    # decrypt. The TUI exposes a one-key toggle (action_toggle_preserve_extracted).
     #
-    # Either way the encrypted backup under backup/<UDID>/ is untouched.
+    # The encrypted backup under backup/<UDID>/ is NEVER touched by this
+    # branch — only the decrypted extracted/ subtree.
     local preserve_extracted=false
-    local preserve_flag="${MIKOSHI_PRESERVE_EXTRACTED:-}"
+    local raw="${MIKOSHI_PRESERVE_EXTRACTED:-}"
+    local lc; lc=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')
+    local preserve_setting="default"
+    case "$lc" in
+        true|yes|on|1)        preserve_setting="on"  ;;
+        false|no|off|0)       preserve_setting="off" ;;
+        "")                   preserve_setting="default" ;;
+        *)                    preserve_setting="default" ;;  # unparseable → default
+    esac
     if [[ "$TEMP_DIR_IS_EXTERNAL" == true \
         && -f "${TEMP_DIR}/extracted/ChatStorage.sqlite" ]]; then
-        if [[ "$preserve_flag" == "1" ]]; then
-            preserve_extracted=true
-        elif [[ $exit_code -ne 0 && "$preserve_flag" != "0" ]]; then
-            preserve_extracted=true
-        fi
+        case "$preserve_setting" in
+            on)
+                preserve_extracted=true ;;
+            default)
+                # Default ON. Same effect as "on" — kept separate so the
+                # cleanup log can tell the user where the policy came from.
+                preserve_extracted=true ;;
+            off)
+                # User explicitly opted out; respect it on success. We still
+                # preserve on failure unless the user is *extra* explicit
+                # (off + non-zero exit → wipe is what they asked for).
+                preserve_extracted=false ;;
+        esac
     fi
 
     if [[ -d "$TEMP_DIR" ]]; then
@@ -288,7 +307,11 @@ cleanup() {
 
         if [[ "$preserve_extracted" == true ]]; then
             if [[ $exit_code -eq 0 ]]; then
-                log "✓ Keeping extracted/ (MIKOSHI_PRESERVE_EXTRACTED=1 set)"
+                if [[ "$preserve_setting" == "on" ]]; then
+                    log "✓ Keeping extracted/ (MIKOSHI_PRESERVE_EXTRACTED=$raw)"
+                else
+                    log "✓ Keeping extracted/ (default; toggle in TUI to wipe)"
+                fi
             else
                 log "✓ Keeping extracted/ for iteration (pipeline failed at exit $exit_code)"
             fi
