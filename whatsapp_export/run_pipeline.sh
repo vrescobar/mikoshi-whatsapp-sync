@@ -63,6 +63,7 @@ INCLUDE_SYSTEM=false
 KEEP_LOCAL_EXPORTS="${KEEP_LOCAL_EXPORTS:-5}"
 FAVORITES_FILE=""
 USE_FAVORITES=false
+FROM_PHASE=1
 
 usage() {
     cat <<USAGE
@@ -84,6 +85,13 @@ Options:
         Restrict extraction to JIDs listed in the favorites file. Default
         path: \$MIKOSHI_FAVORITES_FILE or ~/.mikoshi-favorites.json.
         Errors out if the file is missing/empty.
+  --from-phase N
+        Skip earlier phases. N ∈ {1..6}. Useful after a Phase-4 failure:
+        rerun with --from-phase 3 to reuse the encrypted backup (no new
+        backup made, no iPhone needed). Requires that the artifacts each
+        skipped phase would normally produce already exist:
+          --from-phase 3 → needs MIKOSHI_BACKUP_DIR/backup/<UDID>/
+          --from-phase 4 → also needs MIKOSHI_BACKUP_DIR/extracted/ChatStorage.sqlite
   --help, -h
         Show this message.
 
@@ -127,6 +135,13 @@ while [[ $# -gt 0 ]]; do
                 FAVORITES_FILE="$2"; shift 2
             else
                 shift
+            fi
+            ;;
+        --from-phase)
+            FROM_PHASE="$2"; shift 2
+            if ! [[ "$FROM_PHASE" =~ ^[1-6]$ ]]; then
+                echo "ERROR: --from-phase must be an integer 1..6 (got: $FROM_PHASE)"
+                exit 1
             fi
             ;;
         --help|-h) usage; exit 0 ;;
@@ -203,13 +218,25 @@ cleanup() {
     local exit_code=$?
     log "=== Cleanup (exit $exit_code) ==="
     if [[ -d "$TEMP_DIR" ]]; then
-        # Always shred sensitive files (decrypted DB + Apple metadata)
-        find "$TEMP_DIR" -type f \( \
-            -name "ChatStorage.sqlite" -o \
-            -name "*.plist" -o \
-            -name "Manifest.db" -o \
-            -name "Status" \
-        \) -exec shred -vfz -n 7 {} \; 2>/dev/null || true
+        # CRITICAL: the shred target MUST be restricted to the decrypted
+        # working area, NEVER the whole $TEMP_DIR. When MIKOSHI_BACKUP_DIR
+        # is used as $TEMP_DIR, recursing into it would match Manifest.plist /
+        # Status.plist / Info.plist / Manifest.db inside the *encrypted*
+        # iPhone backup tree (those files have the same names as our
+        # decrypted artifacts) and destroy them — irrecoverably, with the
+        # 7-pass shred. This bug cost a 55h backup once.
+        #
+        # The decrypted artifacts only ever live in $TEMP_DIR/extracted/.
+        # Anything in $TEMP_DIR/backup/<UDID>/ is the iPhone's encrypted
+        # backup and must remain untouched.
+        if [[ -d "${TEMP_DIR}/extracted" ]]; then
+            find "${TEMP_DIR}/extracted" -type f \( \
+                -name "ChatStorage.sqlite" -o \
+                -name "*.plist" -o \
+                -name "Manifest.db" -o \
+                -name "Status" \
+            \) -exec shred -vfz -n 7 {} \; 2>/dev/null || true
+        fi
 
         if [[ "$TEMP_DIR_IS_EXTERNAL" == true ]]; then
             # External backup dir (MIKOSHI_BACKUP_DIR): preserve the encrypted
@@ -455,11 +482,16 @@ validate_export() {
 
 secure_cleanup() {
     log "=== PHASE 5: Secure Cleanup ==="
-    find "$TEMP_DIR" -type f \( \
-        -name "ChatStorage.sqlite" -o \
-        -name "*.plist" -o \
-        -name "Manifest.db" \
-    \) -exec shred -vfz -n 7 {} \; 2>/dev/null || true
+    # Scoped to $TEMP_DIR/extracted/ ONLY — see cleanup() comment for why.
+    # Recursing $TEMP_DIR with MIKOSHI_BACKUP_DIR active would destroy the
+    # encrypted iPhone backup.
+    if [[ -d "${TEMP_DIR}/extracted" ]]; then
+        find "${TEMP_DIR}/extracted" -type f \( \
+            -name "ChatStorage.sqlite" -o \
+            -name "*.plist" -o \
+            -name "Manifest.db" \
+        \) -exec shred -vfz -n 7 {} \; 2>/dev/null || true
+    fi
     log "✓ Sensitive files shredded"
 }
 
@@ -575,19 +607,57 @@ main() {
     log "╔════════════════════════════════════════════════════╗"
     log "║   WhatsApp → Mikoshi Pipeline                      ║"
     log "║   Mode: $SYNC_MODE${TARGET_CONTACT:+ (contact: $TARGET_CONTACT)}"
+    [[ "$FROM_PHASE" -gt 1 ]] && log "║   Starting from Phase $FROM_PHASE (skipping prior phases)"
     log "╚════════════════════════════════════════════════════╝"
 
     acquire_lock
     setup_python_env
 
-    detect_device           || exit 1
-    create_backup           || exit 2
-    decrypt_backup          || exit 2
-    extract_and_export      || exit 2
-    validate_export         || exit 2
-    secure_cleanup          || exit 1
-    sync_remote             || exit 3
-    gc_local_exports        || warn "GC failed (non-fatal)"
+    # When skipping phases, we still need the path variables that earlier
+    # phases would have set. Reconstruct them from the existing on-disk state.
+    if [[ "$FROM_PHASE" -gt 1 ]]; then
+        if [[ "$TEMP_DIR_IS_EXTERNAL" != true ]]; then
+            error "--from-phase requires MIKOSHI_BACKUP_DIR (external backup dir)."
+            error "Without it, prior phases' artifacts would have been wiped."
+            exit 1
+        fi
+        BACKUP_PATH="${TEMP_DIR}/backup"
+        # Derive UDID from the backup tree
+        if [[ "$FROM_PHASE" -ge 3 ]]; then
+            local _udids=("$BACKUP_PATH"/*)
+            if [[ ! -d "${_udids[0]:-}" ]]; then
+                error "--from-phase $FROM_PHASE needs $BACKUP_PATH/<UDID>/ to exist."
+                exit 1
+            fi
+            DEVICE_UDID=$(basename "${_udids[0]}")
+            log "  Reusing encrypted backup at $BACKUP_PATH/$DEVICE_UDID"
+            # Phase 2 normally exports BACKUP_PASSWORD for Phase 3. Re-fetch it.
+            BACKUP_PASSWORD=$(security find-generic-password \
+                -a iphone_backup -s iphone_backup_password -w 2>/dev/null) || {
+                error "Backup password not in Keychain (needed by Phase 3)."
+                exit 1
+            }
+            export BACKUP_PASSWORD
+        fi
+        if [[ "$FROM_PHASE" -ge 4 ]]; then
+            EXTRACT_DIR="${TEMP_DIR}/extracted"
+            CHAT_STORAGE="${EXTRACT_DIR}/ChatStorage.sqlite"
+            if [[ ! -f "$CHAT_STORAGE" ]]; then
+                error "--from-phase $FROM_PHASE needs $CHAT_STORAGE to exist."
+                exit 1
+            fi
+            log "  Reusing decrypted ChatStorage at $CHAT_STORAGE"
+        fi
+    fi
+
+    [[ "$FROM_PHASE" -le 1 ]] && { detect_device       || exit 1; }
+    [[ "$FROM_PHASE" -le 2 ]] && { create_backup       || exit 2; }
+    [[ "$FROM_PHASE" -le 3 ]] && { decrypt_backup      || exit 2; }
+    [[ "$FROM_PHASE" -le 4 ]] && { extract_and_export  || exit 2; }
+                                  validate_export      || exit 2
+    [[ "$FROM_PHASE" -le 5 ]] && { secure_cleanup      || exit 1; }
+    [[ "$FROM_PHASE" -le 6 ]] && { sync_remote         || exit 3; }
+                                  gc_local_exports     || warn "GC failed (non-fatal)"
 }
 
 main
