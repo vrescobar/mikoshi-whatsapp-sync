@@ -221,6 +221,35 @@ if [[ -f "$INGEST_CONF" ]] || [[ -n "${MIKOSHI_URL:-}" && -n "${MIKOSHI_TOKEN:-}
     else
         warn "MIKOSHI_TOKEN not set"
     fi
+
+    # Live auth probe against the cursors endpoint (M2+). Falls back to
+    # a HEAD against /manifest for older Mikoshi installs that don't
+    # expose /cursors yet. Returns a friendly diagnosis on 401/403/404.
+    if [[ -n "${MIKOSHI_URL:-}" && -n "${MIKOSHI_TOKEN:-}" ]]; then
+        echo ""
+        echo "Auth check (hits Mikoshi /cursors endpoint):"
+        if MIKOSHI_URL="$MIKOSHI_URL" MIKOSHI_TOKEN="$MIKOSHI_TOKEN" \
+            python3 - <<'PYEOF'
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) if "__file__" in dir() else ".")
+sys.path.insert(0, ".")
+# When invoked via `verify_setup.sh`, CWD is the user's shell — use SCRIPT_DIR.
+script_dir = os.path.dirname(os.path.realpath(os.environ.get("BASH_SOURCE0", sys.argv[0])))
+for d in (script_dir, "whatsapp_export", "."):
+    if d and os.path.isfile(os.path.join(d, "push_via_api.py")):
+        sys.path.insert(0, d)
+        break
+import push_via_api
+ok, msg = push_via_api.test_auth(os.environ["MIKOSHI_URL"].rstrip("/"), os.environ["MIKOSHI_TOKEN"])
+print(("  " + msg.replace("\n", "\n  ")))
+sys.exit(0 if ok else 1)
+PYEOF
+        then
+            pass "Mikoshi token accepted"
+        else
+            fail "Mikoshi token rejected — see message above"
+        fi
+    fi
 elif [[ -f "$CONFIG_FILE" ]]; then
     # Legacy rsync flow — still supported but discouraged
     source "$CONFIG_FILE"

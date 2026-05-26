@@ -2,8 +2,17 @@
 """
 Interactive menu for the WhatsApp → Mikoshi pipeline.
 
-Wraps run_pipeline.sh, extract_messages.py, explore_backup.py and
-push_via_api.py behind a guided menu so you don't have to remember flags.
+Built around user intent, not pipeline phases:
+  - Sync (the default; shows a plan-before-doing)
+  - Inspect (local chats, server cursors, drift)
+  - Favorites
+  - Setup & verify
+  - Tools (advanced)
+
+Persistent status header (refreshed on every menu return) shows the
+current state of iPhone / Backup / Decrypt / Server / Drift so the
+user never has to guess what's true before clicking. See REDESIGN.md
+§5 for the full layout.
 
 Run:  python3 tui.py
 """
@@ -14,6 +23,7 @@ import shlex
 import sqlite3
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,10 +33,13 @@ try:
     from rich.console import Console
     from rich.panel import Panel
     from rich.table import Table
+    from rich.text import Text
 except ImportError:
     print("Missing deps. Activate venv first:")
     print("  source .venv/bin/activate && pip install questionary rich")
     sys.exit(1)
+
+import pipeline_state
 
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -39,12 +52,8 @@ console = Console()
 IOS_EPOCH = 978307200
 
 
-# ─── helpers ───────────────────────────────────────────────────────────────
+# ─── config plumbing (unchanged from pre-redesign) ────────────────────────
 
-# Keys that flow from ~/.mikoshi-ingest.conf into the process env so all
-# child processes (run_pipeline.sh, push_via_api.py, explore_backup.py)
-# pick them up. Order doesn't matter — we export every one that's set in
-# the file unless the env already has a value (env wins).
 INGEST_CONF_KEYS = (
     "MIKOSHI_URL",
     "MIKOSHI_TOKEN",
@@ -56,15 +65,7 @@ INGEST_CONF_KEYS = (
 )
 
 
-def parse_bool(value: str | None, *, default: bool) -> bool:
-    """
-    Parse a human-friendly boolean string. Accepted forms (case-insensitive):
-      true / false, yes / no, on / off, 1 / 0
-    Empty / None / unparseable → `default`.
-
-    Centralised so the bash side and the Python side agree on what
-    'MIKOSHI_PRESERVE_EXTRACTED=True' means.
-    """
+def parse_bool(value, *, default):
     if value is None:
         return default
     v = value.strip().lower()
@@ -76,13 +77,6 @@ def parse_bool(value: str | None, *, default: bool) -> bool:
 
 
 def load_ingest_conf() -> dict:
-    """Mirror the bash logic: read KEY=VALUE lines from ~/.mikoshi-ingest.conf.
-
-    Also exports each value to os.environ so that subprocess children
-    (explore_backup.py, push_via_api.py, run_pipeline.sh) inherit them
-    even when tui.py is launched directly without going through the
-    mikoshi-whatsapp.sh wrapper.
-    """
     cfg = {}
     if INGEST_CONF.exists():
         for line in INGEST_CONF.read_text().splitlines():
@@ -92,43 +86,19 @@ def load_ingest_conf() -> dict:
             if "=" in line:
                 k, v = line.split("=", 1)
                 cfg[k.strip()] = v.strip().strip('"').strip("'")
-    # Env vars take precedence over file values
     for key in INGEST_CONF_KEYS:
         if os.environ.get(key):
             cfg[key] = os.environ[key]
         elif cfg.get(key):
-            # File-provided value: export so children inherit
             os.environ[key] = cfg[key]
     return cfg
 
 
 def set_conf_value(key: str, value: str, *, conf_path: Path | None = None) -> None:
-    """
-    Persist `KEY=VALUE` into ~/.mikoshi-ingest.conf, preserving every other
-    line as-is (comments, ordering, formatting).
-
-    - If `key` already appears in the file, the existing assignment line is
-      replaced (in place — same line number, neighbours untouched).
-    - Otherwise the new assignment is appended.
-    - The file is written atomically (tmp + os.replace) so a crash between
-      open() and close() can't leave a half-written conf behind.
-    - The corresponding env var is also exported in-process so subsequent
-      load_ingest_conf() calls (and any subprocess we spawn from this
-      session) see the new value immediately.
-
-    Quotes are NOT added — the user can edit the file by hand and we don't
-    want to mangle their formatting. Bash's `set -a; source` accepts bare
-    values fine for the kind of bool/path/url we store here.
-    """
     path = conf_path or INGEST_CONF
     path.parent.mkdir(parents=True, exist_ok=True)
     new_line = f"{key}={value}"
-
-    if path.exists():
-        lines = path.read_text().splitlines()
-    else:
-        lines = []
-
+    lines = path.read_text().splitlines() if path.exists() else []
     replaced = False
     for i, raw in enumerate(lines):
         stripped = raw.strip()
@@ -141,15 +111,12 @@ def set_conf_value(key: str, value: str, *, conf_path: Path | None = None) -> No
             break
     if not replaced:
         lines.append(new_line)
-
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text("\n".join(lines) + "\n")
     tmp.replace(path)
-
     os.environ[key] = value
 
 
-# Eager load on import so the env is set before any subprocess fires
 load_ingest_conf()
 
 
@@ -158,24 +125,29 @@ def get_backup_dir(cfg: dict) -> Path | None:
     return Path(val) if val else None
 
 
-def find_existing_chatstorage() -> Path | None:
-    """Either freshly-decrypted or kept from a previous run.
+PRESERVE_EXTRACTED_DEFAULT = True
 
-    Validates the SQLite magic header so callers (pick_contact →
-    list_chats_from_db) don't open a zero-filled or shredded file and
-    crash with 'file is not a database'. The file is left in place so
-    a future Phase 3 run can overwrite it cleanly.
-    """
-    candidates = [
-        SCRIPT_DIR / "temp" / "extracted" / "ChatStorage.sqlite",
-    ]
+
+# ─── existing helpers (kept verbatim where possible — covered by tests) ───
+
+
+def find_existing_chatstorage() -> Path | None:
+    candidates = [SCRIPT_DIR / "temp" / "extracted" / "ChatStorage.sqlite"]
     cfg = load_ingest_conf()
     if backup_dir := get_backup_dir(cfg):
         candidates.append(backup_dir / "extracted" / "ChatStorage.sqlite")
     for c in candidates:
-        if c.exists() and _looks_like_sqlite(c):
+        if c.exists() and pipeline_state.looks_like_sqlite(c):
             return c
     return None
+
+
+# Kept for tests that import these symbols directly.
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+def _looks_like_sqlite(path: Path) -> bool:
+    return pipeline_state.looks_like_sqlite(path)
 
 
 def list_chats_from_db(db: Path) -> list[dict]:
@@ -195,18 +167,11 @@ def list_chats_from_db(db: Path) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def fmt_ts(ios_ts: float | None) -> str:
-    """
-    Convert an iOS Core Data timestamp (seconds since 2001-01-01) to a date
-    string. Real ChatStorage.sqlite rows occasionally carry garbage values
-    (uninitialised columns, rows from system events, corrupted entries) that
-    overflow datetime — guard against that instead of crashing the whole TUI.
-    """
+def fmt_ts(ios_ts) -> str:
     if not ios_ts:
         return "—"
     try:
         unix = ios_ts + IOS_EPOCH
-        # Sanity-clamp: anything outside [1970-01-01, 2100-01-01] is junk.
         if not 0 <= unix <= 4_102_444_800:
             return "—"
         return datetime.fromtimestamp(unix, tz=timezone.utc).strftime("%Y-%m-%d")
@@ -215,7 +180,6 @@ def fmt_ts(ios_ts: float | None) -> str:
 
 
 def run(cmd: list[str], env_extra: dict | None = None) -> int:
-    """Run a subprocess inline (its stdout/stderr go to terminal)."""
     env = os.environ.copy()
     if env_extra:
         env.update(env_extra)
@@ -230,21 +194,11 @@ def run(cmd: list[str], env_extra: dict | None = None) -> int:
 def pause():
     console.print()
     if not sys.stdin.isatty():
-        # Non-interactive contexts (cron, `mikoshi-whatsapp.sh status` piped,
-        # pytest subprocess) have no human to press a key. Returning makes the
-        # caller terminate cleanly instead of blocking forever on read().
         return
     questionary.press_any_key_to_continue("Press any key to return to menu...").ask()
 
 
-# ─── actions ───────────────────────────────────────────────────────────────
-
 def _dir_size_gb(path: Path, timeout: float = 5.0) -> str:
-    """
-    Return human-readable size of `path` using `du -sk`. Capped by timeout
-    because a 200 GB backup on an external SSD with a slow file system can
-    take minutes to walk via Python's stat().
-    """
     try:
         result = subprocess.run(
             ["du", "-sk", str(path)],
@@ -263,95 +217,424 @@ def _dir_size_gb(path: Path, timeout: float = 5.0) -> str:
         return f"[dim](error: {e})[/]"
 
 
-def action_status():
-    """Render the pipeline status table.
-
-    Order matters: render text-only fields first, then expensive disk
-    measurements (du). With Rich's Live wrapper the user sees progress as
-    rows fill in instead of staring at a blank screen.
-    """
-    from rich.live import Live
-
+# Thin wrapper kept so existing tests don't break — delegates to the shared
+# helper now living in pipeline_state.
+def _best_from_phase() -> tuple[int, str]:
     cfg = load_ingest_conf()
-    table = Table(title="Pipeline status", show_header=False, box=None)
-    table.add_column("Key", style="cyan")
-    table.add_column("Value")
+    return pipeline_state.best_from_phase(get_backup_dir(cfg))
 
-    # ── Fast fields (in-memory / single file stat) ─────────────────────────
-    table.add_row("Config file",
-                  str(INGEST_CONF) + (" ✓" if INGEST_CONF.exists() else " ✗ (missing)"))
-    table.add_row("MIKOSHI_URL", cfg.get("MIKOSHI_URL", "[red]not set[/]"))
-    table.add_row("MIKOSHI_TOKEN",
-                  "[green]set[/]" if cfg.get("MIKOSHI_TOKEN") else "[red]not set[/]")
+
+# ─── status header (the heart of the new TUI mental model) ────────────────
+
+
+# Cache server probes for ~30 seconds so the menu doesn't feel sluggish.
+# Setting this to 0 forces a refresh on every render — used by the "Refresh"
+# action and after operations that change state.
+_HEADER_CACHE: dict = {"ts": 0.0, "ttl": 30.0, "snapshot": None}
+
+
+def _invalidate_header_cache():
+    _HEADER_CACHE["ts"] = 0.0
+
+
+def _gather_header_snapshot(cfg: dict) -> dict:
+    """Compute every field the header displays. ~3s worst case (server probe)."""
+    snap = {}
+    snap["cfg"] = cfg
+
+    # iPhone
+    snap["iphone_reachable"] = pipeline_state.device_reachable(timeout=2.0)
+
+    # Backup dir
     bdir = get_backup_dir(cfg)
-    table.add_row("MIKOSHI_BACKUP_DIR",
-                  str(bdir) if bdir else "[dim](local temp/)[/]")
+    snap["backup_dir"] = bdir
+    if bdir and bdir.exists():
+        udids = pipeline_state.find_udid_dirs(bdir)
+        snap["backup_udid_count"] = len(udids)
+        snap["backup_size"] = _dir_size_gb(bdir) if udids else "[dim]empty[/]"
+    else:
+        snap["backup_udid_count"] = 0
+        snap["backup_size"] = "[dim]not set[/]"
 
+    # Decrypted ChatStorage
     db = find_existing_chatstorage()
-    table.add_row("Decrypted ChatStorage", str(db) if db else "[dim]none[/]")
+    snap["chatstorage"] = db
+    if db:
+        mtime = db.stat().st_mtime
+        snap["chatstorage_mtime"] = datetime.fromtimestamp(mtime, tz=timezone.utc)
+    else:
+        snap["chatstorage_mtime"] = None
 
-    preserve = parse_bool(cfg.get("MIKOSHI_PRESERVE_EXTRACTED"),
-                          default=PRESERVE_EXTRACTED_DEFAULT)
-    table.add_row(
-        "Keep decrypted between runs",
-        "[green]ON[/] (extracted/ survives cleanup)" if preserve
-        else "[yellow]OFF[/] (extracted/ wiped on success)",
+    # Server cursors
+    url = cfg.get("MIKOSHI_URL", "").rstrip("/")
+    token = cfg.get("MIKOSHI_TOKEN", "")
+    snap["server_url"] = url
+    if url and token:
+        cursors = pipeline_state.fetch_server_cursors(url, token, timeout=3.0)
+        snap["server_cursors"] = cursors  # None if endpoint missing / unreachable
+    else:
+        snap["server_cursors"] = None
+
+    # Cache + drift
+    cache = pipeline_state.load_cursor_cache(STATE_FILE)
+    snap["cache"] = cache
+    snap["drift"] = pipeline_state.detect_drift(cache, snap["server_cursors"])
+    return snap
+
+
+def get_header_snapshot(force_refresh: bool = False) -> dict:
+    now = time.time()
+    if (
+        not force_refresh
+        and _HEADER_CACHE["snapshot"] is not None
+        and (now - _HEADER_CACHE["ts"]) < _HEADER_CACHE["ttl"]
+    ):
+        return _HEADER_CACHE["snapshot"]
+    cfg = load_ingest_conf()
+    snap = _gather_header_snapshot(cfg)
+    _HEADER_CACHE["snapshot"] = snap
+    _HEADER_CACHE["ts"] = now
+    return snap
+
+
+def render_header(snap: dict) -> None:
+    cfg = snap["cfg"]
+
+    iphone_row = (
+        "[green]✓ detected[/]"
+        if snap["iphone_reachable"]
+        else "[yellow]not reachable[/] [dim](OK if you have a cached backup)[/]"
     )
 
-    if STATE_FILE.exists():
-        try:
-            state = json.loads(STATE_FILE.read_text())
-            table.add_row("Last global sync", state.get("last_global_sync") or "—")
-            table.add_row("Chats with cursor", str(len(state.get("chats", {}))))
-        except Exception as e:
-            table.add_row("Sync state", f"[red]corrupt: {e}[/]")
+    bdir = snap["backup_dir"]
+    if bdir:
+        if snap["backup_udid_count"]:
+            backup_row = (
+                f"[green]{bdir}[/]  "
+                f"({snap['backup_size']}, {snap['backup_udid_count']} device)"
+            )
+        else:
+            backup_row = f"[yellow]{bdir}[/]  [dim](no UDID directory yet)[/]"
     else:
-        table.add_row("Last global sync", "[dim]never[/]")
+        backup_row = "[dim]using SCRIPT_DIR/temp (MIKOSHI_BACKUP_DIR not set)[/]"
 
-    exports = sorted(EXPORTS_DIR.glob("whatsapp_export_*.json"))
-    table.add_row("Local exports",
-                  f"{len(exports)} files" if exports else "[dim]none[/]")
+    chat = snap["chatstorage"]
+    if chat and snap["chatstorage_mtime"]:
+        age_min = (datetime.now(tz=timezone.utc) - snap["chatstorage_mtime"]).total_seconds() / 60
+        if age_min < 60:
+            stale = ""
+        elif age_min < 60 * 24:
+            stale = f" [dim]({age_min / 60:.0f}h old)[/]"
+        else:
+            stale = f" [yellow]({age_min / 1440:.0f}d old)[/]"
+        decrypt_row = f"[green]✓ ChatStorage at {chat}[/]" + stale
+    else:
+        decrypt_row = "[yellow]no decrypted DB yet[/]"
 
-    try:
-        import favorites as _favs
-        fav_count = len(_favs.load().get("favorites", []))
-        table.add_row("Favorites",
-                      f"{fav_count} chat(s)" if fav_count else "[dim]none[/]")
-    except Exception:
-        pass
+    url = snap.get("server_url") or ""
+    cursors = snap["server_cursors"]
+    if not url:
+        server_row = "[red]MIKOSHI_URL not set[/]"
+    elif cursors is None:
+        server_row = (
+            f"[yellow]{url}[/]  [dim]/cursors endpoint unreachable "
+            f"(old Mikoshi? Network down? Bad token?)[/]"
+        )
+    else:
+        cache = snap["cache"]
+        last_commit = cache.last_successful_commit or "—"
+        server_row = (
+            f"[green]✓ {url}[/]  "
+            f"{len(cursors)} chats tracked   "
+            f"last commit {(last_commit or '—')[:19]}"
+        )
 
-    # Render the cheap portion immediately, then live-update with backup sizes.
-    udids: list[Path] = []
-    if bdir and bdir.exists():
-        backup_root = bdir / "backup"
-        if backup_root.exists():
-            udids = [d for d in backup_root.iterdir()
-                     if d.is_dir() and len(d.name) > 20]
-            for u in udids:
-                table.add_row(f"  Backup {u.name[:12]}", "[dim]measuring…[/]")
+    summary = pipeline_state.drift_summary(snap["drift"])
+    n_local_ahead = summary.get(pipeline_state.DriftStatus.LOCAL_AHEAD, 0)
+    n_in_sync = summary.get(pipeline_state.DriftStatus.IN_SYNC, 0)
+    n_no_server = summary.get(pipeline_state.DriftStatus.NO_SERVER_RECORD, 0)
+    n_no_local = summary.get(pipeline_state.DriftStatus.NO_LOCAL_RECORD, 0)
 
-    if not udids:
-        console.print(table)
-        pause()
+    if cursors is None:
+        state_row = "[dim]drift unknown (server unreachable)[/]"
+    elif n_local_ahead > 0:
+        state_row = (
+            f"[yellow]⚠ Drift:[/] {n_local_ahead} chats local-ahead "
+            "[dim](re-sync will recover; server is authoritative)[/]"
+        )
+    elif n_in_sync > 0 and n_no_server == 0 and n_no_local == 0:
+        state_row = "[green]✓ in-sync[/]"
+    else:
+        bits = []
+        if n_in_sync:
+            bits.append(f"{n_in_sync} in-sync")
+        if n_no_server:
+            bits.append(f"{n_no_server} never-pushed")
+        if n_no_local:
+            bits.append(f"{n_no_local} server-only")
+        state_row = "  ·  ".join(bits) or "[dim](empty)[/]"
+
+    table = Table(show_header=False, box=None, padding=(0, 1))
+    table.add_column("Key", style="cyan")
+    table.add_column("Value")
+    table.add_row("iPhone", iphone_row)
+    table.add_row("Backup", backup_row)
+    table.add_row("Decrypt", decrypt_row)
+    table.add_row("Server", server_row)
+    table.add_row("State", state_row)
+
+    console.print(Panel(table, title="[bold cyan]Mikoshi WhatsApp[/]", expand=False))
+
+
+# ─── plan screen ─────────────────────────────────────────────────────────
+
+
+def _scope_jids_for_mode(mode: str, db: Path | None) -> set[str] | None:
+    """Resolve a mode (`all`/`favorites`/`one-chat`) into a concrete JID set."""
+    if mode == "all":
+        return None
+    if mode == "favorites":
+        import favorites as favs
+        jids = favs.jids()
+        return set(jids) if jids else set()
+    return None  # one-chat handled separately by the caller
+
+
+def render_plan(plan: pipeline_state.Plan, *, scope_label: str, source_label: str) -> None:
+    body = Table(show_header=True, header_style="bold cyan", box=None)
+    body.add_column("Chat", min_width=20)
+    body.add_column("Cutoff", style="dim")
+    body.add_column("New msgs", justify="right")
+    body.add_column("New att", justify="right")
+
+    nonzero = [c for c in plan.chats if c.new_messages > 0]
+    for entry in nonzero[:20]:
+        body.add_row(
+            (entry.name or entry.jid)[:32],
+            (entry.cutoff_ts or "—")[:19],
+            str(entry.new_messages),
+            str(entry.new_attachments),
+        )
+    if len(nonzero) > 20:
+        body.add_row("…", "", f"+{len(nonzero) - 20} more chats", "")
+
+    summary = (
+        f"[bold]Source:[/]  {source_label}\n"
+        f"[bold]Scope:[/]   {scope_label}\n"
+        f"[bold]New:[/]     {plan.total_messages} messages across "
+        f"{len(nonzero)}/{len(plan.chats)} chats, "
+        f"{plan.total_attachments} attachments\n"
+    )
+    if not plan.server_endpoint_present:
+        summary += (
+            "[yellow]⚠[/] Server [dim]/cursors[/] endpoint unreachable — "
+            "plan computed from local cache only. Dedup will still protect us, "
+            "but the count is an upper bound.\n"
+        )
+
+    console.print(Panel(summary, title="[bold]Sync plan[/]", expand=False))
+    if nonzero:
+        console.print(body)
+
+
+def compute_plan_if_possible(scope_mode: str, jid_for_one: str | None) -> pipeline_state.Plan | None:
+    """Return None if we don't have a decrypted DB to plan against yet."""
+    db = find_existing_chatstorage()
+    if not db:
+        return None
+    cfg = load_ingest_conf()
+    cache = pipeline_state.load_cursor_cache(STATE_FILE)
+    srv = pipeline_state.fetch_server_cursors(
+        cfg.get("MIKOSHI_URL", "").rstrip("/"),
+        cfg.get("MIKOSHI_TOKEN", ""),
+        timeout=3.0,
+    )
+    if scope_mode == "one-chat" and jid_for_one:
+        scope = {jid_for_one}
+    else:
+        scope = _scope_jids_for_mode(scope_mode, db)
+    return pipeline_state.compute_plan(db, cache, srv, scope_jids=scope)
+
+
+# ─── top-level actions (the 5-screen menu) ───────────────────────────────
+
+
+def action_sync():
+    """The redesign's centerpiece: plan-then-act sync.
+
+    The user picks scope + source, sees a plan, then confirms.
+    """
+    snap = get_header_snapshot()
+
+    scope_choice = questionary.select(
+        "What scope?",
+        choices=[
+            Choice("🔂  Favorites (recommended for incremental)", "favorites"),
+            Choice("🌍  All chats", "all"),
+            Choice("👤  One chat (pick from list)", "one-chat"),
+            Choice("← Cancel", "__cancel__"),
+        ],
+    ).ask()
+    if scope_choice in (None, "__cancel__"):
         return
 
-    # Stream `du` results into the table without re-rendering the whole screen.
-    with Live(table, console=console, refresh_per_second=4, transient=False) as live:
-        for i, u in enumerate(udids):
-            # The backup rows start after the "fixed" rows; locate them by name
-            size = _dir_size_gb(u)
-            # Rich's Table doesn't expose row updates, so rebuild that row.
-            # Simplest: keep a separate index. We know the order of udids.
-            row_idx = len(table.rows) - len(udids) + i
-            table.columns[1]._cells[row_idx] = size
-            live.refresh()
+    jid_for_one: str | None = None
+    if scope_choice == "one-chat":
+        picked = pick_contact()
+        if not picked:
+            return
+        flag, value = picked
+        if flag != "--chat-jid":
+            console.print("[yellow]Free-form contact match doesn't allow planning; "
+                          "running the legacy substring path.[/]")
+            jid_for_one = None
+            extra_args = ["--mode", "full-contact", flag, value]
+        else:
+            jid_for_one = value
+            extra_args = ["--chat-jid", value]
+    else:
+        extra_args = []
+        if scope_choice == "favorites":
+            extra_args.append("--favorites")
 
+    # Source pick — only when we have a meaningful choice.
+    default_phase, default_label = _best_from_phase()
+    if default_phase != 1:
+        source_choice = questionary.select(
+            "How do you want to source?",
+            choices=[
+                Choice(f"⚡ {default_label}", default_phase),
+                Choice("🔄 Refresh from iPhone (incremental — fetches only new data)", 1),
+                Choice("← Cancel", "__cancel__"),
+            ],
+            instruction="(all are incremental — they differ in how much work to redo)",
+        ).ask()
+        if source_choice in (None, "__cancel__"):
+            return
+        phase = source_choice
+    else:
+        if not snap["iphone_reachable"]:
+            console.print(
+                "[red]No iPhone reachable and no cached backup exists.[/]\n"
+                "Plug the iPhone (unlock + trust) and try again."
+            )
+            pause()
+            return
+        phase = 1
+    source_label = {
+        1: "iPhone (incremental backup → decrypt → extract → push)",
+        3: "cached encrypted backup (re-decrypt → extract → push)",
+        4: "cached decrypted DB (extract → push only)",
+    }[phase]
+
+    # Plan (only possible when we already have a decrypted DB, i.e. phase ≥ 4).
+    plan: pipeline_state.Plan | None = None
+    if phase >= 4 or find_existing_chatstorage():
+        plan = compute_plan_if_possible(
+            scope_mode="one-chat" if jid_for_one else scope_choice,
+            jid_for_one=jid_for_one,
+        )
+
+    scope_label_human = {
+        "favorites": "favorites",
+        "all": "all chats",
+        "one-chat": jid_for_one or "one chat (manual)",
+    }[scope_choice]
+
+    if plan:
+        render_plan(plan, scope_label=scope_label_human, source_label=source_label)
+    else:
+        console.print(Panel(
+            f"[bold]Source:[/]  {source_label}\n"
+            f"[bold]Scope:[/]   {scope_label_human}\n"
+            "[dim]Plan not available until ChatStorage has been decrypted.\n"
+            "Refresh-from-iPhone runs Phases 1-3 and decrypts on the fly.[/]",
+            title="[bold]Sync plan (preview)[/]",
+            expand=False,
+        ))
+
+    skip_remote = not questionary.confirm("Push to Mikoshi at the end?", default=True).ask()
+    proceed = questionary.confirm("Run the sync?", default=True).ask()
+    if not proceed:
+        return
+
+    cmd = ["bash", str(SCRIPT_DIR / "run_pipeline.sh")]
+    cmd.extend(extra_args)
+    if phase > 1:
+        cmd += ["--from-phase", str(phase)]
+    if skip_remote:
+        cmd.append("--skip-remote-sync")
+    run(cmd)
+
+    _invalidate_header_cache()
     pause()
 
 
-def action_verify():
-    run(["bash", str(SCRIPT_DIR / "verify_setup.sh")])
-    pause()
+def action_inspect():
+    snap = get_header_snapshot(force_refresh=True)
+
+    drift = snap["drift"]
+    cursors = snap["server_cursors"]
+
+    table = Table(title="Per-chat sync state", header_style="bold cyan")
+    table.add_column("Chat", min_width=18)
+    table.add_column("Status")
+    table.add_column("Local cursor", style="dim")
+    table.add_column("Server cursor", style="dim")
+    table.add_column("Note", style="dim")
+
+    sty = {
+        pipeline_state.DriftStatus.IN_SYNC: "[green]✓ in-sync[/]",
+        pipeline_state.DriftStatus.LOCAL_AHEAD: "[yellow]⚠ local ahead[/]",
+        pipeline_state.DriftStatus.SERVER_AHEAD: "[cyan]↑ server ahead[/]",
+        pipeline_state.DriftStatus.NO_SERVER_RECORD: "[dim]no server record[/]",
+        pipeline_state.DriftStatus.NO_LOCAL_RECORD: "[dim]no local cache[/]",
+    }
+
+    cache = snap["cache"]
+    # Decorate with names when we have a DB.
+    name_for: dict[str, str] = {}
+    db = find_existing_chatstorage()
+    if db:
+        try:
+            for c in list_chats_from_db(db):
+                if c.get("jid"):
+                    name_for[c["jid"]] = c.get("name") or c["jid"]
+        except Exception:
+            pass
+
+    for entry in drift[:80]:
+        table.add_row(
+            (name_for.get(entry.jid) or entry.jid)[:30],
+            sty[entry.status],
+            (entry.local_ts or "—")[:19],
+            (entry.server_ts or "—")[:19],
+            entry.note[:60],
+        )
+    if len(drift) > 80:
+        console.print(f"[dim]Showing top 80 of {len(drift)} entries[/]")
+
+    console.print(table)
+
+    if cursors is None:
+        console.print(
+            "\n[yellow]Server cursor endpoint unreachable[/] — drift detection ran against "
+            "local cache only. Check `mikoshi-whatsapp.sh test-auth`."
+        )
+
+    sub = questionary.select(
+        "More:",
+        choices=[
+            Choice("Show all local chats (from ChatStorage)", "all"),
+            Choice("Open ChatStorage in sqlite3 shell", "sqlite"),
+            Choice("← Back", "back"),
+        ],
+    ).ask()
+
+    if sub == "all":
+        action_list_chats()
+    elif sub == "sqlite":
+        action_sqlite_shell()
 
 
 def action_list_chats():
@@ -360,9 +643,10 @@ def action_list_chats():
         console.print("[yellow]No decrypted ChatStorage found.[/]")
         if questionary.confirm(
             "Decrypt now from existing backup (no iPhone needed)?",
-            default=True
+            default=True,
         ).ask():
-            run([sys.executable, str(SCRIPT_DIR / "explore_backup.py"), "list-chats"])
+            run(["bash", str(SCRIPT_DIR / "run_pipeline.sh"),
+                 "--from-phase", "3", "--skip-remote-sync"])
         pause()
         return
 
@@ -389,21 +673,10 @@ def action_list_chats():
     pause()
 
 
-def pick_contact() -> tuple[str, str] | None:
-    """
-    Either pick from the existing DB or type free-form.
-
-    Returns a (flag, value) pair ready to splice into a run_pipeline.sh
-    invocation: ("--chat-jid", "<jid>") when the user picked a known chat
-    (exact-match decrypt + extract), or ("--contact", "<text>") when they
-    typed something free-form (substring match).
-    """
+def pick_contact():
     db = find_existing_chatstorage()
-
     if db:
         chats = list_chats_from_db(db)
-        # Top 50 most recent. Use JID as the *value* so we can flow it
-        # through as --chat-jid (enables selective decryption in Phase 3).
         choices = [
             Choice(
                 title=f"{fmt_ts(c['last_ts']):<12} {c['msg_count']:>5} msgs  {(c['name'] or '—')[:30]}",
@@ -412,10 +685,7 @@ def pick_contact() -> tuple[str, str] | None:
             for c in chats[:50] if c["jid"]
         ]
         choices.append(Choice(title="✎ Type name/JID manually", value="__manual__"))
-        # See _pick_phase_with_user: Choice(value=None) leaks the title back
-        # to the caller. Use a sentinel.
         choices.append(Choice(title="← Cancel", value="__cancel__"))
-
         pick = questionary.select(
             "Select a contact (or type to filter):",
             choices=choices,
@@ -433,332 +703,17 @@ def pick_contact() -> tuple[str, str] | None:
     ).ask()
     if not text:
         return None
-    # If the user typed something that looks like a JID, prefer the exact
-    # path. Otherwise fall back to substring contact match.
     if "@" in text:
         return ("--chat-jid", text.strip())
     return ("--contact", text.strip())
 
 
-def action_full_backup():
-    console.print(Panel(
-        "[bold yellow]Full pipeline:[/] device backup → decrypt → extract ALL chats → push.\n"
-        "First time this can take HOURS (200+ GB if your iPhone is full).\n"
-        "Subsequent runs are incremental (minutes).",
-        title="⚠  Full backup",
-    ))
-    if not questionary.confirm("Continue?", default=False).ask():
-        return
-    skip_remote = not questionary.confirm("Push to Mikoshi at the end?", default=True).ask()
-    cmd = ["bash", str(SCRIPT_DIR / "run_pipeline.sh"), "--mode", "full"]
-    if skip_remote:
-        cmd.append("--skip-remote-sync")
-    run(cmd)
-    pause()
-
-
-_SQLITE_MAGIC = b"SQLite format 3\x00"
-
-
-def _looks_like_sqlite(path: Path) -> bool:
-    """Cheapest possible 'is this a real SQLite DB?' check.
-
-    A 1.1 GB file of zeroes passes `size > 0` but blows up later with
-    `sqlite3.DatabaseError: file is not a database` deep in Phase 4.
-    We've been bitten by that — a Phase 3 run killed mid-write leaves
-    the output file size-extended but with the first pages still zero.
-    Header check catches both empty headers and other obvious garbage.
-    """
-    try:
-        with path.open("rb") as f:
-            return f.read(16) == _SQLITE_MAGIC
-    except OSError:
-        return False
-
-
-def _best_from_phase() -> tuple[int, str]:
-    """
-    Inspect the on-disk state and pick the cheapest --from-phase we can
-    safely start from.
-
-    Returns (phase, label). Phases mean:
-      1 — no usable backup at all → need iPhone connected (Phase 1+)
-      3 — encrypted backup exists, decryption hasn't happened (or was wiped)
-      4 — decrypted ChatStorage exists → extraction-only, seconds
-
-    Avoids the "Sync — one contact only" → Phase 1 → no iPhone → failure
-    trap we hit when the user already has a perfectly good backup on disk.
-    """
-    cfg = load_ingest_conf()
-    bdir = get_backup_dir(cfg)
-    if bdir:
-        # Has the backup completed?
-        encrypted_ok = (bdir / "backup").exists() and any(
-            (d / "Manifest.plist").exists() and (d / "Manifest.plist").stat().st_size > 0
-            for d in (bdir / "backup").iterdir() if d.is_dir() and len(d.name) > 20
-        )
-        # File must exist AND have a valid SQLite header — guards against
-        # truncated/zero-header artifacts from a killed decrypt run.
-        chat_db = bdir / "extracted" / "ChatStorage.sqlite"
-        decrypted_ok = chat_db.exists() and _looks_like_sqlite(chat_db)
-        if decrypted_ok:
-            return 4, "Extract-only (seconds, reuses decrypted DB)"
-        if encrypted_ok:
-            return 3, "Re-decrypt existing backup (~30 min, no iPhone)"
-    return 1, "Refresh from iPhone (incremental — fetches only new data)"
-
-
-_CANCEL_SENTINEL = "__cancel__"
-
-
-def _pick_phase_with_user(default_phase: int, default_label: str) -> int | None:
-    """
-    Surface the auto-detected phase to the user and let them override.
-    Returns the selected phase, or None if cancelled.
-
-    Uses a sentinel for the Cancel choice because questionary treats a
-    Choice with `value=None` as "no explicit value" and returns the title
-    string instead — which then propagates as `phase` and crashes the
-    caller with `'>' not supported between str and int`.
-    """
-    if default_phase == 1:
-        # Nothing else to offer
-        return 1
-    options = [
-        Choice(f"⚡ {default_label}", default_phase),
-        Choice("🔄 Refresh from iPhone (incremental — fetches only new data)", 1),
-        Choice("← Cancel", _CANCEL_SENTINEL),
-    ]
-    result = questionary.select(
-        "How do you want to sync?",
-        choices=options,
-        instruction="(all options are incremental — they differ in how far back to restart)",
-    ).ask()
-    # ESC / Ctrl+C → None; explicit Cancel → _CANCEL_SENTINEL. Both mean "abort".
-    if result is None or result == _CANCEL_SENTINEL:
-        return None
-    return result
-
-
-def action_backup_one_contact():
-    picked = pick_contact()
-    if not picked:
-        return
-    flag, value = picked
-
-    default_phase, default_label = _best_from_phase()
-    phase = _pick_phase_with_user(default_phase, default_label)
-    if phase is None:
-        return
-
-    skip_remote = not questionary.confirm("Push to Mikoshi at the end?", default=True).ask()
-
-    cmd = ["bash", str(SCRIPT_DIR / "run_pipeline.sh")]
-    if flag == "--chat-jid":
-        # Exact-JID path: selective decrypt in Phase 3 + exact filter in
-        # Phase 4. Massive speedup when only one chat is wanted.
-        cmd += [flag, value]
-    else:
-        # Substring match — legacy path, decrypts the whole shared domain.
-        cmd += ["--mode", "full-contact", flag, value]
-
-    if phase > 1:
-        cmd += ["--from-phase", str(phase)]
-    if skip_remote:
-        cmd.append("--skip-remote-sync")
-    run(cmd)
-    pause()
-
-
-def action_incremental():
-    default_phase, default_label = _best_from_phase()
-    phase = _pick_phase_with_user(default_phase, default_label)
-    if phase is None:
-        return
-
-    skip_remote = not questionary.confirm("Push to Mikoshi at the end?", default=True).ask()
-    cmd = ["bash", str(SCRIPT_DIR / "run_pipeline.sh")]
-    if phase > 1:
-        cmd += ["--from-phase", str(phase)]
-    if skip_remote:
-        cmd.append("--skip-remote-sync")
-    run(cmd)
-    pause()
-
-
-def action_reextract():
-    """Run extraction against an already-downloaded backup."""
-    if not find_existing_chatstorage():
-        cfg = load_ingest_conf()
-        bdir = get_backup_dir(cfg)
-        if not (bdir and (bdir / "backup").exists()):
-            console.print("[red]No existing backup found.[/] Run a full backup first.")
-            pause()
-            return
-
-    mode = questionary.select(
-        "Re-extract mode:",
-        choices=[
-            Choice("Incremental (new since last sync)", "incremental"),
-            Choice("Full (re-process everything from existing backup)", "full"),
-            Choice("Just one contact", "full-contact"),
-        ],
-    ).ask()
-    if not mode:
-        return
-
-    contact = None
-    if mode == "full-contact":
-        contact = pick_contact()
-        if not contact:
-            return
-
-    cmd = [sys.executable, str(SCRIPT_DIR / "explore_backup.py"),
-           "extract", "--mode", mode]
-    if contact:
-        cmd += ["--contact", contact]
-    run(cmd)
-    pause()
-
-
-def action_push_existing():
-    exports = sorted(EXPORTS_DIR.glob("whatsapp_export_*.json"), reverse=True)
-    if not exports:
-        console.print("[red]No local exports found in exports/[/]")
-        pause()
-        return
-
-    cfg = load_ingest_conf()
-    if not cfg.get("MIKOSHI_URL") or not cfg.get("MIKOSHI_TOKEN"):
-        console.print("[red]MIKOSHI_URL and MIKOSHI_TOKEN are required.[/]")
-        console.print(f"Edit {INGEST_CONF}")
-        pause()
-        return
-
-    choices = []
-    for e in exports[:20]:
-        try:
-            meta = json.loads(e.read_text())
-            choices.append(Choice(
-                title=f"{e.name}  [{meta.get('mode')}, {meta['stats']['total_messages']} msgs]",
-                value=str(e),
-            ))
-        except Exception:
-            choices.append(Choice(title=e.name, value=str(e)))
-
-    pick = questionary.select("Pick an export to push:", choices=choices).ask()
-    if not pick:
-        return
-    run([
-        sys.executable, str(SCRIPT_DIR / "push_via_api.py"),
-        "--manifest", pick,
-        "--attachments-dir", str(EXPORTS_DIR / "attachments"),
-    ])
-    pause()
-
-
-def action_sqlite_shell():
-    db = find_existing_chatstorage()
-    if not db:
-        console.print("[yellow]No decrypted ChatStorage. Decrypting now...[/]")
-        run([sys.executable, str(SCRIPT_DIR / "explore_backup.py"), "shell"])
-        return
-    console.print(f"[cyan]Opening sqlite3 against {db}[/]")
-    console.print("[dim]Type .quit to return[/]")
-    os.execvp("sqlite3", ["sqlite3", str(db)])
-
-
-def action_run_tests():
-    run([sys.executable, "-m", "pytest", "-v"], env_extra=None)
-    pause()
-
-
-def action_verify_backup():
-    """Interactively pick a level then run verify_backup.py."""
-    level = questionary.select(
-        "Which checks?",
-        choices=[
-            Choice("Level 4 — full (extracts ChatStorage, slowest, definitive)", 4),
-            Choice("Level 3 — keybag (passphrase + Manifest.db decrypt, no extract)", 3),
-            Choice("Level 2 — Status.plist parses + 'finished'", 2),
-            Choice("Level 1 — file presence + magic bytes (instant)", 1),
-        ],
-    ).ask()
-    if not level:
-        return
-    run([sys.executable, str(SCRIPT_DIR / "verify_backup.py"), "--level", str(level)])
-    pause()
-
-
-def action_edit_config():
-    if not INGEST_CONF.exists():
-        if not questionary.confirm(f"{INGEST_CONF} doesn't exist. Create with template?", default=True).ask():
-            return
-        INGEST_CONF.write_text(
-            "# Mikoshi WhatsApp pipeline config\n"
-            "MIKOSHI_URL=https://your-mikoshi.example.com\n"
-            "MIKOSHI_TOKEN=paste-token-here\n"
-            "# MIKOSHI_BACKUP_DIR=/Volumes/ExternalSSD/iphone_backup\n"
-            "# MIKOSHI_CLIENT_ID=my-mac\n"
-            "# KEEP_LOCAL_EXPORTS=5\n"
-            "# Keep decrypted ChatStorage + media between runs so --from-phase 4\n"
-            "# works without re-decrypting. Default: true (data already lives\n"
-            "# on your encrypted backup disk anyway).\n"
-            "MIKOSHI_PRESERVE_EXTRACTED=true\n"
-        )
-        INGEST_CONF.chmod(0o600)
-    editor = os.environ.get("EDITOR", "nano")
-    subprocess.call([editor, str(INGEST_CONF)])
-
-
-# Single source of truth for what "unset" means. The cleanup() in
-# run_pipeline.sh defaults the same way (see PRESERVE_EXTRACTED_DEFAULT
-# constant there). Keep these in sync.
-PRESERVE_EXTRACTED_DEFAULT = True
-
-
-def action_toggle_preserve_extracted():
-    """
-    Flip MIKOSHI_PRESERVE_EXTRACTED in ~/.mikoshi-ingest.conf and persist.
-
-    Why this matters: when enabled, the decrypted ChatStorage.sqlite + media
-    tree under extracted/ survive the pipeline's EXIT trap, so the next
-    --from-phase 4 run doesn't pay another ~30 min decrypt. Default is ON;
-    users worried about decrypted artifacts sitting on disk can flip it OFF.
-    """
-    cfg = load_ingest_conf()
-    current = parse_bool(cfg.get("MIKOSHI_PRESERVE_EXTRACTED"),
-                         default=PRESERVE_EXTRACTED_DEFAULT)
-
-    console.print(Panel(
-        f"[bold]Preserve decrypted artifacts across runs[/]\n\n"
-        f"Currently: [{'green' if current else 'yellow'}]"
-        f"{'ON — extracted/ kept' if current else 'OFF — extracted/ wiped after each run'}[/]\n\n"
-        "[dim]When ON, the decrypted ChatStorage.sqlite + media live in\n"
-        "MIKOSHI_BACKUP_DIR/extracted/ between runs. Saves ~30 min of\n"
-        "decryption per iteration. When OFF, those files are removed\n"
-        "after every successful run (encrypted backup is kept either way).[/]",
-        title="MIKOSHI_PRESERVE_EXTRACTED",
-    ))
-
-    new_val = not current
-    label = "Turn OFF" if current else "Turn ON"
-    if not questionary.confirm(f"{label}?", default=True).ask():
-        return
-
-    set_conf_value("MIKOSHI_PRESERVE_EXTRACTED", "true" if new_val else "false")
-    console.print(f"[green]✓ Saved to {INGEST_CONF}[/]")
-    console.print(f"  MIKOSHI_PRESERVE_EXTRACTED={'true' if new_val else 'false'}")
-    pause()
-
-
-# ─── favorites ─────────────────────────────────────────────────────────────
+# ─── favorites ────────────────────────────────────────────────────────────
 
 import favorites as favs
 
 
-def _pick_chats_multi(prompt: str, source_chats: list[dict], preselect_jids: set[str] | None = None) -> list[dict] | None:
-    """questionary.checkbox over chats; returns selected dicts or None on cancel."""
+def _pick_chats_multi(prompt, source_chats, preselect_jids=None):
     preselect_jids = preselect_jids or set()
     choices = []
     for c in source_chats:
@@ -767,11 +722,9 @@ def _pick_chats_multi(prompt: str, source_chats: list[dict], preselect_jids: set
         kind = "group" if c["jid"].endswith("@g.us") else "1-on-1"
         title = f"{fmt_ts(c['last_ts']):<12} {c['msg_count']:>5} msgs  [{kind}]  {(c.get('name') or '—')[:30]}"
         choices.append(Choice(title=title, value=c, checked=(c["jid"] in preselect_jids)))
-
     if not choices:
         console.print("[red]No chats to choose from.[/]")
         return None
-
     return questionary.checkbox(
         prompt,
         choices=choices,
@@ -786,32 +739,29 @@ def _render_favorites_table():
     if not items:
         console.print("[yellow]No favorites yet.[/]")
         return
-
-    state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {"chats": {}}
-    cursors = state.get("chats", {})
-
+    cache = pipeline_state.load_cursor_cache(STATE_FILE)
     table = Table(title=f"Favorites ({len(items)})", header_style="bold cyan")
     table.add_column("Name")
     table.add_column("JID", style="dim")
-    table.add_column("Last sync")
-    table.add_column("Added")
+    table.add_column("Last commit", style="dim")
+    table.add_column("Added", style="dim")
     for f in items:
+        entry = cache.chats.get(f["jid"])
+        ts = entry.committed_through_ts if entry else None
         table.add_row(
             (f.get("name") or "—")[:32],
             f["jid"],
-            (cursors.get(f["jid"]) or "—")[:19],
+            (ts or "—")[:19],
             (f.get("added_at") or "")[:10],
         )
     console.print(table)
 
 
-def action_manage_favorites():
+def action_favorites():
     while True:
         console.clear()
-        console.print(Panel.fit(
-            f"[bold cyan]Favorites[/]   ({favs.path()})\n"
-            "[dim]These chats will be synced when you run 'mikoshi-whatsapp.sh sync'[/]"
-        ))
+        render_header(get_header_snapshot())
+        console.print()
         _render_favorites_table()
         console.print()
 
@@ -826,13 +776,12 @@ def action_manage_favorites():
             ],
         ).ask()
 
-        if choice is None or choice == "back":
+        if choice in (None, "back"):
             return
         if choice == "add":
             db = find_existing_chatstorage()
             if not db:
-                console.print("[red]No ChatStorage decrypted yet.[/] "
-                              "Run a sync first so we can list your chats.")
+                console.print("[red]No ChatStorage decrypted yet.[/] Run a sync first.")
                 pause()
                 continue
             all_chats = list_chats_from_db(db)
@@ -874,86 +823,255 @@ def action_manage_favorites():
                 console.print(f"[green]Cleared {n} favorite(s)[/]")
                 pause()
         elif choice == "sync_now":
-            action_sync_favorites()
+            # Short-cut into Sync screen with scope preselected.
+            return action_sync()
 
 
-def action_sync_favorites():
-    data = favs.load()
-    if not data["favorites"]:
-        console.print("[yellow]No favorites configured. Add some first.[/]")
-        pause()
-        return
+# ─── setup & verify ──────────────────────────────────────────────────────
 
-    default_phase, default_label = _best_from_phase()
-    phase = _pick_phase_with_user(default_phase, default_label)
-    if phase is None:
-        return
 
-    skip_remote = not questionary.confirm(
-        f"Push to Mikoshi at the end? ({len(data['favorites'])} chat(s))",
-        default=True
+def action_setup_verify():
+    choice = questionary.select(
+        "Setup & verify:",
+        choices=[
+            Choice("✅  Verify setup (run checks)", "verify_setup"),
+            Choice("🔍  Verify backup integrity (1-4 levels)", "verify_backup"),
+            Choice("🌐  Test Mikoshi auth (against /cursors)", "test_auth"),
+            Choice("✏️   Edit ~/.mikoshi-ingest.conf", "edit_conf"),
+            Choice("🔐  Toggle 'keep decrypted between runs'", "toggle"),
+            Choice("← Back", "back"),
+        ],
     ).ask()
-    cmd = ["bash", str(SCRIPT_DIR / "run_pipeline.sh"), "--favorites"]
-    if phase > 1:
-        cmd += ["--from-phase", str(phase)]
-    if skip_remote:
-        cmd.append("--skip-remote-sync")
-    run(cmd)
+    if choice in (None, "back"):
+        return
+
+    if choice == "verify_setup":
+        run(["bash", str(SCRIPT_DIR / "verify_setup.sh")])
+        pause()
+    elif choice == "verify_backup":
+        action_verify_backup()
+    elif choice == "test_auth":
+        run(["bash", str(SCRIPT_DIR / "mikoshi-whatsapp.sh"), "test-auth"])
+        pause()
+    elif choice == "edit_conf":
+        action_edit_config()
+    elif choice == "toggle":
+        action_toggle_preserve_extracted()
+
+
+def action_verify_backup():
+    level = questionary.select(
+        "Which checks?",
+        choices=[
+            Choice("Level 4 — full (extracts ChatStorage, slowest, definitive)", 4),
+            Choice("Level 3 — keybag (passphrase + Manifest.db decrypt, no extract)", 3),
+            Choice("Level 2 — Status.plist parses + 'finished'", 2),
+            Choice("Level 1 — file presence + magic bytes (instant)", 1),
+        ],
+    ).ask()
+    if not level:
+        return
+    run([sys.executable, str(SCRIPT_DIR / "verify_backup.py"), "--level", str(level)])
     pause()
 
 
-# ─── main loop ─────────────────────────────────────────────────────────────
+def action_edit_config():
+    if not INGEST_CONF.exists():
+        if not questionary.confirm(f"{INGEST_CONF} doesn't exist. Create with template?", default=True).ask():
+            return
+        INGEST_CONF.write_text(
+            "# Mikoshi WhatsApp pipeline config\n"
+            "MIKOSHI_URL=https://your-mikoshi.example.com\n"
+            "MIKOSHI_TOKEN=paste-token-here\n"
+            "# MIKOSHI_BACKUP_DIR=/Volumes/ExternalSSD/iphone_backup\n"
+            "# MIKOSHI_CLIENT_ID=my-mac\n"
+            "# KEEP_LOCAL_EXPORTS=5\n"
+            "# Keep decrypted ChatStorage + media between runs so --from-phase 4 works.\n"
+            "MIKOSHI_PRESERVE_EXTRACTED=true\n"
+        )
+        INGEST_CONF.chmod(0o600)
+    editor = os.environ.get("EDITOR", "nano")
+    subprocess.call([editor, str(INGEST_CONF)])
+    _invalidate_header_cache()
 
+
+def action_toggle_preserve_extracted():
+    cfg = load_ingest_conf()
+    current = parse_bool(cfg.get("MIKOSHI_PRESERVE_EXTRACTED"),
+                         default=PRESERVE_EXTRACTED_DEFAULT)
+
+    console.print(Panel(
+        f"[bold]Preserve decrypted artifacts across runs[/]\n\n"
+        f"Currently: [{'green' if current else 'yellow'}]"
+        f"{'ON — extracted/ kept' if current else 'OFF — extracted/ wiped after each run'}[/]",
+        title="MIKOSHI_PRESERVE_EXTRACTED",
+    ))
+
+    new_val = not current
+    label = "Turn OFF" if current else "Turn ON"
+    if not questionary.confirm(f"{label}?", default=True).ask():
+        return
+    set_conf_value("MIKOSHI_PRESERVE_EXTRACTED", "true" if new_val else "false")
+    console.print(f"[green]✓ Saved to {INGEST_CONF}[/]")
+    _invalidate_header_cache()
+    pause()
+
+
+# ─── tools (advanced) ─────────────────────────────────────────────────────
+
+
+def action_tools():
+    choice = questionary.select(
+        "Advanced tools:",
+        choices=[
+            Choice("📤  Push existing export to Mikoshi", "push_existing"),
+            Choice("🐚  Open sqlite3 shell on ChatStorage", "sqlite"),
+            Choice("🧹  Purge decrypted artifacts (shred)", "purge"),
+            Choice("🧪  Run tests", "tests"),
+            Choice("🔄  Refresh header now", "refresh"),
+            Choice("← Back", "back"),
+        ],
+    ).ask()
+    if choice in (None, "back"):
+        return
+
+    if choice == "push_existing":
+        action_push_existing()
+    elif choice == "sqlite":
+        action_sqlite_shell()
+    elif choice == "purge":
+        run(["bash", str(SCRIPT_DIR / "mikoshi-whatsapp.sh"), "purge-extracted"])
+        _invalidate_header_cache()
+        pause()
+    elif choice == "tests":
+        run([sys.executable, "-m", "pytest", "-v"])
+        pause()
+    elif choice == "refresh":
+        _invalidate_header_cache()
+
+
+def action_push_existing():
+    exports = sorted(EXPORTS_DIR.glob("whatsapp_export_*.json"), reverse=True)
+    if not exports:
+        console.print("[red]No local exports found in exports/[/]")
+        pause()
+        return
+
+    cfg = load_ingest_conf()
+    if not cfg.get("MIKOSHI_URL") or not cfg.get("MIKOSHI_TOKEN"):
+        console.print("[red]MIKOSHI_URL and MIKOSHI_TOKEN are required.[/]")
+        console.print(f"Edit {INGEST_CONF}")
+        pause()
+        return
+
+    choices = []
+    for e in exports[:20]:
+        try:
+            meta = json.loads(e.read_text())
+            choices.append(Choice(
+                title=f"{e.name}  [{meta.get('mode')}, {meta['stats']['total_messages']} msgs]",
+                value=str(e),
+            ))
+        except Exception:
+            choices.append(Choice(title=e.name, value=str(e)))
+
+    pick = questionary.select("Pick an export to push:", choices=choices).ask()
+    if not pick:
+        return
+    run([
+        sys.executable, str(SCRIPT_DIR / "push_via_api.py"),
+        "--manifest", pick,
+        "--attachments-dir", str(EXPORTS_DIR / "attachments"),
+        "--state-file", str(STATE_FILE),
+    ])
+    _invalidate_header_cache()
+    pause()
+
+
+def action_sqlite_shell():
+    db = find_existing_chatstorage()
+    if not db:
+        console.print("[yellow]No decrypted ChatStorage. Decrypting now...[/]")
+        run(["bash", str(SCRIPT_DIR / "run_pipeline.sh"),
+             "--from-phase", "3", "--skip-remote-sync"])
+        return
+    console.print(f"[cyan]Opening sqlite3 against {db}[/]")
+    console.print("[dim]Type .quit to return[/]")
+    os.execvp("sqlite3", ["sqlite3", str(db)])
+
+
+# ─── action_status (kept for `mikoshi-whatsapp.sh status`) ───────────────
+
+
+def action_status():
+    """Headless-friendly status dump used by `mikoshi-whatsapp.sh status`."""
+    snap = get_header_snapshot(force_refresh=True)
+    render_header(snap)
+    # Plus a few extra fields not in the header.
+    cfg = snap["cfg"]
+    table = Table(title="More details", show_header=False, box=None)
+    table.add_column("Key", style="cyan")
+    table.add_column("Value")
+    table.add_row("Config file", str(INGEST_CONF) + (" ✓" if INGEST_CONF.exists() else " ✗"))
+    table.add_row("MIKOSHI_TOKEN", "[green]set[/]" if cfg.get("MIKOSHI_TOKEN") else "[red]not set[/]")
+    exports = sorted(EXPORTS_DIR.glob("whatsapp_export_*.json"))
+    table.add_row("Local exports", f"{len(exports)} files" if exports else "[dim]none[/]")
+    try:
+        fav_count = len(favs.load().get("favorites", []))
+        table.add_row("Favorites", f"{fav_count} chat(s)" if fav_count else "[dim]none[/]")
+    except Exception:
+        pass
+    console.print(table)
+    pause()
+
+
+# ─── main loop ────────────────────────────────────────────────────────────
+
+# Five intent-based top-level actions (REDESIGN.md §5.1).
+# The label text includes the cross-reference keyword "Sync" / "Push" / etc.
+# in sub-screens so users still find them via the menu's search filter.
 ACTIONS = [
-    ("📊  Show status / config",                action_status),
-    ("✅  Verify setup (run checks)",           action_verify),
-    ("🔍  Verify backup integrity",             action_verify_backup),
-    ("📋  List chats from backup",              action_list_chats),
-    ("📌  Manage favorites",                    action_manage_favorites),
-    ("🔂  Sync favorites now",                  action_sync_favorites),
-    ("🔁  Sync — incremental (default)",        action_incremental),
-    ("👤  Sync — one contact only",             action_backup_one_contact),
-    ("🌍  Sync — full (everything)",            action_full_backup),
-    ("♻️   Re-extract from existing backup",    action_reextract),
-    ("📤  Push existing export to Mikoshi",     action_push_existing),
-    ("🐚  Open sqlite3 shell on ChatStorage",   action_sqlite_shell),
-    ("🔐  Toggle keep decrypted between runs",  action_toggle_preserve_extracted),
-    ("✏️   Edit ~/.mikoshi-ingest.conf",        action_edit_config),
-    ("🧪  Run tests",                            action_run_tests),
+    ("🔂  Sync (recommended)",           "sync"),
+    ("📊  Inspect (List chats, drift, status)", "inspect"),
+    ("📌  Manage favorites",             "favorites"),
+    ("⚙   Setup & verify (Verify setup, auth, config)", "setup"),
+    ("🛠   Tools (Push, sqlite, advanced)", "tools"),
 ]
 
+_ACTION_DISPATCH = {
+    "sync": action_sync,
+    "inspect": action_inspect,
+    "favorites": action_favorites,
+    "setup": action_setup_verify,
+    "tools": action_tools,
+}
 
-# Sentinel for explicit-Exit so we can distinguish it from ESC/Ctrl+C (None).
-# Using None for both made `choice()` get called with a non-callable string
-# when use_shortcuts=True returned the shortcut key for the Exit row.
+
 _EXIT_SENTINEL = "__exit__"
 
 
 def main():
     while True:
         console.clear()
-        console.print(Panel.fit(
-            "[bold cyan]Mikoshi WhatsApp Pipeline[/]\n"
-            "[dim]TUI · ESC or Ctrl+C to exit[/]",
-        ))
+        snap = get_header_snapshot()
+        render_header(snap)
+        console.print()
 
         choice = questionary.select(
             "What do you want to do?",
-            choices=[Choice(title=label, value=fn) for label, fn in ACTIONS]
+            choices=[Choice(title=label, value=key) for label, key in ACTIONS]
                     + [Choice(title="🚪  Exit", value=_EXIT_SENTINEL)],
             use_shortcuts=True,
         ).ask()
 
-        # User hit ESC / Ctrl+C, or picked Exit, or somehow got a non-callable.
-        if choice is None or choice == _EXIT_SENTINEL:
+        if choice in (None, _EXIT_SENTINEL):
             break
-        if not callable(choice):
-            # Defensive: questionary occasionally hands back a shortcut string
-            # when use_shortcuts is enabled. Don't crash; warn and re-prompt.
+        fn = _ACTION_DISPATCH.get(choice)
+        if fn is None:
             console.print(f"[yellow]Unexpected selection: {choice!r}[/]")
             continue
         try:
-            choice()
+            fn()
         except KeyboardInterrupt:
             console.print("\n[yellow]Action cancelled[/]")
 

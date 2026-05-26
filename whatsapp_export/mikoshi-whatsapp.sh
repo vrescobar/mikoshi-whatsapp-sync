@@ -9,6 +9,8 @@
 #   ./mikoshi-whatsapp.sh sync --full    # full re-sync (resets state)
 #   ./mikoshi-whatsapp.sh sync --skip-remote-sync  # local-only test
 #   ./mikoshi-whatsapp.sh status         # show config + state
+#   ./mikoshi-whatsapp.sh purge-extracted [--force]  # opt-in shred of decrypted artifacts
+#   ./mikoshi-whatsapp.sh test-auth      # verify MIKOSHI_URL/MIKOSHI_TOKEN against the server
 #   ./mikoshi-whatsapp.sh --help
 
 set -euo pipefail
@@ -32,15 +34,26 @@ Subcommands:
                   --since <date>       Only messages since YYYY-MM-DD.
                   --skip-remote-sync   Run extraction but don't push.
                   Anything else gets forwarded to run_pipeline.sh.
-  status       Print pipeline status (config, backup, sync state).
+
+                  Cron-friendly behaviour: when no iPhone is detected,
+                  the run falls back to a cached encrypted backup if one
+                  exists, or exits cleanly (rc=0) with "nothing to do"
+                  when neither is available.
+
+  status       Print pipeline status (config, backup, sync state, drift).
   reset-backup [--force]
                Delete the partial/corrupt iPhone backup so the next sync
-               can start fresh. Asks for confirmation unless --force.
-               Only touches MIKOSHI_BACKUP_DIR/backup/<UDID>/.
+               can start fresh. Only touches MIKOSHI_BACKUP_DIR/backup/<UDID>/.
   verify-backup [--level 1-4]
                Run integrity checks against the existing encrypted backup
-               without touching it. Level 1=files+magic, 2=status, 3=keybag,
-               4=ChatStorage extract (default). Useful before/after a sync.
+               without touching it.
+  purge-extracted [--force]
+               Shred decrypted artifacts (ChatStorage.sqlite, *.plist,
+               Manifest.db). The encrypted backup stays intact. Replaces
+               the old "Phase 5 secure_cleanup" which used to run on every
+               successful sync and forced re-decrypting on the next run.
+  test-auth    Hit the Mikoshi cursors endpoint with the configured token
+               and return a friendly diagnosis. Doesn't push anything.
   -h, --help   This message.
 
 Examples:
@@ -48,6 +61,7 @@ Examples:
   $(basename "$0") sync                           # favorites if any, else all
   $(basename "$0") sync --all                     # force all-chats incremental
   $(basename "$0") sync --skip-remote-sync        # dry run, no push
+  $(basename "$0") test-auth                      # validate MIKOSHI_TOKEN
 
   # Single chat, since a date — selectively decrypts only that chat's media:
   $(basename "$0") sync --chat-jid '34xxxxxxxxx@s.whatsapp.net' --since 2026-01-01
@@ -70,12 +84,9 @@ activate_venv() {
     fi
 }
 
-# Load ~/.mikoshi-ingest.conf so child processes (tui.py, run_pipeline.sh,
-# explore_backup.py, ...) all inherit MIKOSHI_URL / TOKEN / BACKUP_DIR / etc.
-# Precedence: env vars set by the user > values from the file.
+# Load ~/.mikoshi-ingest.conf so child processes inherit the env vars.
 INGEST_CONF="${MIKOSHI_INGEST_CONF:-${HOME}/.mikoshi-ingest.conf}"
 if [[ -f "$INGEST_CONF" ]]; then
-    # Snapshot env-provided values so we can restore them after sourcing.
     _saved_MIKOSHI_URL="${MIKOSHI_URL:-}"
     _saved_MIKOSHI_TOKEN="${MIKOSHI_TOKEN:-}"
     _saved_MIKOSHI_BACKUP_DIR="${MIKOSHI_BACKUP_DIR:-}"
@@ -88,7 +99,6 @@ if [[ -f "$INGEST_CONF" ]]; then
     source "$INGEST_CONF"
     set +a
 
-    # Env vars trump file values.
     [[ -n "$_saved_MIKOSHI_URL" ]] && export MIKOSHI_URL="$_saved_MIKOSHI_URL"
     [[ -n "$_saved_MIKOSHI_TOKEN" ]] && export MIKOSHI_TOKEN="$_saved_MIKOSHI_TOKEN"
     [[ -n "$_saved_MIKOSHI_BACKUP_DIR" ]] && export MIKOSHI_BACKUP_DIR="$_saved_MIKOSHI_BACKUP_DIR"
@@ -113,6 +123,30 @@ try:
 except Exception:
     sys.exit(1)
 PYEOF
+}
+
+# Cron / interactive parity: share `_best_from_phase` with the TUI by
+# shelling out to pipeline_state. Stdout: "<phase>\t<label>". Stderr is
+# human-readable. Pre-redesign the cron path always started from Phase 1
+# and failed when the iPhone wasn't around — closes pain point #9.
+#
+# PYTHONPATH gets SCRIPT_DIR prepended so the import works no matter
+# what the caller's CWD is (cron typically calls us from $HOME).
+best_phase() {
+    activate_venv
+    # `cd` into SCRIPT_DIR so `python3 -m pipeline_state` resolves the
+    # module from the install dir, not from the caller's CWD (cron typically
+    # runs us from $HOME, and the test harness from the project root —
+    # both cases the wrapper has to handle). The cd is local to the
+    # subshell created by command substitution in the caller, so it
+    # doesn't leak.
+    (cd "$SCRIPT_DIR" && python3 -m pipeline_state best-phase 2>/dev/null) \
+        || echo "1	Refresh from iPhone"
+}
+
+# Wrapper around the require-iphone probe — same `cd` trick.
+require_iphone_ok() {
+    ( cd "$SCRIPT_DIR" && python3 -m pipeline_state best-phase --require-iphone >/dev/null 2>&1 )
 }
 
 cmd_tui() {
@@ -151,12 +185,38 @@ cmd_sync() {
         fi
     fi
 
+    # Smart phase selection — same logic the TUI uses (REDESIGN.md §6.2).
+    # If the user didn't pass --from-phase, pick the cheapest based on
+    # on-disk state + iPhone reachability.
+    local has_from_phase=false
+    for a in "${args[@]+"${args[@]}"}"; do
+        if [[ "$a" == "--from-phase" ]]; then
+            has_from_phase=true
+            break
+        fi
+    done
+
+    if [[ "$has_from_phase" != true ]]; then
+        local best_out
+        best_out=$(best_phase)
+        local phase="${best_out%%	*}"
+        local label="${best_out#*	}"
+        if [[ "$phase" == "1" ]]; then
+            # Confirm the iPhone is actually reachable; otherwise the run
+            # will fail. If no backup exists either, exit cleanly with
+            # rc=0 (cron: "nothing to do" beats "failed").
+            if ! require_iphone_ok; then
+                echo "[mikoshi] no iPhone reachable and no cached backup → nothing to do (rc=0)"
+                exit 0
+            fi
+        else
+            echo "[mikoshi] smart-phase: starting from phase $phase ($label)"
+            args+=(--from-phase "$phase")
+        fi
+    fi
+
     echo "[mikoshi] $(date '+%Y-%m-%d %H:%M:%S') starting sync: ${args[*]:-(default)}"
     echo "[mikoshi] full log: $cron_log"
-    # Pipe to both terminal and cron log.
-    # ${args[@]+"${args[@]}"} is the portable idiom for "expand only if set":
-    # bash 3.2 (macOS default) trips on plain "${args[@]}" under `set -u`
-    # when the array is empty, e.g. `sync --all` with no other flags.
     "$PIPELINE" ${args[@]+"${args[@]}"} 2>&1 | tee "$cron_log"
     local rc=${PIPESTATUS[0]}
     echo "[mikoshi] $(date '+%Y-%m-%d %H:%M:%S') sync finished (exit $rc)"
@@ -192,8 +252,6 @@ cmd_reset_backup() {
         return 0
     fi
 
-    # Find UDID-named subdirs via simple globbing — avoids bash 3.2 quirks
-    # with `< <(find ...)` and arrays under set -u.
     local found=0
     local victim
     for victim in "$backup_root"/*; do
@@ -235,13 +293,71 @@ cmd_reset_backup() {
         echo "[mikoshi] ✓ removed $victim"
     done
 
-    # Also wipe any decrypted artifacts from previous runs
     if [[ -d "${base}/extracted" ]]; then
         rm -rf "${base}/extracted"
         echo "[mikoshi] ✓ removed decrypted artifacts"
     fi
 
     echo "[mikoshi] done. Next sync will start a fresh full backup."
+}
+
+# Opt-in secure cleanup. Replaces the pre-redesign "Phase 5" that ran
+# unconditionally on every successful sync.
+cmd_purge_extracted() {
+    local force=false
+    if [[ "${1:-}" == "--force" ]]; then
+        force=true
+    fi
+
+    local base="${MIKOSHI_BACKUP_DIR:-${SCRIPT_DIR}/temp}"
+    local extracted="${base}/extracted"
+
+    if [[ ! -d "$extracted" ]]; then
+        echo "[mikoshi] no decrypted artifacts at $extracted — nothing to purge"
+        return 0
+    fi
+
+    local size
+    size=$(du -sh "$extracted" 2>/dev/null | cut -f1)
+    echo "[mikoshi] will shred: $extracted ($size)"
+    echo "  Files to shred: ChatStorage.sqlite, *.plist, Manifest.db (encrypted backup left intact)"
+
+    if [[ "$force" != true ]]; then
+        echo ""
+        read -r -p "Type 'yes' to confirm: " ans
+        if [[ "$ans" != "yes" ]]; then
+            echo "[mikoshi] aborted"
+            return 1
+        fi
+    fi
+
+    find "$extracted" -type f \( \
+        -name "ChatStorage.sqlite" -o \
+        -name "*.plist" -o \
+        -name "Manifest.db" \
+    \) -exec shred -vfz -n 7 {} \; 2>/dev/null || true
+
+    # Sweep decrypted media (large) and the extracted/ directory itself.
+    rm -rf "$extracted"
+    echo "[mikoshi] ✓ decrypted artifacts removed"
+    echo "[mikoshi]   next sync needs --from-phase 3 (re-decrypt) at minimum"
+}
+
+cmd_test_auth() {
+    activate_venv
+    python3 - <<'PYEOF'
+import os
+import sys
+sys.path.insert(0, ".")
+import push_via_api
+
+cfg = push_via_api.load_config()
+url = cfg.get("MIKOSHI_URL", "").rstrip("/")
+token = cfg.get("MIKOSHI_TOKEN", "")
+ok, msg = push_via_api.test_auth(url, token)
+print(msg)
+sys.exit(0 if ok else 1)
+PYEOF
 }
 
 # ─── dispatch ──────────────────────────────────────────────────────────────
@@ -251,11 +367,13 @@ if [[ $# -eq 0 ]]; then
 fi
 
 case "$1" in
-    tui)            shift; cmd_tui "$@" ;;
-    sync)           shift; cmd_sync "$@" ;;
-    status)         shift; cmd_status "$@" ;;
-    reset-backup)   shift; cmd_reset_backup "$@" ;;
-    verify-backup)  shift; cmd_verify_backup "$@" ;;
-    -h|--help)      usage ;;
-    *)              echo "Unknown subcommand: $1"; echo; usage; exit 1 ;;
+    tui)              shift; cmd_tui "$@" ;;
+    sync)             shift; cmd_sync "$@" ;;
+    status)           shift; cmd_status "$@" ;;
+    reset-backup)     shift; cmd_reset_backup "$@" ;;
+    verify-backup)    shift; cmd_verify_backup "$@" ;;
+    purge-extracted)  shift; cmd_purge_extracted "$@" ;;
+    test-auth)        shift; cmd_test_auth "$@" ;;
+    -h|--help)        usage ;;
+    *)                echo "Unknown subcommand: $1"; echo; usage; exit 1 ;;
 esac

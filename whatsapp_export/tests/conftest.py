@@ -10,6 +10,31 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
+def persist_cursors_like_push(state_file, chats_state):
+    """
+    Mimic what push_via_api.py does on a successful commit: stamp the
+    cursor cache with the server-confirmed values.
+
+    Since extract_messages no longer writes the cache by default (that
+    was the silent-drift bug), tests that exercise multi-run cursor
+    semantics need to simulate the post-push step explicitly. This
+    helper is the post-redesign equivalent of the old
+    `save_sync_state(state_file, sync_state)` call.
+    """
+    import pipeline_state
+    committed = {
+        jid: {"ts": ts, "external_id": None}
+        for jid, ts in (chats_state or {}).items()
+        if ts
+    }
+    pipeline_state.update_cache_from_commit(
+        state_file=state_file,
+        server_url="http://test",
+        push_id="test-push",
+        committed_cursors=committed,
+    )
+
+
 IOS_EPOCH_OFFSET = 978307200  # 2001-01-01 UTC
 
 

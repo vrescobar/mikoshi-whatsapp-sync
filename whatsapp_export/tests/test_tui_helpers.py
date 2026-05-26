@@ -345,31 +345,38 @@ class TestDirSizeGb:
 # ─── ACTIONS / main loop invariants ────────────────────────────────────────
 
 class TestActionsTable:
-    """Guard against the 'str object is not callable' regression in main()."""
+    """Guard against the 'str object is not callable' regression in main()
+    and verify the intent-based menu still exposes the screens users
+    expect to find via keyword search.
+    """
 
     def setup_method(self):
         sys.modules.pop("tui", None)
         import tui
         self.tui = tui
 
-    def test_all_actions_are_callable(self):
-        for label, fn in self.tui.ACTIONS:
-            assert callable(fn), f"Action {label!r} has non-callable target: {fn!r}"
+    def test_all_actions_dispatch_to_callables(self):
+        """Each entry in ACTIONS is (label, dispatch_key); the dispatch
+        table maps every key to a real function."""
+        for label, key in self.tui.ACTIONS:
+            assert key in self.tui._ACTION_DISPATCH, \
+                f"Action {label!r} maps to key {key!r} which has no dispatch entry"
+            assert callable(self.tui._ACTION_DISPATCH[key]), \
+                f"Dispatch entry for {key!r} is not callable"
 
     def test_all_actions_have_unique_labels(self):
         labels = [label for label, _ in self.tui.ACTIONS]
         assert len(labels) == len(set(labels)), "Duplicate action labels"
 
     def test_exit_sentinel_distinct_from_None(self):
-        """If Exit's sentinel collides with None, ESC handling breaks."""
         assert self.tui._EXIT_SENTINEL is not None
-        # And the sentinel itself must not be callable (so main() won't try to call it)
         assert not callable(self.tui._EXIT_SENTINEL)
 
-    def test_at_least_basic_actions_present(self):
-        """Smoke check: the menu has the entries we documented."""
+    def test_intent_keywords_discoverable(self):
+        """The 5-screen menu is built around intent. Each pre-redesign
+        keyword still appears somewhere in the labels so users hunting
+        for 'Push' or 'sqlite' via questionary's filter find a route."""
         labels = [label for label, _ in self.tui.ACTIONS]
-        # Fuzzy match: each expected keyword shows up in at least one label
         for keyword in ("status", "Verify", "List chats", "Manage favorites",
                         "Sync", "Push", "sqlite"):
             assert any(keyword.lower() in lbl.lower() for lbl in labels), \

@@ -165,7 +165,8 @@ class TestChatJidFilter:
         untouched, otherwise the next incremental sync silently loses those
         chats' new messages.
         """
-        from extract_messages import save_sync_state
+        sys.path.insert(0, str(Path(__file__).parent))
+        from _helpers import persist_cursors_like_push
 
         # Seed all cursors with a full sync.
         out1 = tmp_path / "1.json"
@@ -178,9 +179,9 @@ class TestChatJidFilter:
             sync_state=s,
             mode="full",
         )
-        s["chats"] = new
-        save_sync_state(state_file, s)
-        alice_before = s["chats"]["alice@s.whatsapp.net"]
+        persist_cursors_like_push(state_file, new)
+        s_reloaded = load_sync_state(state_file)
+        alice_before = s_reloaded["chats"]["alice@s.whatsapp.net"]
 
         # Now scoped sync on Bob only.
         out2 = tmp_path / "2.json"
@@ -195,10 +196,11 @@ class TestChatJidFilter:
             target_chat_jid="bob@s.whatsapp.net",
         )
         if new2 is not None:
-            s2["chats"] = new2
+            persist_cursors_like_push(state_file, new2)
 
         # Alice's cursor must not have changed.
-        assert s2["chats"]["alice@s.whatsapp.net"] == alice_before
+        s_final = load_sync_state(state_file)
+        assert s_final["chats"]["alice@s.whatsapp.net"] == alice_before
 
 
 # ─── --since filter ──────────────────────────────────────────────────────
@@ -232,7 +234,8 @@ class TestSinceFilter:
         If the per-chat cursor is already past the --since date, --since must
         not pull older messages back in. The cursor wins.
         """
-        from extract_messages import save_sync_state
+        sys.path.insert(0, str(Path(__file__).parent))
+        from _helpers import persist_cursors_like_push
 
         # Full sync first → cursors are at the latest message.
         out1 = tmp_path / "1.json"
@@ -245,8 +248,7 @@ class TestSinceFilter:
             sync_state=s,
             mode="full",
         )
-        s["chats"] = new
-        save_sync_state(state_file, s)
+        persist_cursors_like_push(state_file, new)
 
         # Now an incremental run with --since far in the past. We expect zero
         # new messages because every chat's cursor is already at the tip.
@@ -261,8 +263,6 @@ class TestSinceFilter:
             mode="incremental",
             since_iso="2000-01-01T00:00:00+00:00",
         )
-        # extract_messages returns None when no chats had new messages, or a
-        # dict whose stats sum to zero. Both are acceptable here.
         if new2 is not None:
             data = json.loads(out2.read_text())
             assert data["stats"]["total_messages"] == 0

@@ -28,6 +28,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pipeline_state
+
 # iOS Core Data reference epoch: 2001-01-01 00:00:00 UTC
 IOS_EPOCH_OFFSET = 978307200
 
@@ -90,19 +92,76 @@ def sha256_file(path):
 
 
 def load_sync_state(state_file):
-    if not state_file.exists():
-        return {"version": 1, "last_global_sync": None, "chats": {}}
-    with open(state_file) as f:
-        return json.load(f)
+    """
+    Read the cursor cache and project it into the v1-shape dict this
+    module's internals were originally built around: ``{"chats": {jid: iso_ts}}``.
+
+    The on-disk file may be either v1 (pre-redesign) or v2 (server-confirmed
+    after a successful commit). `pipeline_state.load_cursor_cache` handles
+    both shapes transparently. The projection back to v1 lets the rest of
+    this script (and existing tests) keep working unchanged.
+    """
+    cache = pipeline_state.load_cursor_cache(state_file)
+    return {
+        "version": 1,
+        "last_global_sync": cache.last_successful_commit,
+        "chats": {
+            jid: c.committed_through_ts
+            for jid, c in cache.chats.items()
+            if c.committed_through_ts
+        },
+    }
 
 
 def save_sync_state(state_file, state):
-    state["last_global_sync"] = datetime.now(timezone.utc).isoformat()
-    state_file.parent.mkdir(parents=True, exist_ok=True)
-    tmp = state_file.with_suffix(".tmp")
-    with open(tmp, "w") as f:
-        json.dump(state, f, indent=2)
-    tmp.replace(state_file)
+    """
+    Write cursors back to disk.
+
+    From the redesign onward this is a NO-OP unless the user explicitly
+    opted into the legacy behaviour via ``MIKOSHI_TRUST_LOCAL_CURSOR=1``.
+    The reason it's gated: writing cursors at extraction time is what
+    caused the silent-drift bug — a 401 on push left local cursors
+    pretending the server had data it never received. The single
+    authorised cursor writer is now ``push_via_api.commit`` after a 200
+    from ``/commit``.
+
+    When the escape hatch is on, we still write — but in the v2 schema,
+    with ``source: "extracted (legacy)"`` so drift detection knows these
+    values must be re-verified against the server.
+    """
+    if os.environ.get("MIKOSHI_TRUST_LOCAL_CURSOR", "").strip().lower() not in ("1", "true", "yes", "on"):
+        print(
+            "[INFO] Skipping cursor write — push_via_api.py will advance cursors after a successful commit.",
+            file=sys.stderr,
+        )
+        print(
+            "[INFO]   (set MIKOSHI_TRUST_LOCAL_CURSOR=1 to restore the legacy extraction-time write.)",
+            file=sys.stderr,
+        )
+        return
+
+    print(
+        "[WARN] MIKOSHI_TRUST_LOCAL_CURSOR=1 is set — writing cursors at extraction time.",
+        file=sys.stderr,
+    )
+    print(
+        "[WARN]   This re-enables the pre-redesign behaviour where cursors can advance past a failed push.",
+        file=sys.stderr,
+    )
+    cache = pipeline_state.load_cursor_cache(state_file)
+    cache.last_successful_commit = state.get("last_global_sync") or pipeline_state.now_iso()
+    for jid, iso_ts in (state.get("chats") or {}).items():
+        if not iso_ts:
+            continue
+        existing = cache.chats.get(jid)
+        if existing and existing.committed_through_ts and existing.committed_through_ts >= str(iso_ts):
+            # Don't rewind a cursor someone else (push) already advanced past.
+            continue
+        cache.chats[jid] = pipeline_state.ChatCursor(
+            committed_through_ts=str(iso_ts),
+            source=pipeline_state.SOURCE_EXTRACTED_LEGACY,
+        )
+    pipeline_state.save_cursor_cache(state_file, cache)
 
 
 def attachment_is_allowed(mime, file_path):
@@ -600,9 +659,13 @@ def main():
     if new_chats_state is None:
         sys.exit(2)
 
+    # `new_chats_state` is the cursor map *would-be* — we hand it to the
+    # push step via the manifest, and push_via_api will persist the
+    # authoritative version after a successful commit. The local save
+    # below is a no-op by default (see save_sync_state docstring), kept
+    # only as a manual escape hatch.
     sync_state["chats"] = new_chats_state
     save_sync_state(args.state_file, sync_state)
-    print(f"[INFO] Sync state saved: {args.state_file}")
 
 
 if __name__ == "__main__":

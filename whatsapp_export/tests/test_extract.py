@@ -91,10 +91,14 @@ class TestSyncState:
 
 # ─── End-to-end extraction ─────────────────────────────────────────────────
 
-def run_extract(db, root, out, atts, state_file, **kwargs):
-    """Helper: load state, extract, save state."""
-    from extract_messages import save_sync_state
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).parent))
+from _helpers import persist_cursors_like_push as _persist_cursors_like_push  # noqa: E402
 
+
+def run_extract(db, root, out, atts, state_file, **kwargs):
+    """Helper: load state, extract, persist state-as-if-push-succeeded."""
     state = load_sync_state(state_file)
     if kwargs.get("mode") == "full":
         state = {"version": 1, "last_global_sync": None, "chats": {}}
@@ -111,8 +115,7 @@ def run_extract(db, root, out, atts, state_file, **kwargs):
         favorite_jids=kwargs.get("favorite_jids"),
     )
     if new_chats_state is not None:
-        state["chats"] = new_chats_state
-        save_sync_state(state_file, state)
+        _persist_cursors_like_push(state_file, new_chats_state)
     return json.loads(out.read_text())
 
 
@@ -179,13 +182,16 @@ class TestFullContactSync:
         # Initial full sync sets all cursors
         out1 = tmp_path / "1.json"
         run_extract(synthetic_db, extracted_root, out1, attachments_dir, state_file, mode="full")
-        state_after_full = json.loads(state_file.read_text())
+        # Use load_sync_state so we get the v1-shape projection regardless
+        # of whether the on-disk file is v1 or v2 — the new cache writes
+        # v2 but load_sync_state collapses it back to {jid: iso_ts}.
+        state_after_full = load_sync_state(state_file)
 
         # full-contact on Alice should NOT touch Bob's cursor
         out2 = tmp_path / "2.json"
         run_extract(synthetic_db, extracted_root, out2, attachments_dir, state_file,
                     mode="full-contact", target_contact="Alice")
-        state_after_contact = json.loads(state_file.read_text())
+        state_after_contact = load_sync_state(state_file)
 
         assert state_after_full["chats"]["bob@s.whatsapp.net"] == \
                state_after_contact["chats"]["bob@s.whatsapp.net"]
@@ -582,10 +588,9 @@ class TestStateOverlapWithFavorites:
     def test_favorites_dont_touch_other_chats_cursors(
         self, synthetic_db, extracted_root, tmp_path, attachments_dir, state_file
     ):
-        from extract_messages import (
-            extract_messages, load_sync_state, save_sync_state
-        )
-        # Full sync first to seed all cursors
+        from extract_messages import extract_messages, load_sync_state
+        # Full sync first to seed all cursors. Persist via the same path
+        # push_via_api would use on commit success (the new cursor-write rule).
         out1 = tmp_path / "1.json"
         state = load_sync_state(state_file)
         s1 = extract_messages(
@@ -596,8 +601,8 @@ class TestStateOverlapWithFavorites:
             sync_state=state,
             mode="full",
         )
-        state["chats"] = s1
-        save_sync_state(state_file, state)
+        _persist_cursors_like_push(state_file, s1)
+        state = load_sync_state(state_file)
         bob_cursor_before = state["chats"]["bob@s.whatsapp.net"]
 
         # Now run favorites-only with just Alice
@@ -612,9 +617,9 @@ class TestStateOverlapWithFavorites:
             mode="incremental",
             favorite_jids=["alice@s.whatsapp.net"],
         )
-        # When no new messages exist, extract_messages returns None
         if s2 is not None:
-            state2["chats"] = s2
+            _persist_cursors_like_push(state_file, s2)
 
         # Bob's cursor must remain untouched
+        state2 = load_sync_state(state_file)
         assert state2["chats"].get("bob@s.whatsapp.net") == bob_cursor_before

@@ -186,6 +186,80 @@ def decrypt_media_for_relpaths(
     return decrypted, skipped, missing
 
 
+def decrypt_db_only(
+    backup_dir: Path,
+    password: str,
+    out_dir: Path,
+    *,
+    eb_factory: Optional[Callable[[Path, str], object]] = None,
+) -> Path:
+    """
+    Decrypt only ChatStorage.sqlite — no media. ~10s on a 96 GB backup.
+
+    Used by the redesigned pipeline's Phase 3 (decrypt-db). The plan
+    phase reads this DB to count work-to-do; only then does Phase 5
+    (materialize) decrypt the media files we actually need.
+    """
+    factory = eb_factory or _open_encrypted_backup
+    eb = factory(backup_dir, password)
+    return extract_chatstorage(eb, out_dir)
+
+
+def decrypt_media_for_jids(
+    backup_dir: Path,
+    password: str,
+    out_dir: Path,
+    chatstorage_path: Path,
+    jids: Iterable[str],
+    *,
+    incremental: bool = True,
+    eb_factory: Optional[Callable[[Path, str], object]] = None,
+) -> DecryptStats:
+    """
+    Decrypt the media files belonging to a set of chats.
+
+    Querying multiple JIDs in one decrypt pass is much cheaper than
+    looping `decrypt_whatsapp(..., chat_jid=jid)` because
+    `eb.extract_files` walks the Manifest.db exactly once. Used by the
+    plan-driven Phase 5 (materialize) for favorites / multi-chat scopes.
+    """
+    stats = DecryptStats(chat_jid=None)
+    factory = eb_factory or _open_encrypted_backup
+    eb = factory(backup_dir, password)
+
+    all_relpaths: list[str] = []
+    for jid in jids:
+        try:
+            rps = list_chat_media_relpaths(chatstorage_path, jid)
+        except ValueError:
+            # Unknown JID — skip. The extract step will surface it.
+            continue
+        all_relpaths.extend(rps)
+    # Dedup while preserving order — same media can be referenced from
+    # multiple chats (forwarded images, group/individual overlap).
+    seen: set[str] = set()
+    unique = [rp for rp in all_relpaths if not (rp in seen or seen.add(rp))]
+
+    stats.media_total_candidates = len(unique)
+    stats.media_relpaths = unique
+
+    if not unique:
+        return stats
+
+    decrypted, skipped_cached, missing = decrypt_media_for_relpaths(
+        eb, unique, out_dir / "media", incremental=incremental,
+    )
+    stats.media_decrypted = decrypted
+    stats.media_skipped_cached = skipped_cached
+    if missing:
+        stats.errors.append(
+            f"{len(missing)} relpath(s) not found in Manifest.db: "
+            + ", ".join(missing[:5])
+            + ("…" if len(missing) > 5 else "")
+        )
+    return stats
+
+
 def decrypt_whatsapp(
     backup_dir: Path,
     password: str,

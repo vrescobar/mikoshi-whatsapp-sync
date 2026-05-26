@@ -1,4 +1,29 @@
 #!/bin/bash
+#
+# WhatsApp → Mikoshi pipeline (post-redesign).
+#
+# Phase order (see REDESIGN.md §6):
+#   1. prepare       — detect device (or detect cached backup as fallback)
+#   2. acquire       — make/refresh encrypted backup via idevicebackup2
+#   3. decrypt-db    — selective_decrypt → extracted/ChatStorage.sqlite ONLY (~10s)
+#   3b. decrypt-media— scoped media decrypt based on TARGET_CHAT_JID / favorites / all
+#   4. extract       — extract_messages.py → exports/whatsapp_export_*.json
+#   4.5 validate     — validate_export.py against schema.json
+#   5. push&confirm  — push_via_api.py → manifest / media / commit
+#                       cursor cache is updated INSIDE this step on commit 200
+#   6. gc            — keep last KEEP_LOCAL_EXPORTS json exports + their attachments
+#
+# Cursor advancement:
+#   .sync_state.json is now a *cache* of the server's per-chat cursors,
+#   written exclusively by push_via_api after a 200 from /commit.
+#   extract_messages.py no longer writes the file in default mode —
+#   set MIKOSHI_TRUST_LOCAL_CURSOR=1 for the legacy behaviour.
+#
+# Secure shred of decrypted artifacts:
+#   The pre-redesign Phase 5 (secure_cleanup) was a no-op by default
+#   (MIKOSHI_PRESERVE_EXTRACTED defaults to true). It's been removed
+#   from the default flow. To shred decrypted artifacts after a run,
+#   set MIKOSHI_SECURE_CLEANUP=1 or invoke `./mikoshi-whatsapp.sh purge-extracted`.
 
 set -euo pipefail
 
@@ -14,16 +39,19 @@ EXPORTS_DIR="${SCRIPT_DIR}/exports"
 ATTACHMENTS_DIR="${SCRIPT_DIR}/exports/attachments"
 STATE_FILE="${SCRIPT_DIR}/.sync_state.json"
 LOCK_FILE="${SCRIPT_DIR}/.pipeline.lock"
-CONFIG_FILE="${HOME}/.whatsapp_export.conf"                      # legacy rsync
-INGEST_CONF="${MIKOSHI_INGEST_CONF:-${HOME}/.mikoshi-ingest.conf}"   # HTTP push + shared pipeline env
+CONFIG_FILE="${HOME}/.whatsapp_export.conf"                      # legacy rsync (deprecated)
+INGEST_CONF="${MIKOSHI_INGEST_CONF:-${HOME}/.mikoshi-ingest.conf}"
 EXTRACTOR="${SCRIPT_DIR}/extract_messages.py"
 VALIDATOR="${SCRIPT_DIR}/validate_export.py"
 SCHEMA_FILE="${SCRIPT_DIR}/schema.json"
 
+# Pairing timeout for the iPhone trust prompt (Phase 1). Anything beyond
+# this is treated as "device unreachable" and the pipeline either falls
+# back to a cached backup (when --from-phase ≥ 3) or aborts cleanly.
+MIKOSHI_DEVICE_TIMEOUT="${MIKOSHI_DEVICE_TIMEOUT:-300}"
+
 # Load ~/.mikoshi-ingest.conf early so env vars defined there (MIKOSHI_BACKUP_DIR,
 # MIKOSHI_CLIENT_ID, KEEP_LOCAL_EXPORTS, ...) take effect before we compute paths.
-# Lines must be KEY=VALUE (no `export` needed — set -a auto-exports).
-# Precedence: env vars set by the user > values from the file.
 if [[ -f "$INGEST_CONF" ]]; then
     _saved_MIKOSHI_URL="${MIKOSHI_URL:-}"
     _saved_MIKOSHI_TOKEN="${MIKOSHI_TOKEN:-}"
@@ -45,10 +73,6 @@ if [[ -f "$INGEST_CONF" ]]; then
     [[ -n "$_saved_MIKOSHI_FAVORITES_FILE" ]] && export MIKOSHI_FAVORITES_FILE="$_saved_MIKOSHI_FAVORITES_FILE"
 fi
 
-# Temp / backup location. Override with MIKOSHI_BACKUP_DIR to use an external
-# disk (recommended when the iPhone backup is larger than your Mac's free space).
-# When set, only sensitive files are shredded — the directory itself is left
-# alone (you may have other backups there).
 TEMP_DIR="${MIKOSHI_BACKUP_DIR:-${SCRIPT_DIR}/temp}"
 TEMP_DIR_IS_EXTERNAL=false
 [[ -n "${MIKOSHI_BACKUP_DIR:-}" ]] && TEMP_DIR_IS_EXTERNAL=true
@@ -75,67 +99,42 @@ Options:
   --mode <incremental|full|full-contact>
         Default: incremental.
   --contact <name-or-jid>
-        Required when --mode=full-contact. Substring match against
-        ZPARTNERNAME / ZCONTACTJID — use --chat-jid for an exact match.
+        Required when --mode=full-contact. Substring match — use --chat-jid for exact.
   --chat-jid <jid>
-        Restrict the run to messages of this exact ZCONTACTJID. When set,
-        Phase 3 ALSO switches to selective decryption: only ChatStorage.sqlite
-        plus the media attachments belonging to this chat are decrypted,
-        instead of the whole WhatsApp shared domain. Massive speedup when
-        you only care about one DM.
+        Restrict the run to messages of this exact ZCONTACTJID. Phase 3b
+        switches to per-chat selective decryption automatically.
   --since <YYYY-MM-DD>
-        Only extract messages whose timestamp is >= this date. Combines with
-        the per-chat incremental cursor: never rewinds, never goes earlier.
+        Lift the lower bound for fresh chats. Never rewinds a cursor.
   --include-system
         Include WhatsApp system messages (group events, encryption notices).
   --skip-remote-sync
-        Run extraction but don't rsync to Mikoshi server.
+        Run extraction but don't push to Mikoshi. The cursor cache is NOT
+        advanced when push is skipped — there is no commit, so there's no
+        confirmation to record.
   --keep-local <N>
-        Override KEEP_LOCAL_EXPORTS (default 5). Older exports are shredded
-        after successful remote sync.
+        Override KEEP_LOCAL_EXPORTS (default 5).
   --favorites [PATH]
-        Restrict extraction to JIDs listed in the favorites file. Default
-        path: \$MIKOSHI_FAVORITES_FILE or ~/.mikoshi-favorites.json.
-        Errors out if the file is missing/empty.
+        Restrict extraction (and Phase 3b media decrypt) to JIDs listed
+        in the favorites file. Default path: \$MIKOSHI_FAVORITES_FILE
+        or ~/.mikoshi-favorites.json.
   --from-phase N
-        Skip earlier phases. N ∈ {1..6}. Useful after a Phase-4 failure:
-        rerun with --from-phase 3 to reuse the encrypted backup (no new
-        backup made, no iPhone needed). Requires that the artifacts each
-        skipped phase would normally produce already exist:
-          --from-phase 3 → needs MIKOSHI_BACKUP_DIR/backup/<UDID>/
-          --from-phase 4 → also needs MIKOSHI_BACKUP_DIR/extracted/ChatStorage.sqlite
+        Skip earlier phases. N ∈ {1..6}. Useful after a failure — see
+        REDESIGN.md §6 for phase semantics.
   --help, -h
         Show this message.
 
-Environment variables:
-  MIKOSHI_BACKUP_DIR
-        Override location of the iPhone backup + decryption workspace.
-        Use this when your Mac doesn't have enough free space to hold the
-        whole iPhone backup. The encrypted backup is preserved between runs
-        so incremental backups are fast; only decrypted artifacts are wiped.
-        Example: export MIKOSHI_BACKUP_DIR=/Volumes/ExternalSSD/iphone_backup
-  KEEP_LOCAL_EXPORTS
-        See --keep-local.
-  MIKOSHI_PRESERVE_EXTRACTED
-        Persist decrypted ChatStorage.sqlite + media between runs so the
-        next --from-phase 4 doesn't re-decrypt. Accepts true/yes/on/1 vs
-        false/no/off/0 (case-insensitive). DEFAULT: true.
-        Lives in ~/.mikoshi-ingest.conf — TUI exposes a one-key toggle:
-        "Toggle keep decrypted between runs".
-  MIKOSHI_CLIENT_ID
-        Override the hostname recorded in each export.
-  MIKOSHI_URL / MIKOSHI_TOKEN
-        Mikoshi REST ingest credentials (or put them in ~/.mikoshi-ingest.conf).
+Environment:
+  MIKOSHI_BACKUP_DIR             External backup workspace.
+  MIKOSHI_DEVICE_TIMEOUT         Phase 1 trust-prompt timeout in seconds (default: 300).
+  MIKOSHI_SECURE_CLEANUP         Set to 1 to shred decrypted artifacts after a successful run.
+  MIKOSHI_TRUST_LOCAL_CURSOR     Legacy: re-enable extraction-time cursor writes (re-introduces drift bug).
+  MIKOSHI_URL / MIKOSHI_TOKEN    Mikoshi REST ingest credentials.
 
 Examples:
   $(basename "$0")
   $(basename "$0") --mode full
-  $(basename "$0") --mode full-contact --contact "Alice"
-  $(basename "$0") --include-system
-
-  # Backup to external SSD (recommended if your Mac is tight on disk):
-  export MIKOSHI_BACKUP_DIR=/Volumes/ExternalSSD/iphone_backup
-  $(basename "$0") --mode full-contact --contact "Alice" --skip-remote-sync
+  $(basename "$0") --favorites
+  $(basename "$0") --chat-jid '34xxxxxxxxx@s.whatsapp.net' --since 2026-01-01
 USAGE
 }
 
@@ -150,7 +149,6 @@ while [[ $# -gt 0 ]]; do
         --keep-local) KEEP_LOCAL_EXPORTS="$2"; shift 2 ;;
         --favorites)
             USE_FAVORITES=true
-            # Optional inline path: --favorites /custom/path
             if [[ $# -ge 2 && "$2" != --* ]]; then
                 FAVORITES_FILE="$2"; shift 2
             else
@@ -189,8 +187,6 @@ fi
 
 mkdir -p "$LOG_DIR" "$EXPORTS_DIR" "$ATTACHMENTS_DIR"
 
-# For external backup dir, check the mount actually exists (avoid silently
-# writing to a stale path if the drive isn't plugged in).
 if [[ "$TEMP_DIR_IS_EXTERNAL" == true ]]; then
     parent="$(dirname "$TEMP_DIR")"
     if [[ ! -d "$parent" ]]; then
@@ -217,7 +213,6 @@ if [[ "$TEMP_DIR_IS_EXTERNAL" == true ]]; then
     fi
 fi
 
-# Report on the actual config that matters for the modern HTTP push flow.
 if [[ -f "$INGEST_CONF" ]]; then
     log "Mikoshi config loaded from $INGEST_CONF"
     if [[ -z "${MIKOSHI_URL:-}" ]]; then
@@ -231,104 +226,52 @@ else
     warn "To enable push, create the file with: MIKOSHI_URL=... and MIKOSHI_TOKEN=..."
 fi
 
-# Legacy SSH/rsync config — kept for back-compat only. Silently source if
-# present; don't warn when absent (it's expected to be missing on new installs).
+# Legacy rsync config kept for back-compat. Silently source if present.
 if [[ -f "$CONFIG_FILE" ]]; then
     # shellcheck disable=SC1090
     source "$CONFIG_FILE"
-    log "Legacy SSH config also loaded from $CONFIG_FILE"
 fi
 
+# ─── lock with PID liveness check ────────────────────────────────────────
+#
+# The pre-redesign acquire_lock() wrote $$ to .pipeline.lock and never
+# checked whether the PID was alive. A kill -9 mid-run bricked every
+# subsequent run (notably 6h cron) until someone manually rm'd the file.
+# Now we re-acquire the lock if its PID is no longer running and the file
+# is older than 1 hour (safe heuristic — backups can take 90 minutes).
+acquire_lock() {
+    if [[ -f "$LOCK_FILE" ]]; then
+        local lock_pid
+        lock_pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
+        if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+            error "Pipeline already running (lock: $LOCK_FILE, PID $lock_pid)"
+            error "If you're sure that's stale: rm $LOCK_FILE"
+            exit 1
+        fi
+        # Stale lock — owner is gone.
+        warn "Stale lock detected (PID ${lock_pid:-?} no longer running). Reclaiming."
+        rm -f "$LOCK_FILE"
+    fi
+    echo $$ > "$LOCK_FILE"
+}
+
+# ─── cleanup trap (no longer shreds by default) ──────────────────────────
+#
+# Pre-redesign this also acted as the secure-cleanup phase (shredding
+# decrypted artifacts on every successful run). That's now opt-in via
+# MIKOSHI_SECURE_CLEANUP=1 — see secure_cleanup_optin().
 cleanup() {
     local exit_code=$?
-    log "=== Cleanup (exit $exit_code) ==="
 
-    # Preserve extracted/ (decrypted ChatStorage + media) across runs.
-    #
-    # Source of truth: MIKOSHI_PRESERVE_EXTRACTED in ~/.mikoshi-ingest.conf
-    # (auto-sourced at script start) or as an env var. Accepts the same
-    # boolean forms tui.parse_bool() does — true/yes/on/1 vs false/no/off/0,
-    # case-insensitive.
-    #
-    # Default (unset) is TRUE: decrypted artifacts live alongside the
-    # encrypted backup on the external disk anyway, and keeping them lets
-    # the user iterate with --from-phase 4 without paying ~30 min per
-    # decrypt. The TUI exposes a one-key toggle (action_toggle_preserve_extracted).
-    #
-    # The encrypted backup under backup/<UDID>/ is NEVER touched by this
-    # branch — only the decrypted extracted/ subtree.
-    local preserve_extracted=false
-    local raw="${MIKOSHI_PRESERVE_EXTRACTED:-}"
-    local lc; lc=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')
-    local preserve_setting="default"
-    case "$lc" in
-        true|yes|on|1)        preserve_setting="on"  ;;
-        false|no|off|0)       preserve_setting="off" ;;
-        "")                   preserve_setting="default" ;;
-        *)                    preserve_setting="default" ;;  # unparseable → default
-    esac
-    if [[ "$TEMP_DIR_IS_EXTERNAL" == true \
-        && -f "${TEMP_DIR}/extracted/ChatStorage.sqlite" ]]; then
-        case "$preserve_setting" in
-            on)
-                preserve_extracted=true ;;
-            default)
-                # Default ON. Same effect as "on" — kept separate so the
-                # cleanup log can tell the user where the policy came from.
-                preserve_extracted=true ;;
-            off)
-                # User explicitly opted out; respect it on success. We still
-                # preserve on failure unless the user is *extra* explicit
-                # (off + non-zero exit → wipe is what they asked for).
-                preserve_extracted=false ;;
-        esac
+    if [[ -f "${TEMP_DIR}/backup.stderr" ]]; then
+        rm -f "${TEMP_DIR}/backup.stderr"
     fi
 
-    if [[ -d "$TEMP_DIR" ]]; then
-        # CRITICAL: the shred target MUST be restricted to the decrypted
-        # working area, NEVER the whole $TEMP_DIR. When MIKOSHI_BACKUP_DIR
-        # is used as $TEMP_DIR, recursing into it would match Manifest.plist /
-        # Status.plist / Info.plist / Manifest.db inside the *encrypted*
-        # iPhone backup tree (those files have the same names as our
-        # decrypted artifacts) and destroy them — irrecoverably, with the
-        # 7-pass shred. This bug cost a 55h backup once.
-        #
-        # The decrypted artifacts only ever live in $TEMP_DIR/extracted/.
-        # Anything in $TEMP_DIR/backup/<UDID>/ is the iPhone's encrypted
-        # backup and must remain untouched.
-        if [[ -d "${TEMP_DIR}/extracted" && "$preserve_extracted" != true ]]; then
-            find "${TEMP_DIR}/extracted" -type f \( \
-                -name "ChatStorage.sqlite" -o \
-                -name "*.plist" -o \
-                -name "Manifest.db" -o \
-                -name "Status" \
-            \) -exec shred -vfz -n 7 {} \; 2>/dev/null || true
-        fi
-
-        if [[ "$preserve_extracted" == true ]]; then
-            if [[ $exit_code -eq 0 ]]; then
-                if [[ "$preserve_setting" == "on" ]]; then
-                    log "✓ Keeping extracted/ (MIKOSHI_PRESERVE_EXTRACTED=$raw)"
-                else
-                    log "✓ Keeping extracted/ (default; toggle in TUI to wipe)"
-                fi
-            else
-                log "✓ Keeping extracted/ for iteration (pipeline failed at exit $exit_code)"
-            fi
-            log "  Re-run with: ./mikoshi-whatsapp.sh sync --all --from-phase 4"
-            rm -f "${TEMP_DIR}/backup.stderr"
-        elif [[ "$TEMP_DIR_IS_EXTERNAL" == true ]]; then
-            # External backup dir (MIKOSHI_BACKUP_DIR): preserve the encrypted
-            # iPhone backup so future incremental backups are fast. Only nuke
-            # the per-run extracted/ subdir which contains decrypted data.
-            rm -rf "${TEMP_DIR}/extracted"
-            rm -f "${TEMP_DIR}/backup.stderr"
-            log "✓ Decrypted artifacts cleaned (encrypted backup kept in $TEMP_DIR)"
-        else
-            rm -rf "$TEMP_DIR"
-            log "✓ Temp cleaned"
-        fi
+    # Opt-in shred on success only.
+    if [[ $exit_code -eq 0 && "${MIKOSHI_SECURE_CLEANUP:-0}" == "1" ]]; then
+        secure_cleanup_optin
     fi
+
     rm -f "$LOCK_FILE"
     if [[ $exit_code -eq 0 ]]; then
         log "=== Pipeline OK ==="
@@ -338,15 +281,6 @@ cleanup() {
     exit $exit_code
 }
 trap cleanup EXIT
-
-acquire_lock() {
-    if [[ -f "$LOCK_FILE" ]]; then
-        error "Pipeline already running (lock: $LOCK_FILE)"
-        error "If stale: rm $LOCK_FILE"
-        exit 1
-    fi
-    echo $$ > "$LOCK_FILE"
-}
 
 setup_python_env() {
     if [[ -z "${VIRTUAL_ENV:-}" ]]; then
@@ -360,21 +294,16 @@ setup_python_env() {
     fi
 }
 
-# Map idevicebackup2 output patterns to actionable messages.
-# Patterns are ordered from most-specific to most-generic.
+# ─── error-message decoder for idevicebackup2 ────────────────────────────
 diagnose_backup_error() {
     local err_file="$1"
     [[ -f "$err_file" ]] || return
 
-    # Most specific first: backup dir has corrupt metadata from a prior failed run
     if grep -qiE "deserializing property list|Error reading status|Could not read Info\\.plist|ErrorCode 205" "$err_file"; then
         error "Backup directory has CORRUPT metadata from a previous failed attempt."
-        error "Symptoms in idevicebackup2 output: 'Status.plist' / 'Info.plist' deserialization errors."
-        error ""
         error "Fix: wipe the partial backup so a fresh one can start:"
         if [[ "$TEMP_DIR_IS_EXTERNAL" == true ]]; then
             error "  ./mikoshi-whatsapp.sh reset-backup"
-            error "  (this deletes ${TEMP_DIR}/backup/<UDID>/ only — the rest of MIKOSHI_BACKUP_DIR is untouched)"
         else
             error "  rm -rf ${TEMP_DIR}/backup"
         fi
@@ -382,12 +311,10 @@ diagnose_backup_error() {
     fi
     if grep -qiE "MBErrorDomain/104|MBErrorDomain/106|backup is encrypted with a different password" "$err_file"; then
         error "Backup password mismatch: this device's backup was created with a different password."
-        error "Either delete the backup dir, or update Keychain to the right one."
         return
     fi
     if grep -qiE "wrong password|incorrect password" "$err_file"; then
         error "Backup password rejected by device."
-        error "Either the password in Keychain is wrong, or you changed it on the iPhone."
         error "Fix: security delete-generic-password -a iphone_backup -s iphone_backup_password"
         error "     security add-generic-password -a iphone_backup -s iphone_backup_password -w 'NEW_PASSWORD'"
         return
@@ -398,7 +325,6 @@ diagnose_backup_error() {
     fi
     if grep -qiE "trust this computer|pairing.*fail|not paired" "$err_file"; then
         error "iPhone has not trusted this Mac yet."
-        error "On iPhone: tap 'Trust' when prompted, then re-run."
         return
     fi
     if grep -qiE "no device|not found|ENODEV" "$err_file"; then
@@ -413,13 +339,33 @@ diagnose_backup_error() {
     tail -20 "$err_file" >&2
 }
 
+# ─── portable bounded wait (bash 3.2 + macOS, no `timeout` dependency) ────
+#
+# Some macs don't have `timeout(1)` (coreutils not installed). idevice
+# binaries occasionally hang when the trust prompt is pending or the
+# device is locked. We wrap the call: fork the child, fork a sleeper
+# that SIGTERMs it, wait for the child, then kill the sleeper.
+run_with_timeout() {
+    local secs=$1; shift
+    "$@" &
+    local pid=$!
+    ( sleep "$secs" && kill -TERM "$pid" 2>/dev/null ) &
+    local timer=$!
+    local rc=0
+    wait "$pid" 2>/dev/null || rc=$?
+    kill -KILL "$timer" 2>/dev/null || true
+    wait "$timer" 2>/dev/null || true
+    return $rc
+}
+
+# ─── PHASE 1: prepare (formerly detect_device) ───────────────────────────
 detect_device() {
     log "=== PHASE 1: Device Detection ==="
     if ! command -v idevice_id &>/dev/null; then
         error "idevice_id not found. Run: bash setup.sh"
         return 1
     fi
-    DEVICE_UDID=$(idevice_id -l | head -n1)
+    DEVICE_UDID=$(idevice_id -l 2>/dev/null | head -n1 || true)
     if [[ -z "$DEVICE_UDID" ]]; then
         error "No iPhone detected."
         error "  1. Unlock iPhone"
@@ -428,16 +374,24 @@ detect_device() {
         return 1
     fi
     log "✓ iPhone: $DEVICE_UDID"
-    if ideviceinfo -u "$DEVICE_UDID" >/dev/null 2>&1; then
-        # Use awk + sed to trim — xargs chokes on names with apostrophes/quotes
-        DEVICE_NAME=$(ideviceinfo -u "$DEVICE_UDID" | awk -F': ' '/^DeviceName:/ {print $2}' | sed 's/[[:space:]]*$//')
-        log "✓ Device: $DEVICE_NAME"
+
+    # Trust prompt can hang ideviceinfo forever. Bound it.
+    local info_file="${TEMP_DIR}/_ideviceinfo.tmp"
+    rm -f "$info_file"
+    if run_with_timeout "$MIKOSHI_DEVICE_TIMEOUT" \
+        bash -c "ideviceinfo -u '$DEVICE_UDID' > '$info_file' 2>&1"; then
+        DEVICE_NAME=$(awk -F': ' '/^DeviceName:/ {print $2}' "$info_file" | sed 's/[[:space:]]*$//' || true)
+        log "✓ Device: ${DEVICE_NAME:-(unnamed)}"
     else
-        error "Cannot communicate with device. Trust prompt accepted?"
+        error "Cannot communicate with device within ${MIKOSHI_DEVICE_TIMEOUT}s."
+        error "  - iPhone may be locked, untrusted, or off your WiFi."
+        error "  - Bump MIKOSHI_DEVICE_TIMEOUT to wait longer."
         return 1
     fi
+    rm -f "$info_file"
 }
 
+# ─── PHASE 2: acquire (encrypted backup) ─────────────────────────────────
 create_backup() {
     log "=== PHASE 2: Encrypted Backup ==="
     BACKUP_PATH="${TEMP_DIR}/backup"
@@ -453,14 +407,8 @@ create_backup() {
 
     log "Creating backup (first run can be hours; subsequent are incremental)..."
     local err_file="${TEMP_DIR}/backup.stderr"
-    # Full output log — backup_progress.py mirrors all idevicebackup2 lines
-    # here via MIKOSHI_BACKUP_LOG so diagnose_backup_error has something to
-    # grep. (Plain stderr capture isn't enough since backup_progress.py owns
-    # the TTY for Rich rendering.)
     local backup_log="${TEMP_DIR}/backup.log"
 
-    # Use the rich progress wrapper unless explicitly disabled.
-    # Falls back to plain idevicebackup2 if rich isn't importable.
     local backup_cmd=(idevicebackup2 backup --udid "$DEVICE_UDID" "$BACKUP_PATH")
     if [[ "${MIKOSHI_PLAIN_PROGRESS:-0}" != "1" ]] && \
        python3 -c "import rich" 2>/dev/null; then
@@ -468,7 +416,6 @@ create_backup() {
     fi
 
     if ! MIKOSHI_BACKUP_LOG="$backup_log" "${backup_cmd[@]}" 2> >(tee "$err_file" >&2); then
-        # Diagnose against the full log (preferred) or stderr (fallback).
         if [[ -s "$backup_log" ]]; then
             diagnose_backup_error "$backup_log"
         else
@@ -479,40 +426,123 @@ create_backup() {
     log "✓ Backup created"
 }
 
-decrypt_backup() {
-    log "=== PHASE 3: Decrypt & Locate ChatStorage ==="
+# ─── PHASE 3a: decrypt-db only (ChatStorage.sqlite, ~10s) ────────────────
+decrypt_db() {
+    log "=== PHASE 3a: Decrypt ChatStorage.sqlite ==="
     EXTRACT_DIR="${TEMP_DIR}/extracted"
     mkdir -p "$EXTRACT_DIR"
 
-    # Both decrypt paths (3A whole-domain and 3B chat-only) go through
-    # selective_decrypt.py — the bash side just chooses the args. Keeping
-    # the Python logic in a module means it's unit-testable; embedded
-    # heredocs aren't.
-    local sel_args=(
-        --backup-dir "${BACKUP_PATH}/${DEVICE_UDID}"
-        --out-dir "$EXTRACT_DIR"
-    )
-    if [[ -n "$TARGET_CHAT_JID" ]]; then
-        log "  Selective decrypt: chat $TARGET_CHAT_JID"
-        sel_args+=(--chat-jid "$TARGET_CHAT_JID")
-    else
-        log "  Decrypting WhatsApp shared domain (full)"
-    fi
-
     if ! BACKUP_PASSWORD="$BACKUP_PASSWORD" \
-        python3 "${SCRIPT_DIR}/selective_decrypt.py" "${sel_args[@]}"; then
-        error "Decryption failed"
+        python3 -c "
+import sys
+sys.path.insert(0, '${SCRIPT_DIR}')
+from pathlib import Path
+import os
+import selective_decrypt
+out = selective_decrypt.decrypt_db_only(
+    backup_dir=Path('${BACKUP_PATH}/${DEVICE_UDID}'),
+    password=os.environ['BACKUP_PASSWORD'],
+    out_dir=Path('${EXTRACT_DIR}'),
+)
+print(f'[INFO] DB decrypted: {out}')
+"; then
+        error "Decryption of ChatStorage.sqlite failed"
         return 1
     fi
 
     CHAT_STORAGE="${EXTRACT_DIR}/ChatStorage.sqlite"
     if [[ ! -f "$CHAT_STORAGE" ]]; then
-        error "ChatStorage.sqlite not extracted (decryption failed silently?)"
+        error "ChatStorage.sqlite not extracted"
         return 1
     fi
     log "✓ ChatStorage.sqlite ready"
 }
 
+# ─── PHASE 3b: decrypt-media (scoped) ────────────────────────────────────
+#
+# Scope rules:
+#   - TARGET_CHAT_JID set → that chat's media only (selective).
+#   - USE_FAVORITES=true → media for every JID in the favorites file.
+#   - Otherwise → the whole WhatsApp shared domain (today's default for
+#     a full sync).
+decrypt_media() {
+    log "=== PHASE 3b: Decrypt media (scope: $(media_scope_label)) ==="
+    EXTRACT_DIR="${TEMP_DIR}/extracted"
+
+    if [[ -n "$TARGET_CHAT_JID" ]]; then
+        local jids=("$TARGET_CHAT_JID")
+        decrypt_media_jids "${jids[@]}"
+        return $?
+    fi
+
+    if [[ "$USE_FAVORITES" == true ]]; then
+        # shellcheck disable=SC2207
+        local fav_jids=( $(python3 -c "
+import json, sys
+data = json.load(open('${FAVORITES_FILE}'))
+for f in data.get('favorites', []):
+    if f.get('jid'):
+        print(f['jid'])
+") )
+        if [[ ${#fav_jids[@]} -eq 0 ]]; then
+            warn "Favorites file empty; skipping media decrypt"
+            return 0
+        fi
+        decrypt_media_jids "${fav_jids[@]}"
+        return $?
+    fi
+
+    # No targeting — decrypt the whole shared domain (today's behaviour).
+    if ! BACKUP_PASSWORD="$BACKUP_PASSWORD" \
+        python3 "${SCRIPT_DIR}/selective_decrypt.py" \
+            --backup-dir "${BACKUP_PATH}/${DEVICE_UDID}" \
+            --out-dir "$EXTRACT_DIR"; then
+        error "Whole-domain media decrypt failed"
+        return 1
+    fi
+    log "✓ Media decrypted (full WhatsApp shared domain)"
+}
+
+media_scope_label() {
+    if [[ -n "$TARGET_CHAT_JID" ]]; then
+        echo "one chat ($TARGET_CHAT_JID)"
+    elif [[ "$USE_FAVORITES" == true ]]; then
+        echo "favorites"
+    else
+        echo "all"
+    fi
+}
+
+decrypt_media_jids() {
+    local jids_csv
+    jids_csv=$(IFS=,; echo "$*")
+    if ! BACKUP_PASSWORD="$BACKUP_PASSWORD" MIKOSHI_DECRYPT_JIDS="$jids_csv" \
+        python3 -c "
+import os
+import sys
+sys.path.insert(0, '${SCRIPT_DIR}')
+from pathlib import Path
+import selective_decrypt
+jids = [j for j in os.environ['MIKOSHI_DECRYPT_JIDS'].split(',') if j]
+stats = selective_decrypt.decrypt_media_for_jids(
+    backup_dir=Path('${BACKUP_PATH}/${DEVICE_UDID}'),
+    password=os.environ['BACKUP_PASSWORD'],
+    out_dir=Path('${EXTRACT_DIR}'),
+    chatstorage_path=Path('${EXTRACT_DIR}/ChatStorage.sqlite'),
+    jids=jids,
+)
+print(f'[INFO] media decrypt: {stats.media_decrypted} decrypted, '
+      f'{stats.media_skipped_cached} cached, {stats.media_total_candidates} candidates')
+for e in stats.errors:
+    print(f'[WARN] {e}', file=sys.stderr)
+"; then
+        error "Scoped media decrypt failed"
+        return 1
+    fi
+    log "✓ Media decrypted (scoped)"
+}
+
+# ─── PHASE 4: extract messages ───────────────────────────────────────────
 extract_and_export() {
     log "=== PHASE 4: Extract Messages (mode=$SYNC_MODE) ==="
     [[ -n "$TARGET_CONTACT" ]] && log "  Target contact: $TARGET_CONTACT"
@@ -553,36 +583,19 @@ validate_export() {
     if python3 "$VALIDATOR" --export "$EXPORT_FILE" --schema "$SCHEMA_FILE"; then
         log "✓ Export validates against schema"
     else
-        error "Export does NOT conform to schema. Refusing to rsync."
+        error "Export does NOT conform to schema. Refusing to push."
         return 1
     fi
 }
 
-secure_cleanup() {
-    log "=== PHASE 5: Secure Cleanup ==="
-    # Scoped to $TEMP_DIR/extracted/ ONLY — see cleanup() comment for why.
-    # Recursing $TEMP_DIR with MIKOSHI_BACKUP_DIR active would destroy the
-    # encrypted iPhone backup.
-    #
-    # Honour MIKOSHI_PRESERVE_EXTRACTED (default ON when an external backup
-    # dir is configured) — otherwise this function shreds the very file the
-    # user just spent 13 min decrypting, forcing a re-decrypt on the next
-    # `--from-phase 4`. The cleanup() exit trap had this gate; secure_cleanup
-    # didn't, and was silently destroying ChatStorage.sqlite on every success.
-    local raw="${MIKOSHI_PRESERVE_EXTRACTED:-}"
-    local lc; lc=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')
-    case "$lc" in
-        false|no|off|0)
-            # User explicitly opted out → shred as before.
-            ;;
-        *)
-            # Default + true/yes/on/1 → preserve. Skip the shred entirely.
-            if [[ "$TEMP_DIR_IS_EXTERNAL" == true ]]; then
-                log "✓ Skipping shred (MIKOSHI_PRESERVE_EXTRACTED=${raw:-default}; keeping extracted/ for next run)"
-                return 0
-            fi
-            ;;
-    esac
+# ─── opt-in secure cleanup ──────────────────────────────────────────────
+#
+# Pre-redesign this ran unconditionally and shredded ChatStorage.sqlite on
+# every "successful" run, forcing a 13-min re-decrypt on the next iteration.
+# It's now off by default. Set MIKOSHI_SECURE_CLEANUP=1 to bring it back —
+# or invoke `./mikoshi-whatsapp.sh purge-extracted` as a one-shot.
+secure_cleanup_optin() {
+    log "=== Optional secure cleanup (MIKOSHI_SECURE_CLEANUP=1) ==="
     if [[ -d "${TEMP_DIR}/extracted" ]]; then
         find "${TEMP_DIR}/extracted" -type f \( \
             -name "ChatStorage.sqlite" -o \
@@ -590,18 +603,19 @@ secure_cleanup() {
             -name "Manifest.db" \
         \) -exec shred -vfz -n 7 {} \; 2>/dev/null || true
     fi
-    log "✓ Sensitive files shredded"
+    log "✓ Sensitive files shredded (encrypted backup kept intact)"
 }
 
+# ─── PHASE 5: push & confirm (the only cursor writer) ────────────────────
 sync_remote() {
     if [[ "$SKIP_SYNC" == true ]]; then
-        log "=== PHASE 6: Mikoshi REST push (SKIPPED) ==="
+        log "=== PHASE 5: Mikoshi REST push (SKIPPED) ==="
+        warn "Cursor cache NOT advanced — skip-remote-sync means no server confirmation."
         return 0
     fi
 
-    log "=== PHASE 6: Mikoshi REST push ==="
+    log "=== PHASE 5: Mikoshi REST push ==="
 
-    # Config: ~/.mikoshi-ingest.conf or env. Required: MIKOSHI_URL, MIKOSHI_TOKEN.
     if [[ -z "${MIKOSHI_URL:-}" || -z "${MIKOSHI_TOKEN:-}" ]]; then
         local conf="${HOME}/.mikoshi-ingest.conf"
         if [[ -f "$conf" ]]; then
@@ -611,10 +625,10 @@ sync_remote() {
     fi
     if [[ -z "${MIKOSHI_URL:-}" || -z "${MIKOSHI_TOKEN:-}" ]]; then
         warn "MIKOSHI_URL / MIKOSHI_TOKEN not configured — skipping push."
+        warn "Cursor cache NOT advanced (no server to confirm with)."
         return 0
     fi
 
-    # Manifest is the most-recent export JSON written this run.
     local manifest
     manifest=$(ls -t "$EXPORTS_DIR"/whatsapp_export_*.json 2>/dev/null | head -1)
     if [[ -z "$manifest" || ! -f "$manifest" ]]; then
@@ -626,24 +640,24 @@ sync_remote() {
     if MIKOSHI_URL="$MIKOSHI_URL" MIKOSHI_TOKEN="$MIKOSHI_TOKEN" \
         python3 "$SCRIPT_DIR/push_via_api.py" \
             --manifest "$manifest" \
-            --attachments-dir "$ATTACHMENTS_DIR"; then
-        log "✓ Mikoshi push OK"
+            --attachments-dir "$ATTACHMENTS_DIR" \
+            --state-file "$STATE_FILE"; then
+        log "✓ Mikoshi push OK (cursor cache updated from server response)"
         SYNC_SUCCEEDED=true
     else
-        error "Mikoshi push failed"
+        error "Mikoshi push failed — cursor cache NOT updated (this is correct behaviour)"
         return 1
     fi
 }
 
-# GC: keep last N JSON exports locally, shred the rest. Then drop
-# attachments not referenced by any retained JSON.
+# ─── PHASE 6: GC old exports ────────────────────────────────────────────
 gc_local_exports() {
     if [[ "${SYNC_SUCCEEDED:-false}" != true ]]; then
-        log "=== PHASE 7: GC (SKIPPED — no successful remote sync) ==="
+        log "=== PHASE 6: GC (SKIPPED — no successful remote sync) ==="
         return 0
     fi
 
-    log "=== PHASE 7: GC old exports (keep last $KEEP_LOCAL_EXPORTS) ==="
+    log "=== PHASE 6: GC old exports (keep last $KEEP_LOCAL_EXPORTS) ==="
 
     local stale_jsons
     stale_jsons=$(ls -t "$EXPORTS_DIR"/whatsapp_export_*.json 2>/dev/null | tail -n +$((KEEP_LOCAL_EXPORTS + 1)))
@@ -658,7 +672,6 @@ gc_local_exports() {
     log "Shredding $count old export(s)"
     echo "$stale_jsons" | xargs -I{} shred -vfz -n 3 {} 2>/dev/null || true
 
-    # Attachment GC: keep only sha256s referenced by retained JSONs
     python3 - <<PYEOF
 import json
 import os
@@ -711,25 +724,33 @@ main() {
     acquire_lock
     setup_python_env
 
-    # When skipping phases, we still need the path variables that earlier
-    # phases would have set. Reconstruct them from the existing on-disk state.
+    # --from-phase support: reconstruct the path variables that earlier
+    # phases would have set, then verify the required artifacts exist.
+    #
+    # Pain point B in REDESIGN.md §2: this used to require MIKOSHI_BACKUP_DIR.
+    # Now it accepts either MIKOSHI_BACKUP_DIR/backup/<UDID>/ or
+    # SCRIPT_DIR/temp/backup/<UDID>/ — whichever has the artifacts.
     if [[ "$FROM_PHASE" -gt 1 ]]; then
-        if [[ "$TEMP_DIR_IS_EXTERNAL" != true ]]; then
-            error "--from-phase requires MIKOSHI_BACKUP_DIR (external backup dir)."
-            error "Without it, prior phases' artifacts would have been wiped."
-            exit 1
-        fi
         BACKUP_PATH="${TEMP_DIR}/backup"
-        # Derive UDID from the backup tree
         if [[ "$FROM_PHASE" -ge 3 ]]; then
-            local _udids=("$BACKUP_PATH"/*)
-            if [[ ! -d "${_udids[0]:-}" ]]; then
+            local _udid_dir=""
+            if [[ -d "$BACKUP_PATH" ]]; then
+                for d in "$BACKUP_PATH"/*; do
+                    [[ -d "$d" ]] || continue
+                    local _name; _name=$(basename "$d")
+                    [[ ${#_name} -gt 20 ]] || continue
+                    _udid_dir="$d"
+                    break
+                done
+            fi
+            if [[ -z "$_udid_dir" ]]; then
                 error "--from-phase $FROM_PHASE needs $BACKUP_PATH/<UDID>/ to exist."
+                error "  Looked in: $BACKUP_PATH"
+                error "  (Set MIKOSHI_BACKUP_DIR to the external SSD path if your backup lives there.)"
                 exit 1
             fi
-            DEVICE_UDID=$(basename "${_udids[0]}")
-            log "  Reusing encrypted backup at $BACKUP_PATH/$DEVICE_UDID"
-            # Phase 2 normally exports BACKUP_PASSWORD for Phase 3. Re-fetch it.
+            DEVICE_UDID=$(basename "$_udid_dir")
+            log "  Reusing encrypted backup at $_udid_dir"
             BACKUP_PASSWORD=$(security find-generic-password \
                 -a iphone_backup -s iphone_backup_password -w 2>/dev/null) || {
                 error "Backup password not in Keychain (needed by Phase 3)."
@@ -744,9 +765,8 @@ main() {
                 error "--from-phase $FROM_PHASE needs $CHAT_STORAGE to exist."
                 exit 1
             fi
-            # A killed Phase 3 leaves a size-extended but garbage-headered file.
-            # Validate the SQLite magic so we fail fast with an actionable
-            # message instead of crashing in Phase 4 with "file is not a database".
+            # SQLite header sanity check (a killed Phase 3 leaves a zero-headered
+            # file; size > 0 isn't enough).
             if ! python3 -c "
 import sys
 with open('$CHAT_STORAGE', 'rb') as f:
@@ -762,11 +782,11 @@ with open('$CHAT_STORAGE', 'rb') as f:
 
     [[ "$FROM_PHASE" -le 1 ]] && { detect_device       || exit 1; }
     [[ "$FROM_PHASE" -le 2 ]] && { create_backup       || exit 2; }
-    [[ "$FROM_PHASE" -le 3 ]] && { decrypt_backup      || exit 2; }
+    [[ "$FROM_PHASE" -le 3 ]] && { decrypt_db          || exit 2; }
+    [[ "$FROM_PHASE" -le 3 ]] && { decrypt_media       || exit 2; }
     [[ "$FROM_PHASE" -le 4 ]] && { extract_and_export  || exit 2; }
                                   validate_export      || exit 2
-    [[ "$FROM_PHASE" -le 5 ]] && { secure_cleanup      || exit 1; }
-    [[ "$FROM_PHASE" -le 6 ]] && { sync_remote         || exit 3; }
+    [[ "$FROM_PHASE" -le 5 ]] && { sync_remote         || exit 3; }
                                   gc_local_exports     || warn "GC failed (non-fatal)"
 }
 

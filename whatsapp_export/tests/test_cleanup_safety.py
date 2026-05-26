@@ -39,21 +39,9 @@ def _make_fake_backup_tree(root: Path):
     return udid_dir
 
 
-def _run_cleanup(temp_dir: Path, external: bool, *, preserve: str | None = "false"):
-    """
-    Source run_pipeline.sh's cleanup function and run it against temp_dir.
-
-    `preserve` controls MIKOSHI_PRESERVE_EXTRACTED in the subprocess env:
-      - "false" (default for THIS test module) — exercises the legacy
-        wipe-on-success path. Without this we'd test the new default-preserve
-        behaviour (which has dedicated tests in test_preserve_extracted.py).
-      - None  → unset, so cleanup falls into "default" (= preserve).
-      - "true"/"yes"/etc → explicit preserve.
-    """
-    # Extract the cleanup() function from the script
-    script_text = PIPELINE.read_text()
-    start = script_text.find("cleanup() {")
-    # End at the closing brace of cleanup (find next \n}\n at top level)
+def _extract_fn(script_text: str, fn_name: str) -> str:
+    """Pull a `name() { ... }` block out of a bash script (depth-balanced)."""
+    start = script_text.find(f"{fn_name}() {{")
     depth = 0
     end = start
     for i, ch in enumerate(script_text[start:], start=start):
@@ -64,7 +52,26 @@ def _run_cleanup(temp_dir: Path, external: bool, *, preserve: str | None = "fals
             if depth == 0:
                 end = i + 1
                 break
-    cleanup_fn = script_text[start:end]
+    return script_text[start:end]
+
+
+def _run_cleanup(temp_dir: Path, external: bool, *,
+                 secure_cleanup: str | None = None):
+    """
+    Source run_pipeline.sh's cleanup() + secure_cleanup_optin() functions
+    and run cleanup() against temp_dir.
+
+    Post-redesign, the cleanup trap doesn't shred anything by default —
+    that's now opt-in via MIKOSHI_SECURE_CLEANUP=1 (or the standalone
+    `./mikoshi-whatsapp.sh purge-extracted` subcommand).
+
+    `secure_cleanup`:
+      - None         → don't set the env var (default behaviour: no shred)
+      - "1"          → enable the opt-in shred
+    """
+    script_text = PIPELINE.read_text()
+    cleanup_fn = _extract_fn(script_text, "cleanup")
+    secure_fn = _extract_fn(script_text, "secure_cleanup_optin")
 
     runner = f"""
 set +e
@@ -75,17 +82,15 @@ info()  {{ echo "INFO: $@"; }}
 TEMP_DIR="{temp_dir}"
 TEMP_DIR_IS_EXTERNAL={"true" if external else "false"}
 LOCK_FILE="/tmp/test-lock-$$"
+{secure_fn}
 {cleanup_fn}
-# Don't let cleanup's trap exit kill the test runner
 trap - EXIT
 cleanup
 """
-    # Don't inherit MIKOSHI_PRESERVE_EXTRACTED from the parent — earlier
-    # tests in the suite may have exported it via load_ingest_conf().
     env = {k: v for k, v in os.environ.items()
-           if k != "MIKOSHI_PRESERVE_EXTRACTED"}
-    if preserve is not None:
-        env["MIKOSHI_PRESERVE_EXTRACTED"] = preserve
+           if k not in ("MIKOSHI_PRESERVE_EXTRACTED", "MIKOSHI_SECURE_CLEANUP")}
+    if secure_cleanup is not None:
+        env["MIKOSHI_SECURE_CLEANUP"] = secure_cleanup
     return subprocess.run(
         ["bash", "-c", runner], env=env,
         capture_output=True, text=True, timeout=30,
@@ -115,15 +120,31 @@ class TestCleanupPreservesEncryptedBackup:
         assert (udid_dir / "Status.plist").read_bytes() == status_before
         assert (udid_dir / "Info.plist").read_bytes() == info_before
 
-    def test_decrypted_artifacts_are_still_shredded(self, tmp_path):
+    def test_default_cleanup_preserves_decrypted_artifacts(self, tmp_path):
         """
-        When the user explicitly opts OUT of preservation
-        (MIKOSHI_PRESERVE_EXTRACTED=false) the cleanup must scrub the
-        decrypted area. NB: this is now opt-in — the default changed to
-        "preserve". The preserve-by-default path has its own test in
-        test_preserve_extracted.py.
+        Default behaviour after the redesign: cleanup does NOT shred
+        anything. The old wipe-on-success path was wrecking 13 minutes
+        of decryption work on every iteration. See REDESIGN.md pain
+        point #4.
         """
-        # Set up a fake decrypted artifact directory
+        extracted = tmp_path / "extracted"
+        extracted.mkdir()
+        chat_db = extracted / "ChatStorage.sqlite"
+        chat_db.write_bytes(b"SQLite format 3\x00" + b"x" * 4096)
+
+        _make_fake_backup_tree(tmp_path)
+
+        result = _run_cleanup(tmp_path, external=True)
+        assert result.returncode == 0
+        # extracted/ must still be there — that's the point.
+        assert extracted.exists(), \
+            "Default cleanup must not touch decrypted artifacts"
+        assert chat_db.exists()
+
+    def test_opt_in_secure_cleanup_shreds(self, tmp_path):
+        """MIKOSHI_SECURE_CLEANUP=1 brings back the shred-on-success path
+        for the user who wants it. See REDESIGN.md §6.1.
+        """
         extracted = tmp_path / "extracted"
         extracted.mkdir()
         chat_db = extracted / "ChatStorage.sqlite"
@@ -131,28 +152,21 @@ class TestCleanupPreservesEncryptedBackup:
         manifest_plist = extracted / "Manifest.plist"
         manifest_plist.write_bytes(b"bplist00" + b"x" * 1000)
 
-        # Also put the encrypted tree alongside to make sure scoping works
         _make_fake_backup_tree(tmp_path)
 
-        result = _run_cleanup(tmp_path, external=True, preserve="false")
+        result = _run_cleanup(tmp_path, external=True, secure_cleanup="1")
         assert result.returncode == 0
-
-        # extracted/ should be gone entirely
-        assert not extracted.exists(), "Decrypted artifacts were not cleaned"
-
-    def test_local_mode_wipes_everything_under_temp(self, tmp_path):
-        """In local mode (no MIKOSHI_BACKUP_DIR), cleanup nukes the whole dir."""
-        (tmp_path / "extracted").mkdir()
-        (tmp_path / "extracted" / "ChatStorage.sqlite").write_bytes(b"x" * 100)
-        # No encrypted backup tree — local mode doesn't preserve anything
-        result = _run_cleanup(tmp_path, external=False)
-        assert result.returncode == 0
-        assert not tmp_path.exists()
+        # The opt-in path shreds individual sensitive files but leaves the
+        # extracted/ directory itself (so a partial re-decrypt can land cleanly).
+        # We just need to confirm the file contents were destroyed.
+        if chat_db.exists():
+            # If it still exists, it must have been overwritten (shred -vfz),
+            # so contents won't match the original.
+            assert chat_db.read_bytes() != b"SQLite format 3\x00" + b"x" * 4096
 
     def test_no_decrypted_dir_is_a_noop(self, tmp_path):
         """If extracted/ doesn't exist, cleanup must not error."""
         _make_fake_backup_tree(tmp_path)
-        # No extracted/ subdir at all
         result = _run_cleanup(tmp_path, external=True)
         assert result.returncode == 0
 
@@ -198,15 +212,16 @@ class TestFromPhase:
                result.returncode != 0
 
 
-class TestSecureCleanupPhase5:
-    """Phase 5's secure_cleanup() had the same bug — it also recursed
-    $TEMP_DIR. Verify it's scoped to extracted/ too."""
+class TestSecureCleanupOptin:
+    """The redesigned `secure_cleanup_optin` runs only when explicitly
+    requested (MIKOSHI_SECURE_CLEANUP=1). When it does run, it must still
+    obey the original safety rule: scoped to extracted/, never recursing
+    into the encrypted backup tree under backup/<UDID>/.
+    """
 
-    def test_phase5_does_not_touch_encrypted_backup(self, tmp_path):
-        """Source secure_cleanup() and run it against a fake backup tree."""
+    def _extract_secure_fn(self) -> str:
         script_text = PIPELINE.read_text()
-        # Extract secure_cleanup() body
-        start = script_text.find("secure_cleanup() {")
+        start = script_text.find("secure_cleanup_optin() {")
         depth = 0
         end = start
         for i, ch in enumerate(script_text[start:], start=start):
@@ -217,10 +232,19 @@ class TestSecureCleanupPhase5:
                 if depth == 0:
                     end = i + 1
                     break
-        fn = script_text[start:end]
+        return script_text[start:end]
 
+    def test_optin_does_not_touch_encrypted_backup(self, tmp_path):
+        """The 55-hour-backup-destroying bug must remain impossible: the
+        opt-in shred must only touch files under extracted/."""
         udid_dir = _make_fake_backup_tree(tmp_path)
+        # Also seed an extracted/ subtree so the shred has something to do.
+        extracted = tmp_path / "extracted"
+        extracted.mkdir()
+        (extracted / "ChatStorage.sqlite").write_bytes(b"x" * 100)
+
         manifest_before = (udid_dir / "Manifest.plist").read_bytes()
+        manifest_db_before = (udid_dir / "Manifest.db").read_bytes()
 
         runner = f"""
 set +e
@@ -228,35 +252,23 @@ log() {{ echo "$@"; }}
 error() {{ echo "ERR: $@" >&2; }}
 warn() {{ echo "WARN: $@"; }}
 TEMP_DIR="{tmp_path}"
-{fn}
-secure_cleanup
+{self._extract_secure_fn()}
+secure_cleanup_optin
 """
         result = subprocess.run(
             ["bash", "-c", runner],
             capture_output=True, text=True, timeout=15,
         )
         assert result.returncode == 0
-        assert (udid_dir / "Manifest.plist").read_bytes() == manifest_before, \
-            "secure_cleanup destroyed encrypted Manifest.plist"
+        # Critical: encrypted Manifest.plist / Manifest.db must be untouched.
+        assert (udid_dir / "Manifest.plist").read_bytes() == manifest_before
+        assert (udid_dir / "Manifest.db").read_bytes() == manifest_db_before
 
-    def test_phase5_respects_preserve_extracted(self, tmp_path):
-        """secure_cleanup was unconditionally shredding ChatStorage.sqlite,
-        burning ~13 min of decrypt every push. With MIKOSHI_PRESERVE_EXTRACTED
-        on (default + explicit truthy), the file must survive."""
-        script_text = PIPELINE.read_text()
-        start = script_text.find("secure_cleanup() {")
-        depth = 0
-        end = start
-        for i, ch in enumerate(script_text[start:], start=start):
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
-        fn = script_text[start:end]
-
+    def test_optin_shreds_extracted_chatstorage(self, tmp_path):
+        """When invoked, the opt-in shred must scrub ChatStorage.sqlite
+        in extracted/. Used by `mikoshi-whatsapp.sh purge-extracted` and
+        by MIKOSHI_SECURE_CLEANUP=1.
+        """
         extracted = tmp_path / "extracted"
         extracted.mkdir()
         chat = extracted / "ChatStorage.sqlite"
@@ -269,65 +281,17 @@ log() {{ echo "$@"; }}
 error() {{ echo "ERR: $@" >&2; }}
 warn() {{ echo "WARN: $@"; }}
 TEMP_DIR="{tmp_path}"
-TEMP_DIR_IS_EXTERNAL=true
-MIKOSHI_PRESERVE_EXTRACTED=true
-{fn}
-secure_cleanup
+{self._extract_secure_fn()}
+secure_cleanup_optin
 """
-        env = {k: v for k, v in os.environ.items()
-               if k != "MIKOSHI_PRESERVE_EXTRACTED"}
-        env["MIKOSHI_PRESERVE_EXTRACTED"] = "true"
         result = subprocess.run(
-            ["bash", "-c", runner], env=env,
+            ["bash", "-c", runner],
             capture_output=True, text=True, timeout=15,
         )
         assert result.returncode == 0, result.stderr
-        assert chat.read_bytes() == original, \
-            "secure_cleanup ignored MIKOSHI_PRESERVE_EXTRACTED=true and shredded ChatStorage"
-
-    def test_phase5_shreds_when_preserve_off(self, tmp_path):
-        """The opt-out path must still work: MIKOSHI_PRESERVE_EXTRACTED=false
-        means the user actively wants the decrypted artifacts gone."""
-        script_text = PIPELINE.read_text()
-        start = script_text.find("secure_cleanup() {")
-        depth = 0
-        end = start
-        for i, ch in enumerate(script_text[start:], start=start):
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
-        fn = script_text[start:end]
-
-        extracted = tmp_path / "extracted"
-        extracted.mkdir()
-        chat = extracted / "ChatStorage.sqlite"
-        chat.write_bytes(b"SQLite format 3\x00" + b"x" * 4096)
-
-        runner = f"""
-set +e
-log() {{ echo "$@"; }}
-error() {{ echo "ERR: $@" >&2; }}
-warn() {{ echo "WARN: $@"; }}
-TEMP_DIR="{tmp_path}"
-TEMP_DIR_IS_EXTERNAL=true
-{fn}
-secure_cleanup
-"""
-        env = {k: v for k, v in os.environ.items()
-               if k != "MIKOSHI_PRESERVE_EXTRACTED"}
-        env["MIKOSHI_PRESERVE_EXTRACTED"] = "false"
-        result = subprocess.run(
-            ["bash", "-c", runner], env=env,
-            capture_output=True, text=True, timeout=15,
-        )
-        assert result.returncode == 0, result.stderr
-        # shred -vfz fills with zeros; whatever the exact behaviour, content
-        # must NOT equal the original.
-        # The file might be unlinked too — both are valid "shredded".
+        # The shred either removed the file or overwrote its contents.
         if chat.exists():
-            assert chat.read_bytes() != b"SQLite format 3\x00" + b"x" * 4096, \
-                "secure_cleanup did not shred when explicitly opted in"
+            assert chat.read_bytes() != original, \
+                "secure_cleanup_optin failed to scramble ChatStorage.sqlite"
+
+

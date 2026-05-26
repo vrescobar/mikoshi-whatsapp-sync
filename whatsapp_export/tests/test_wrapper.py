@@ -29,6 +29,11 @@ def stub_pipeline(tmp_path, monkeypatch):
     """
     Replace run_pipeline.sh with a script that logs its args and exits 0.
     Returns a path; read it to see what args the wrapper passed.
+
+    Also provides a stub `pipeline_state.py` in the fake root so the
+    wrapper's smart-phase detection (`python3 -m pipeline_state best-phase`)
+    has something to import. The stub always reports phase=4 + iPhone
+    reachable, which lets the pipeline path actually run.
     """
     stub = tmp_path / "run_pipeline.sh"
     args_log = tmp_path / "args.txt"
@@ -36,22 +41,30 @@ def stub_pipeline(tmp_path, monkeypatch):
         f'#!/bin/bash\necho "$@" > {args_log}\nexit 0\n'
     )
     stub.chmod(0o755)
-    # The wrapper resolves PIPELINE as ${SCRIPT_DIR}/run_pipeline.sh.
-    # We can't easily override that without monkey-patching the wrapper,
-    # so we use a sibling temp dir layout.
     fake_root = tmp_path / "fake_export"
     fake_root.mkdir()
-    # Symlink the real wrapper into our fake root
     (fake_root / "mikoshi-whatsapp.sh").symlink_to(WRAPPER)
-    # Drop our stub pipeline next to it
     (fake_root / "run_pipeline.sh").write_text(stub.read_text())
     (fake_root / "run_pipeline.sh").chmod(0o755)
-    # Stub tui.py so `tui` doesn't try to launch questionary
     (fake_root / "tui.py").write_text("print('TUI stub')\n")
-    # Provide a fake venv so activate_venv doesn't fail
     venv = fake_root / ".venv" / "bin"
     venv.mkdir(parents=True)
     (venv / "activate").write_text("# stub venv\n")
+
+    # Stub pipeline_state.py with a minimal best-phase CLI. The real
+    # module does iPhone detection + filesystem probes; we just need
+    # something fast and deterministic so the wrapper proceeds to call
+    # the stub pipeline. Phase=4 means "everything is cached, run extract."
+    (fake_root / "pipeline_state.py").write_text(
+        "import sys\n"
+        "if len(sys.argv) >= 2 and sys.argv[1] == 'best-phase':\n"
+        "    if '--require-iphone' in sys.argv:\n"
+        "        sys.exit(0)\n"
+        "    print('4\\tStub (test fixture)')\n"
+        "    sys.exit(0)\n"
+        "sys.exit(0)\n"
+    )
+
     monkeypatch.setattr("os.environ", {**os.environ, "MIKOSHI_INGEST_CONF": str(tmp_path / "no-conf")})
     return {"wrapper": fake_root / "mikoshi-whatsapp.sh", "args_log": args_log,
             "favorites_file": tmp_path / "favs.json"}
@@ -59,6 +72,12 @@ def stub_pipeline(tmp_path, monkeypatch):
 
 def _run_stub(stub, subargs, favorites=None, env_extra=None):
     env = os.environ.copy()
+    # Don't let the developer's real MIKOSHI_BACKUP_DIR leak into the stub —
+    # the redesigned cron path runs `python3 -m pipeline_state best-phase`
+    # against it, which would auto-inject --from-phase based on whatever
+    # backup happens to be on the dev's external SSD. Tests need a clean
+    # slate; force best-phase to default to Phase 1.
+    env.pop("MIKOSHI_BACKUP_DIR", None)
     if env_extra:
         env.update(env_extra)
     env["MIKOSHI_FAVORITES_FILE"] = str(stub["favorites_file"])
@@ -171,15 +190,21 @@ class TestSyncDispatch:
         `sync --all` with no other flags previously emitted
         'args[@]: unbound variable' because `${args[@]}` is not a safe
         expansion when the array is empty.
+
+        Post-redesign: when no backup + no iPhone, the wrapper exits
+        cleanly with rc=0 ("nothing to do") instead of crashing the cron
+        run. Either way: no unbound-variable explosion, and `--favorites`
+        must not appear (no favorites file present).
         """
         result = _run_stub(stub_pipeline, ["sync", "--all"], favorites=None)
         assert result.returncode == 0, (
             f"sync --all crashed:\nstdout={result.stdout}\nstderr={result.stderr}"
         )
         assert "unbound variable" not in result.stderr
-        # Pipeline got called with no args at all
-        forwarded = stub_pipeline["args_log"].read_text().strip()
-        assert forwarded == ""
+        # If the pipeline was invoked, it must not have been with --favorites.
+        if stub_pipeline["args_log"].exists():
+            forwarded = stub_pipeline["args_log"].read_text().strip()
+            assert "--favorites" not in forwarded
 
     def test_sync_with_no_args_at_all(self, stub_pipeline):
         """Plain `sync` without favorites and without flags."""

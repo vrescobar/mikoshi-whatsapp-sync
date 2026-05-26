@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Explore / re-process an existing iPhone backup without re-downloading.
+Explore an existing iPhone backup without re-downloading.
 
 Use cases:
-  - List all WhatsApp chats with message counts (to pick a --contact)
-  - Decrypt only ChatStorage.sqlite and inspect interactively
-  - Re-run extraction against an existing backup (skipping PHASE 1+2)
+  - List all WhatsApp chats with message counts
+  - Decrypt only ChatStorage.sqlite and inspect interactively in sqlite3
 
 Usage:
   # List chats
@@ -14,8 +13,12 @@ Usage:
   # Decrypt and open ChatStorage.sqlite in sqlite3 REPL
   python3 explore_backup.py shell
 
-  # Re-extract only — backup must exist already
-  python3 explore_backup.py extract --mode full-contact --contact "Alice"
+Note:
+  The `extract` subcommand has been removed — use
+  `./mikoshi-whatsapp.sh sync --from-phase 4` (or `--from-phase 3` if you
+  also need to re-decrypt) for the same effect. That path supports
+  favorites, --chat-jid, --since, --skip-remote-sync, and feeds the new
+  cursor-cache model. See REDESIGN.md §7.
 """
 
 import argparse
@@ -263,41 +266,6 @@ def cmd_shell(args):
     os.execvp("sqlite3", ["sqlite3", str(chat_db)])
 
 
-def cmd_extract(args):
-    """Re-run extraction stage without touching the iPhone."""
-    script_dir = Path(__file__).parent
-    work_dir = script_dir / "temp" / "extracted"
-    chat_db = decrypt_chatstorage(work_dir)
-    media_dir = decrypt_media(work_dir)
-
-    from datetime import datetime
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    export_file = script_dir / "exports" / f"whatsapp_export_{timestamp}.json"
-    attachments_dir = script_dir / "exports" / "attachments"
-    state_file = script_dir / ".sync_state.json"
-
-    cmd = [
-        sys.executable, str(script_dir / "extract_messages.py"),
-        "--db", str(chat_db),
-        "--extracted-root", str(work_dir),
-        "--output", str(export_file),
-        "--attachments-dir", str(attachments_dir),
-        "--state-file", str(state_file),
-        "--mode", args.mode,
-    ]
-    if args.contact:
-        cmd += ["--contact", args.contact]
-    if args.include_system:
-        cmd.append("--include-system")
-
-    print(f"[INFO] Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd)
-    if result.returncode == 0:
-        print(f"\n[OK] Export: {export_file}")
-        print(f"[INFO] To push to Mikoshi: python3 push_via_api.py --export {export_file}")
-    sys.exit(result.returncode)
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -306,22 +274,12 @@ def main():
     sub.add_parser("list-chats", help="List all chats with last-message date and counts")
     sub.add_parser("shell", help="Open ChatStorage.sqlite in sqlite3 interactive shell")
 
-    p_extract = sub.add_parser("extract", help="Re-run extraction without re-downloading the backup")
-    p_extract.add_argument("--mode", choices=["incremental", "full", "full-contact"],
-                           default="incremental")
-    p_extract.add_argument("--contact", help="Required for --mode=full-contact")
-    p_extract.add_argument("--include-system", action="store_true")
-
     args = parser.parse_args()
 
     if args.cmd == "list-chats":
         cmd_list_chats(args)
     elif args.cmd == "shell":
         cmd_shell(args)
-    elif args.cmd == "extract":
-        if args.mode == "full-contact" and not args.contact:
-            parser.error("--contact required when --mode=full-contact")
-        cmd_extract(args)
 
 
 if __name__ == "__main__":
