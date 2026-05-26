@@ -116,6 +116,11 @@ Environment variables:
         Example: export MIKOSHI_BACKUP_DIR=/Volumes/ExternalSSD/iphone_backup
   KEEP_LOCAL_EXPORTS
         See --keep-local.
+  MIKOSHI_PRESERVE_EXTRACTED
+        '1' → keep extracted/ on disk even after a successful run, so the
+              next invocation can use --from-phase 4 without re-decrypting.
+        '0' → wipe extracted/ even on failure (no recovery shortcut).
+        unset (default) → preserve only when the pipeline fails after Phase 3.
   MIKOSHI_CLIENT_ID
         Override the hostname recorded in each export.
   MIKOSHI_URL / MIKOSHI_TOKEN
@@ -237,17 +242,27 @@ cleanup() {
     local exit_code=$?
     log "=== Cleanup (exit $exit_code) ==="
 
-    # When the pipeline fails AFTER Phase 3 (decrypt succeeded) but before
-    # Phase 5 (own cleanup), preserving extracted/ lets the user iterate
-    # with `--from-phase 4` (or 5/6) instead of paying ~30 min for a fresh
-    # decrypt. Safe because extracted/ never contains the encrypted backup.
-    # Set MIKOSHI_PRESERVE_EXTRACTED=0 to opt out.
+    # Preserve extracted/ across runs in two cases:
+    #
+    #  (a) Pipeline FAILED after Phase 3 — default ON. Lets the user fix
+    #      whatever broke and re-run with --from-phase 4 instead of paying
+    #      ~30 min for a fresh decrypt. Opt out with MIKOSHI_PRESERVE_EXTRACTED=0.
+    #
+    #  (b) MIKOSHI_PRESERVE_EXTRACTED=1 explicitly. Use this when iterating
+    #      locally (e.g. multiple --chat-jid / --since runs in a row, or
+    #      A/B-ing extractor changes). Otherwise the cleanup nukes extracted/
+    #      after the first successful run and the next --from-phase 4 fails.
+    #
+    # Either way the encrypted backup under backup/<UDID>/ is untouched.
     local preserve_extracted=false
-    if [[ $exit_code -ne 0 \
-        && "${MIKOSHI_PRESERVE_EXTRACTED:-1}" != "0" \
-        && "$TEMP_DIR_IS_EXTERNAL" == true \
+    local preserve_flag="${MIKOSHI_PRESERVE_EXTRACTED:-}"
+    if [[ "$TEMP_DIR_IS_EXTERNAL" == true \
         && -f "${TEMP_DIR}/extracted/ChatStorage.sqlite" ]]; then
-        preserve_extracted=true
+        if [[ "$preserve_flag" == "1" ]]; then
+            preserve_extracted=true
+        elif [[ $exit_code -ne 0 && "$preserve_flag" != "0" ]]; then
+            preserve_extracted=true
+        fi
     fi
 
     if [[ -d "$TEMP_DIR" ]]; then
@@ -272,7 +287,11 @@ cleanup() {
         fi
 
         if [[ "$preserve_extracted" == true ]]; then
-            log "✓ Keeping extracted/ for iteration (pipeline failed at exit $exit_code)"
+            if [[ $exit_code -eq 0 ]]; then
+                log "✓ Keeping extracted/ (MIKOSHI_PRESERVE_EXTRACTED=1 set)"
+            else
+                log "✓ Keeping extracted/ for iteration (pipeline failed at exit $exit_code)"
+            fi
             log "  Re-run with: ./mikoshi-whatsapp.sh sync --all --from-phase 4"
             rm -f "${TEMP_DIR}/backup.stderr"
         elif [[ "$TEMP_DIR_IS_EXTERNAL" == true ]]; then
