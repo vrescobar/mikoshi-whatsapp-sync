@@ -925,6 +925,7 @@ def action_tools():
         "Advanced tools:",
         choices=[
             Choice("📤  Push existing export to Mikoshi", "push_existing"),
+            Choice("📥  Refresh local backup only (no push)", "refresh_local"),
             Choice("🐚  Open sqlite3 shell on ChatStorage", "sqlite"),
             Choice("🧹  Purge decrypted artifacts (shred)", "purge"),
             Choice("🧪  Run tests", "tests"),
@@ -937,6 +938,8 @@ def action_tools():
 
     if choice == "push_existing":
         action_push_existing()
+    elif choice == "refresh_local":
+        action_refresh_local()
     elif choice == "sqlite":
         action_sqlite_shell()
     elif choice == "purge":
@@ -948,6 +951,73 @@ def action_tools():
         pause()
     elif choice == "refresh":
         _invalidate_header_cache()
+
+
+def action_refresh_local():
+    """Phases 1-4: backup from iPhone → decrypt → extract, WITHOUT push."""
+    snap = get_header_snapshot()
+    cfg = snap["cfg"]
+
+    console.print(Panel(
+        "Will backup from iPhone, decrypt, and extract — "
+        "but skip push to Mikoshi server.",
+        title="[bold]📥 Refresh local backup only[/]",
+        expand=False,
+    ))
+
+    # Determine source, same logic as action_sync.
+    iphone_reachable = snap["iphone_reachable"]
+    backup_dir = get_backup_dir(cfg)
+    best_phase, best_label = pipeline_state.best_from_phase(backup_dir)
+
+    if iphone_reachable:
+        phase = 1
+        source_desc = "from iPhone (phase 1 — incremental backup → decrypt → extract)"
+    elif best_phase in (3, 4):
+        # Cap at phase 3: re-decrypt; phase 4 (extract-only) is fine too.
+        phase = best_phase
+        source_desc = f"{best_label} (iPhone not reachable)"
+    else:
+        # best_phase == 1 but iPhone not reachable and no backup exists.
+        console.print(
+            "[red]No iPhone reachable and no cached backup found.[/]\n"
+            "Plug the iPhone (unlock + trust) and try again."
+        )
+        pause()
+        return
+
+    console.print(f"[cyan]Source:[/] {source_desc}")
+
+    # Scope: favorites if file has entries, else all chats.
+    fav_jids = favs.jids()
+    if fav_jids:
+        scope_flags = ["--favorites"]
+        scope_desc = f"favorites ({len(fav_jids)} chats)"
+    else:
+        scope_flags = []
+        scope_desc = "all chats"
+    console.print(f"[cyan]Scope:[/]  {scope_desc}")
+    console.print()
+
+    proceed = questionary.confirm(
+        "Run local backup/decrypt/extract (no push)?", default=True
+    ).ask()
+    if not proceed:
+        return
+
+    cmd = ["bash", str(SCRIPT_DIR / "run_pipeline.sh")]
+    cmd.extend(scope_flags)
+    if phase > 1:
+        cmd += ["--from-phase", str(phase)]
+    cmd.append("--skip-remote-sync")
+    run(cmd)
+
+    _invalidate_header_cache()
+
+    # Show where the extracted data landed.
+    extracted_dir = (backup_dir / "extracted") if backup_dir else (SCRIPT_DIR / "temp" / "extracted")
+    console.print(f"\n[green]Done.[/] Extracted data at: [cyan]{extracted_dir}[/]")
+    pause()
 
 
 def action_push_existing():

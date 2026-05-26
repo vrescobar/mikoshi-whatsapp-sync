@@ -505,26 +505,37 @@ def best_from_phase(backup_dir: Path | None) -> tuple[int, str]:
     return 1, "Refresh from iPhone (incremental — fetches only new data)"
 
 
-def device_reachable(timeout: float = 5.0) -> bool:
+def device_reachable(timeout: float = 10.0) -> bool:
     """Quick probe: is an iPhone visible via libimobiledevice?
 
     Used by both the TUI header and cron sync. Failure modes are all
     "not reachable" — we don't try to distinguish "no device" from
     "device locked" here; the pipeline does that.
+
+    Checks both USB (-l) and Wi-Fi network (-n) connections. Wi-Fi
+    detection requires the iPhone screen to be ON and unlocked; the
+    mDNS service (_apple-mobdev2._tcp) is always advertised but the
+    backup daemon only responds when the device is awake.
     """
     import shutil
     import subprocess
 
     if not shutil.which("idevice_id"):
         return False
-    try:
-        result = subprocess.run(
-            ["idevice_id", "-l"],
-            capture_output=True, text=True, timeout=timeout,
-        )
-    except (subprocess.TimeoutExpired, OSError):
-        return False
-    return result.returncode == 0 and bool(result.stdout.strip())
+    # Try USB first (fast), then Wi-Fi network (-n flag).
+    # Some libimobiledevice versions include network devices in -l;
+    # others require -n explicitly. We try both and succeed on either.
+    for cmd in (["idevice_id", "-l"], ["idevice_id", "-n"]):
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True, text=True, timeout=timeout,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+        if result.returncode == 0 and result.stdout.strip():
+            return True
+    return False
 
 
 # ─── plan computation ─────────────────────────────────────────────────────
