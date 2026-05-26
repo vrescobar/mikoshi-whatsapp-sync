@@ -119,6 +119,19 @@ class TestFmtTs:
         result = self.tui.fmt_ts(ios_ts)
         assert result == "2026-05-25"
 
+    def test_absurd_value_returns_placeholder(self):
+        # Real ChatStorage.sqlite files occasionally carry junk timestamps
+        # (year 11001 etc.) on rows from uninitialised system events.
+        # fmt_ts must not crash the whole "List chats" view.
+        assert self.tui.fmt_ts(9.99e11) == "—"
+        assert self.tui.fmt_ts(-1e12) == "—"
+
+    def test_garbage_input_returns_placeholder(self):
+        # Defensive: even if a row somehow contains a non-numeric / NaN
+        # value, the listing should degrade gracefully.
+        assert self.tui.fmt_ts(float("nan")) == "—"
+        assert self.tui.fmt_ts(float("inf")) == "—"
+
 
 # ─── find_existing_chatstorage ─────────────────────────────────────────────
 

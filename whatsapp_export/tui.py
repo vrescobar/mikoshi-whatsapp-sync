@@ -111,9 +111,22 @@ def list_chats_from_db(db: Path) -> list[dict]:
 
 
 def fmt_ts(ios_ts: float | None) -> str:
+    """
+    Convert an iOS Core Data timestamp (seconds since 2001-01-01) to a date
+    string. Real ChatStorage.sqlite rows occasionally carry garbage values
+    (uninitialised columns, rows from system events, corrupted entries) that
+    overflow datetime — guard against that instead of crashing the whole TUI.
+    """
     if not ios_ts:
         return "—"
-    return datetime.fromtimestamp(ios_ts + IOS_EPOCH, tz=timezone.utc).strftime("%Y-%m-%d")
+    try:
+        unix = ios_ts + IOS_EPOCH
+        # Sanity-clamp: anything outside [1970-01-01, 2100-01-01] is junk.
+        if not 0 <= unix <= 4_102_444_800:
+            return "—"
+        return datetime.fromtimestamp(unix, tz=timezone.utc).strftime("%Y-%m-%d")
+    except (ValueError, OverflowError, OSError):
+        return "—"
 
 
 def run(cmd: list[str], env_extra: dict | None = None) -> int:
