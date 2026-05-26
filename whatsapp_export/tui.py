@@ -832,11 +832,19 @@ def action_sync_favorites():
         console.print("[yellow]No favorites configured. Add some first.[/]")
         pause()
         return
+
+    default_phase, default_label = _best_from_phase()
+    phase = _pick_phase_with_user(default_phase, default_label)
+    if phase is None:
+        return
+
     skip_remote = not questionary.confirm(
         f"Push to Mikoshi at the end? ({len(data['favorites'])} chat(s))",
         default=True
     ).ask()
     cmd = ["bash", str(SCRIPT_DIR / "run_pipeline.sh"), "--favorites"]
+    if phase > 1:
+        cmd += ["--from-phase", str(phase)]
     if skip_remote:
         cmd.append("--skip-remote-sync")
     run(cmd)
