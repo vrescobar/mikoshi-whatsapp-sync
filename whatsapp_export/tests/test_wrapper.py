@@ -51,16 +51,22 @@ def stub_pipeline(tmp_path, monkeypatch):
     venv.mkdir(parents=True)
     (venv / "activate").write_text("# stub venv\n")
 
-    # Stub pipeline_state.py with a minimal best-phase CLI. The real
-    # module does iPhone detection + filesystem probes; we just need
-    # something fast and deterministic so the wrapper proceeds to call
-    # the stub pipeline. Phase=4 means "everything is cached, run extract."
+    # Stub pipeline_state.py with the minimum CLI surface the wrapper
+    # actually invokes:
+    #   - `best-phase` (smart-phase detection)
+    #   - `check-server-cursor` (pre-flight before sync)
+    # The real module does iPhone detection + a live HTTP probe; the
+    # stub returns predictable values so wrapper tests are deterministic.
+    # Phase=4 means "everything is cached, run extract."
     (fake_root / "pipeline_state.py").write_text(
         "import sys\n"
         "if len(sys.argv) >= 2 and sys.argv[1] == 'best-phase':\n"
         "    if '--require-iphone' in sys.argv:\n"
         "        sys.exit(0)\n"
         "    print('4\\tStub (test fixture)')\n"
+        "    sys.exit(0)\n"
+        "if len(sys.argv) >= 2 and sys.argv[1] == 'check-server-cursor':\n"
+        "    print('server cursor OK (stub)')\n"
         "    sys.exit(0)\n"
         "sys.exit(0)\n"
     )

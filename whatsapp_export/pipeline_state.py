@@ -355,20 +355,25 @@ def fetch_server_cursors(
     timeout: float = 3.0,
 ) -> dict[str, ChatCursor] | None:
     """
-    Hit `GET /api/ingest/v1/cursors`. Return a dict of JID→ChatCursor.
+    Hit `GET /api/ingest/v1/cursor`. Return a dict of JID→ChatCursor.
 
     Returns `None` (not an empty dict!) when:
-      - the endpoint doesn't exist (404)         — old Mikoshi
+      - the endpoint doesn't exist (404)         — very old Mikoshi
       - auth fails (401)                          — bad token
       - network/timeout error                     — server unreachable
 
     The distinction matters: an empty dict means "server confirmed it
     has nothing yet" (so a first sync should push everything);
-    `None` means "we couldn't determine, fall back to local cache."
+    `None` means "we couldn't determine, caller decides whether to
+    fail fast or fall back to its local cache."
     """
     if not url or not token:
         return None
-    full = url.rstrip("/") + "/api/ingest/v1/cursors"
+    # Mikoshi v3 (May 2026) ships the endpoint at /cursor (singular).
+    # We try it first and fall back to /cursors only for older servers
+    # that still answered the original /cursors path. Once nothing in
+    # the wild speaks the plural form this fallback can come out.
+    full = url.rstrip("/") + "/api/ingest/v1/cursor"
     req = urllib.request.Request(full, method="GET")
     req.add_header("Authorization", f"Bearer {token}")
     try:
@@ -377,7 +382,7 @@ def fetch_server_cursors(
             status = resp.status
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            return None
+            return _fetch_server_cursors_legacy_plural(url, token, timeout)
         # 401/403/5xx — also fall back rather than crashing the UI.
         return None
     except (urllib.error.URLError, TimeoutError, OSError):
@@ -388,10 +393,76 @@ def fetch_server_cursors(
         data = json.loads(body) if body else {}
     except json.JSONDecodeError:
         return None
+    return _parse_cursors_payload(data)
+
+
+def _fetch_server_cursors_legacy_plural(
+    url: str, token: str, timeout: float
+) -> dict[str, ChatCursor] | None:
+    """Transition aid: pre-/cursor Mikoshi answered the plural path with a
+    different shape. Strip me out once no deployed server uses it."""
+    full = url.rstrip("/") + "/api/ingest/v1/cursors"
+    req = urllib.request.Request(full, method="GET")
+    req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read()
+            status = resp.status
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError):
+        return None
+    if status != 200:
+        return None
+    try:
+        return _parse_cursors_payload(json.loads(body) if body else {})
+    except json.JSONDecodeError:
+        return None
+
+
+def _parse_cursors_payload(data: object) -> dict[str, ChatCursor]:
+    """Parse the response from any known Mikoshi cursor-listing shape.
+
+    Supported shapes (the first one is what the current Mikoshi ships;
+    the others are tolerated for forward/backward compatibility):
+
+    - **Array of cursors** (current Mikoshi server):
+      ``{ account_id, cursors: [{ chat_jid, last_external_id,
+      last_message_at, ... }, ...] }``
+    - **Map keyed by JID under `chats`** (described in the original
+      MIKOSHI_SERVER_PATCH.md doc, used by some test mocks):
+      ``{ chats: { "<jid>": { ts, external_id } } }``
+    - **Flat map** (simplest shape, also tolerated by tests):
+      ``{ "<jid>": { ts, external_id } }``
+    """
     cursors: dict[str, ChatCursor] = {}
-    # Accept either {jid: {ts, external_id}} or {chats: {jid: {ts, external_id}}}.
-    payload = data.get("chats", data) if isinstance(data, dict) else {}
-    for jid, entry in (payload or {}).items():
+    if not isinstance(data, dict):
+        return cursors
+
+    # Current Mikoshi: { account_id, cursors: [ ... ] }.
+    if isinstance(data.get("cursors"), list):
+        for entry in data["cursors"]:
+            if not isinstance(entry, dict):
+                continue
+            jid = entry.get("chat_jid") or entry.get("jid")
+            if not jid:
+                continue
+            cursors[jid] = ChatCursor(
+                committed_through_ts=(
+                    entry.get("last_message_at")
+                    or entry.get("ts")
+                    or entry.get("timestamp")
+                ),
+                committed_through_external_id=(
+                    entry.get("last_external_id") or entry.get("external_id")
+                ),
+                source=SOURCE_SERVER,
+            )
+        return cursors
+
+    # Legacy / test shapes: map keyed by JID, possibly nested under `chats`.
+    payload = data.get("chats", data)
+    if not isinstance(payload, dict):
+        return cursors
+    for jid, entry in payload.items():
         if not isinstance(entry, dict):
             continue
         cursors[jid] = ChatCursor(
@@ -634,6 +705,49 @@ def compute_plan(
     )
 
 
+# ─── server-cursor fail-fast policy ───────────────────────────────────────
+
+
+class ServerCursorUnreachable(RuntimeError):
+    """Raised by `require_server_cursor` when the server can't answer
+    `GET /cursor` and the escape hatch (MIKOSHI_TRUST_LOCAL_CURSOR=1)
+    is not set. Callers should print the message and exit non-zero."""
+
+
+def _trust_local_cursor_enabled() -> bool:
+    return os.environ.get("MIKOSHI_TRUST_LOCAL_CURSOR", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def require_server_cursor(
+    cursors: dict[str, ChatCursor] | None,
+    url: str,
+) -> dict[str, ChatCursor]:
+    """Enforce the "server cursor is the source of truth" policy.
+
+    Returns the server's cursor dict on success. Raises
+    ``ServerCursorUnreachable`` when ``cursors is None`` and the user
+    has not opted into the legacy degraded mode via
+    ``MIKOSHI_TRUST_LOCAL_CURSOR=1``.
+
+    Why a hard requirement: silent fallback to a stale local cache was
+    the root cause of the cursor-drift bug fixed in the redesign. The
+    server's view is always definitionally correct; degrading without
+    asking the user means we re-introduce the same class of bug.
+    """
+    if cursors is not None:
+        return cursors
+    if _trust_local_cursor_enabled():
+        return {}
+    raise ServerCursorUnreachable(
+        f"server cursor unreachable at {url or '<unset>'}/api/ingest/v1/cursor "
+        "— cannot plan a sync without it. Set MIKOSHI_TRUST_LOCAL_CURSOR=1 "
+        "to fall back to the local cache (legacy mode; risks drift if the "
+        "cache is stale)."
+    )
+
+
 # ─── tiny CLI so bash can call this without a full Python wrapper ─────────
 
 
@@ -652,6 +766,17 @@ def _main(argv: list[str] | None = None) -> int:
     p_drift.add_argument("--state-file", type=Path, required=True)
     p_drift.add_argument("--url")
     p_drift.add_argument("--token")
+
+    p_check = sub.add_parser(
+        "check-server-cursor",
+        help="Probe GET /cursor; exit 0 if reachable, 3 if not (unless MIKOSHI_TRUST_LOCAL_CURSOR=1).",
+    )
+    p_check.add_argument("--url", default=os.environ.get("MIKOSHI_URL", ""))
+    p_check.add_argument("--token", default=os.environ.get("MIKOSHI_TOKEN", ""))
+    p_check.add_argument(
+        "--timeout", type=float, default=5.0,
+        help="Seconds to wait for /cursor before giving up (default 5).",
+    )
 
     args = parser.parse_args(argv)
 
@@ -677,6 +802,21 @@ def _main(argv: list[str] | None = None) -> int:
             "summary": summary,
             "entries": [asdict(e) | {"status": e.status.value} for e in report],
         }, indent=2))
+        return 0
+
+    if args.cmd == "check-server-cursor":
+        srv = fetch_server_cursors(args.url, args.token, timeout=args.timeout)
+        try:
+            require_server_cursor(srv, args.url)
+        except ServerCursorUnreachable as e:
+            print(f"[ERROR] {e}", file=sys.stderr)
+            return 3
+        # On success: print one short line so the caller has feedback.
+        chats = len(srv) if srv is not None else 0
+        if srv is None and _trust_local_cursor_enabled():
+            print("server unreachable; proceeding under MIKOSHI_TRUST_LOCAL_CURSOR=1")
+        else:
+            print(f"server cursor OK ({chats} chats tracked)")
         return 0
 
     return 0

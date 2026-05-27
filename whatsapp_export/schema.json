@@ -73,7 +73,11 @@
         },
         "external_id": {
           "type": "string",
-          "description": "1.2+: Mikoshi-side stable id, encoded as 'ios:<Z_PK>'. The server uses it as platform_message_id for idempotency."
+          "description": "1.2+: Mikoshi-side stable id. Current form: 'wa:<ZSTANZAID>' (cross-source-stable; same value on iPhone backup and Mac Catalyst live DB). Legacy form (still accepted by server): 'ios:<Z_PK>' — used as fallback when ZSTANZAID is null."
+        },
+        "legacy_external_id": {
+          "type": ["string", "null"],
+          "description": "Optional secondary id from a prior client format (e.g. 'ios:<Z_PK>'). When present, the server dedups on either id and lazily migrates historical rows."
         },
         "timestamp": { "type": ["string", "null"], "format": "date-time" },
         "from_jid": { "type": ["string", "null"] },

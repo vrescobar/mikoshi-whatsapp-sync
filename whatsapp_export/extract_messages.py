@@ -445,6 +445,7 @@ def extract_messages(
             """
             SELECT
                 m.Z_PK as msg_pk,
+                m.ZSTANZAID as stanza_id,
                 m.ZTEXT as text,
                 m.ZMESSAGEDATE as msg_ts,
                 m.ZFROMJID as from_jid,
@@ -491,9 +492,21 @@ def extract_messages(
                 # still advance the cursor — we don't want to keep re-visiting it
                 continue
 
+            # Dual external_id: `wa:<ZSTANZAID>` is stable across sources
+            # (same value on iPhone backup and Mac live DB for the same
+            # logical message). `legacy_external_id` carries the older
+            # `ios:<Z_PK>` so a Mikoshi that already received the legacy
+            # form can dedup on it instead of inserting a duplicate.
+            # Falls back to ios:<Z_PK> as the primary id for the ~7 rows
+            # in 300k where ZSTANZAID is null (group-system messages).
+            stanza_id = m["stanza_id"]
+            legacy_id = f"ios:{m['msg_pk']}"
+            external_id = f"wa:{stanza_id}" if stanza_id else legacy_id
+
             msg_obj = {
                 "id": m["msg_pk"],
-                "external_id": f"ios:{m['msg_pk']}",
+                "external_id": external_id,
+                "legacy_external_id": legacy_id if external_id != legacy_id else None,
                 "timestamp": ios_timestamp_to_iso(msg_ts),
                 "from_jid": m["from_jid"],
                 "to_jid": m["to_jid"],

@@ -221,21 +221,21 @@ def test_auth(url: str, token: str, timeout: float = 5.0) -> tuple[bool, str]:
     """
     Verify a (URL, token) pair without pushing anything.
 
-    Strategy: try `GET /api/ingest/v1/cursors` (M2 endpoint). On 200/204
-    auth is good. On 401/403, decode and return the friendly message.
-    On 404, the auth endpoint doesn't exist on this old Mikoshi — try
-    a HEAD against the manifest endpoint as a fallback (with an empty
-    body it'll 400 or 405 if auth was OK, 401 if not).
+    Strategy: try `GET /api/ingest/v1/cursor` (current Mikoshi). On
+    200/204 auth is good. On 401/403, decode and return the friendly
+    message. On 404, the auth endpoint doesn't exist on this older
+    Mikoshi — try a HEAD against the manifest endpoint as a fallback
+    (with an empty body it'll 400 or 405 if auth was OK, 401 if not).
     """
     if not url or not token:
         return False, "MIKOSHI_URL and MIKOSHI_TOKEN are not both set."
-    full = url.rstrip("/") + "/api/ingest/v1/cursors"
+    full = url.rstrip("/") + "/api/ingest/v1/cursor"
     try:
         status, raw = http_request(full, method="GET", token=token, timeout=timeout)
     except Exception as e:  # pragma: no cover — network errors
         return False, f"network error: {e}"
     if status in (200, 204):
-        return True, f"OK — {url} accepts this token (cursors endpoint reachable)."
+        return True, f"OK — {url} accepts this token (cursor endpoint reachable)."
     if status == 404:
         # Old server. Try the manifest endpoint with an empty POST to gauge auth alone.
         try:
@@ -247,7 +247,7 @@ def test_auth(url: str, token: str, timeout: float = 5.0) -> tuple[bool, str]:
         except Exception as e:  # pragma: no cover
             return False, f"network error: {e}"
         if status2 in (400, 405, 422):
-            return True, f"OK — {url} accepts this token (server is pre-M2; cursors endpoint missing)."
+            return True, f"OK — {url} accepts this token (server is pre-M2; cursor endpoint missing)."
         body: dict = {}
         try:
             body = json.loads(raw2) if raw2 else {}

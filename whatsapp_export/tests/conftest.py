@@ -75,7 +75,8 @@ def synthetic_db(tmp_path):
             ZTOJID TEXT,
             ZISFROMME INTEGER,
             ZMESSAGETYPE INTEGER,
-            ZPUSHNAME TEXT
+            ZPUSHNAME TEXT,
+            ZSTANZAID TEXT
         );
         CREATE TABLE ZWAMEDIAITEM (
             Z_PK INTEGER PRIMARY KEY,
@@ -109,26 +110,29 @@ def synthetic_db(tmp_path):
     )
 
     # Alice messages (chat 1)
+    # ZSTANZAID column populated with predictable values so dual-id emission
+    # tests can assert wa:STANZA-NNN. One message (msg_pk=103) deliberately
+    # leaves stanza_id NULL to exercise the legacy-only fallback path.
     cur.execute(
-        "INSERT INTO ZWAMESSAGE VALUES (101, 1, 'Hola', ?, 'alice@s.whatsapp.net', 'me@s.whatsapp.net', 0, 0, 'Alice')",
+        "INSERT INTO ZWAMESSAGE VALUES (101, 1, 'Hola', ?, 'alice@s.whatsapp.net', 'me@s.whatsapp.net', 0, 0, 'Alice', 'STANZA-101')",
         (_ios_ts(2026, 5, 20),),
     )
     cur.execute(
-        "INSERT INTO ZWAMESSAGE VALUES (102, 1, 'Que tal', ?, 'alice@s.whatsapp.net', 'me@s.whatsapp.net', 0, 0, 'Alice')",
+        "INSERT INTO ZWAMESSAGE VALUES (102, 1, 'Que tal', ?, 'alice@s.whatsapp.net', 'me@s.whatsapp.net', 0, 0, 'Alice', 'STANZA-102')",
         (_ios_ts(2026, 5, 22),),
     )
     cur.execute(
-        "INSERT INTO ZWAMESSAGE VALUES (103, 1, 'Bien y tu', ?, 'me@s.whatsapp.net', 'alice@s.whatsapp.net', 1, 0, NULL)",
+        "INSERT INTO ZWAMESSAGE VALUES (103, 1, 'Bien y tu', ?, 'me@s.whatsapp.net', 'alice@s.whatsapp.net', 1, 0, NULL, NULL)",
         (_ios_ts(2026, 5, 24),),
     )
 
     # Bob messages (chat 2) — message 202 has an image attachment
     cur.execute(
-        "INSERT INTO ZWAMESSAGE VALUES (201, 2, 'mira esto', ?, 'bob@s.whatsapp.net', 'me@s.whatsapp.net', 0, 0, 'Bob')",
+        "INSERT INTO ZWAMESSAGE VALUES (201, 2, 'mira esto', ?, 'bob@s.whatsapp.net', 'me@s.whatsapp.net', 0, 0, 'Bob', 'STANZA-201')",
         (_ios_ts(2026, 5, 21),),
     )
     cur.execute(
-        "INSERT INTO ZWAMESSAGE VALUES (202, 2, NULL, ?, 'bob@s.whatsapp.net', 'me@s.whatsapp.net', 0, 1, 'Bob')",
+        "INSERT INTO ZWAMESSAGE VALUES (202, 2, NULL, ?, 'bob@s.whatsapp.net', 'me@s.whatsapp.net', 0, 1, 'Bob', 'STANZA-202')",
         (_ios_ts(2026, 5, 23),),
     )
     cur.execute(
@@ -137,15 +141,15 @@ def synthetic_db(tmp_path):
 
     # Group messages (chat 3): text + system + video
     cur.execute(
-        "INSERT INTO ZWAMESSAGE VALUES (401, 3, NULL, ?, 'alice@s.whatsapp.net', '12345@g.us', 0, 10, 'Alice')",
+        "INSERT INTO ZWAMESSAGE VALUES (401, 3, NULL, ?, 'alice@s.whatsapp.net', '12345@g.us', 0, 10, 'Alice', 'STANZA-401')",
         (_ios_ts(2026, 5, 18),),
     )  # system: group creation
     cur.execute(
-        "INSERT INTO ZWAMESSAGE VALUES (402, 3, 'hola familia', ?, 'alice@s.whatsapp.net', '12345@g.us', 0, 0, 'Alice')",
+        "INSERT INTO ZWAMESSAGE VALUES (402, 3, 'hola familia', ?, 'alice@s.whatsapp.net', '12345@g.us', 0, 0, 'Alice', 'STANZA-402')",
         (_ios_ts(2026, 5, 19),),
     )
     cur.execute(
-        "INSERT INTO ZWAMESSAGE VALUES (403, 3, NULL, ?, 'bob@s.whatsapp.net', '12345@g.us', 0, 2, 'Bob')",
+        "INSERT INTO ZWAMESSAGE VALUES (403, 3, NULL, ?, 'bob@s.whatsapp.net', '12345@g.us', 0, 2, 'Bob', 'STANZA-403')",
         (_ios_ts(2026, 5, 20),),
     )
     cur.execute(

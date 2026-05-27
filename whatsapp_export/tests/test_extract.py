@@ -141,11 +141,23 @@ class TestFullSync:
             mode="full",
         )
         assert result["schema_version"] == "1.2"
-        # v1.2 adds client_id (audit trail) and external_id on each message
+        # v1.2 adds client_id (audit trail). external_id is `wa:<stanza>`
+        # when the row has ZSTANZAID, or the legacy `ios:<pk>` form when
+        # stanza is null (one row in the synthetic fixture exercises that).
         assert result["client_id"]
         for chat in result["chats"]:
             for msg in chat["messages"]:
-                assert msg["external_id"] == f"ios:{msg['id']}"
+                wa_form = msg["external_id"].startswith("wa:")
+                legacy_form = msg["external_id"] == f"ios:{msg['id']}"
+                assert wa_form or legacy_form, (
+                    f"unexpected external_id {msg['external_id']!r} for msg {msg['id']}"
+                )
+                if wa_form:
+                    # The dual id carries the prior ios: form too.
+                    assert msg["legacy_external_id"] == f"ios:{msg['id']}"
+                else:
+                    # Legacy-only path: no legacy_external_id (would be redundant).
+                    assert msg["legacy_external_id"] is None
 
 
 class TestIncrementalSync:
@@ -493,7 +505,8 @@ class TestNullValues:
                 ZTOJID TEXT,
                 ZISFROMME INTEGER,
                 ZMESSAGETYPE INTEGER,
-                ZPUSHNAME TEXT
+                ZPUSHNAME TEXT,
+                ZSTANZAID TEXT
             );
             CREATE TABLE ZWAMEDIAITEM (
                 Z_PK INTEGER PRIMARY KEY,
@@ -504,7 +517,7 @@ class TestNullValues:
                 ZMEDIASIZE INTEGER
             );
             INSERT INTO ZWACHATSESSION VALUES (1, 'x@s.whatsapp.net', NULL, 100.0);
-            INSERT INTO ZWAMESSAGE VALUES (1, 1, NULL, 50.0, 'x@s.whatsapp.net', 'me@s.whatsapp.net', 0, 0, NULL);
+            INSERT INTO ZWAMESSAGE VALUES (1, 1, NULL, 50.0, 'x@s.whatsapp.net', 'me@s.whatsapp.net', 0, 0, NULL, NULL);
         """)
         conn.commit()
         conn.close()

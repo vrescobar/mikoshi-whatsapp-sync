@@ -363,7 +363,9 @@ class TestComputePlan:
 
 class TestServerCursorFetch:
     def test_returns_none_on_404(self, monkeypatch):
-        """Old Mikoshi without the cursors endpoint must not crash the client."""
+        """Very old Mikoshi without either the /cursor or /cursors endpoint
+        must not crash the client. The first 404 triggers the legacy-path
+        fallback, and that also 404'ing produces None."""
         import urllib.error
         def fake_open(*a, **kw):
             raise urllib.error.HTTPError("u", 404, "not found", {}, None)
@@ -381,6 +383,126 @@ class TestServerCursorFetch:
     def test_returns_none_on_missing_url_or_token(self):
         assert pipeline_state.fetch_server_cursors("", "tok") is None
         assert pipeline_state.fetch_server_cursors("http://x", "") is None
+
+    def test_parses_current_mikoshi_array_shape(self, monkeypatch):
+        """The deployed Mikoshi server returns
+        `{account_id, cursors: [{chat_jid, last_external_id, last_message_at, ...}]}`.
+        The client must parse this — the M2 doc described a different
+        shape, and the server team picked this one."""
+        import io
+        body = json.dumps({
+            "account_id": "u_01",
+            "cursors": [
+                {
+                    "chat_jid": "alice@s.whatsapp.net",
+                    "last_external_id": "wa:STANZA-7",
+                    "last_message_at": "2026-05-26T07:14:17Z",
+                    "message_count": 3,
+                    "updated_at": "2026-05-26T07:14:18Z",
+                },
+                {
+                    "chat_jid": "bob@s.whatsapp.net",
+                    "last_external_id": "ios:42",
+                    "last_message_at": "2026-05-25T18:00:00Z",
+                    "message_count": 1,
+                    "updated_at": "2026-05-25T18:00:01Z",
+                },
+            ],
+        }).encode()
+
+        class FakeResp:
+            status = 200
+            def __init__(self): self._body = body
+            def read(self): return self._body
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+
+        urls: list[str] = []
+        def fake_open(req, *a, **kw):
+            urls.append(req.full_url)
+            return FakeResp()
+
+        monkeypatch.setattr("urllib.request.urlopen", fake_open)
+        result = pipeline_state.fetch_server_cursors("http://x", "tok")
+        assert result is not None
+        # Hit /cursor (singular), not /cursors.
+        assert urls[0].endswith("/api/ingest/v1/cursor")
+        assert set(result.keys()) == {"alice@s.whatsapp.net", "bob@s.whatsapp.net"}
+        alice = result["alice@s.whatsapp.net"]
+        assert alice.committed_through_ts == "2026-05-26T07:14:17Z"
+        assert alice.committed_through_external_id == "wa:STANZA-7"
+
+    def test_falls_back_to_plural_on_first_404(self, monkeypatch):
+        """If /cursor 404s (server downgraded or different version), we
+        try /cursors with the legacy map-keyed shape. Keeps the client
+        compatible with the M2 doc's described API while the deployed
+        server uses /cursor."""
+        import urllib.error
+        legacy_body = json.dumps({
+            "alice@s.whatsapp.net": {
+                "ts": "2026-05-26T07:14:17Z",
+                "external_id": "wa:STANZA-7",
+            },
+        }).encode()
+
+        class FakeResp:
+            status = 200
+            def __init__(self, b): self._body = b
+            def read(self): return self._body
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+
+        call_count = {"n": 0}
+        def fake_open(req, *a, **kw):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise urllib.error.HTTPError(req.full_url, 404, "nope", {}, None)
+            return FakeResp(legacy_body)
+
+        monkeypatch.setattr("urllib.request.urlopen", fake_open)
+        result = pipeline_state.fetch_server_cursors("http://x", "tok")
+        assert result is not None
+        assert "alice@s.whatsapp.net" in result
+        assert call_count["n"] == 2
+
+    def test_parses_legacy_map_shape(self, monkeypatch):
+        """Direct test of the map-keyed parser used by tests/older docs."""
+        result = pipeline_state._parse_cursors_payload({
+            "chats": {
+                "alice@s.whatsapp.net": {
+                    "ts": "2026-05-26T07:14:17Z",
+                    "external_id": "ios:42",
+                },
+            },
+        })
+        assert "alice@s.whatsapp.net" in result
+        assert result["alice@s.whatsapp.net"].committed_through_external_id == "ios:42"
+
+
+# ─── server-cursor fail-fast policy ──────────────────────────────────────
+
+
+class TestRequireServerCursor:
+    """The redesign promotes "server is source of truth" to "server is
+    mandatory". A None from fetch_server_cursors is a hard error, not a
+    silent fallback to the cache — that fallback was the original
+    drift-bug surface."""
+
+    def test_returns_cursors_when_present(self):
+        cursors: dict[str, pipeline_state.ChatCursor] = {}
+        assert pipeline_state.require_server_cursor(cursors, "http://x") is cursors
+
+    def test_raises_when_none_and_no_escape_hatch(self, monkeypatch):
+        monkeypatch.delenv("MIKOSHI_TRUST_LOCAL_CURSOR", raising=False)
+        with pytest.raises(pipeline_state.ServerCursorUnreachable) as exc:
+            pipeline_state.require_server_cursor(None, "http://x")
+        # Message should mention the env var, so users know how to recover.
+        assert "MIKOSHI_TRUST_LOCAL_CURSOR" in str(exc.value)
+
+    def test_degrades_when_escape_hatch_set(self, monkeypatch):
+        monkeypatch.setenv("MIKOSHI_TRUST_LOCAL_CURSOR", "1")
+        result = pipeline_state.require_server_cursor(None, "http://x")
+        assert result == {}
 
 
 # ─── 401-decoder ─────────────────────────────────────────────────────────

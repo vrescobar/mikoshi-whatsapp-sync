@@ -215,6 +215,17 @@ cmd_sync() {
         fi
     fi
 
+    # Pre-flight: confirm the server cursor is reachable. The redesign
+    # made server-side cursors authoritative — degrading to a stale local
+    # cache is exactly what caused the original drift bug. Exit 3 if the
+    # server isn't answering /cursor and the user hasn't opted into the
+    # MIKOSHI_TRUST_LOCAL_CURSOR=1 escape hatch.
+    if ! (cd "$SCRIPT_DIR" && python3 -m pipeline_state check-server-cursor); then
+        echo "[mikoshi] aborting sync: server cursor unreachable." >&2
+        echo "[mikoshi] (set MIKOSHI_TRUST_LOCAL_CURSOR=1 to proceed with stale local cursors)" >&2
+        exit 3
+    fi
+
     echo "[mikoshi] $(date '+%Y-%m-%d %H:%M:%S') starting sync: ${args[*]:-(default)}"
     echo "[mikoshi] full log: $cron_log"
     "$PIPELINE" ${args[@]+"${args[@]}"} 2>&1 | tee "$cron_log"
