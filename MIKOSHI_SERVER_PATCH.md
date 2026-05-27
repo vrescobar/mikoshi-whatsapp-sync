@@ -1,211 +1,140 @@
-# MIKOSHI_SERVER_PATCH — companion PR for the Mikoshi repo
+# MIKOSHI_SERVER_PATCH — what landed, what's needed, what's out
 
-The client redesign in this repo is fully usable against an existing
-Mikoshi server — push still works, cursors still get persisted (via the
-`extracted-offline` fallback path in `push_via_api.py`). But two small
-endpoints on the server side unlock the *full* benefit of the redesign:
-authoritative cursor reads, sharper drift detection, and a faster plan
-screen.
+This file used to be a hand-off doc telling the Mikoshi team what to
+build server-side. The actual implementation landed in the Mikoshi
+repo on branch `feat/ingest-committed-cursors`, and this file is now
+the retro: **what's deployed**, **what each piece does**, and **what
+the client expects** so both ends stay in sync.
 
-This doc describes exactly what to change on the server side. It belongs
-as a separate PR in the Mikoshi repo (`src/ingestion/`). The client
-detects whether either endpoint is present and degrades silently when
-they aren't — so the two PRs can be merged in either order.
+## Endpoint 1 — `GET /api/ingest/v1/cursor`
 
-## Endpoint 1 — `GET /api/ingest/v1/cursors`
+### Status: **already shipped** on the Mikoshi server (note: singular `cursor`, not plural)
 
-### Purpose
-
-Let the client ask "what's the last message you have, per chat?" without
-having to query a SQL shell on the server box. Eliminates the silent
-drift bug — instead of trusting its local cache, the client uses the
-server's view as authoritative every time it builds a sync plan.
+The Mikoshi team had already added this endpoint by the time the
+client redesign landed. It lives at
+`src/ingestion/routes/handleIngestCursor.ts` and surfaces the
+per-chat watermarks for the authenticated account.
 
 ### Request
 
 ```http
-GET /api/ingest/v1/cursors
+GET /api/ingest/v1/cursor
 Authorization: Bearer <ingest-token>
 ```
-
-No query parameters. The token resolves to an account; the response is
-scoped to that account.
 
 ### Response (200 OK)
 
 ```json
 {
-  "version": "1.2",
-  "account_id": "u_01HXY...",
-  "as_of": "2026-05-26T18:42:00Z",
-  "chats": {
-    "<jid>": {
-      "ts": "2026-05-26T07:14:17Z",
-      "external_id": "ios:1834219"
-    },
-    ...
-  }
+  "account_id": "main",
+  "cursors": [
+    {
+      "chat_jid": "1215643529322@lid",
+      "last_external_id": "wa:STANZA-7",
+      "last_message_at": "2026-05-26T07:14:17Z",
+      "message_count": 3,
+      "updated_at": "2026-05-26T07:14:18Z"
+    }
+  ]
 }
 ```
 
-The client also accepts the flattened shape `{"<jid>": {...}}` (no
-envelope) — handy for the simplest possible implementation.
-
-Fields:
-
-- `ts` — ISO-8601 UTC timestamp of the latest committed message for this
-  chat. Used as the lower bound for the next incremental extraction.
-- `external_id` — `"ios:<Z_PK>"`. The strong identity — when the server
-  re-receives a message with this external_id it dedups and skips.
+The client parser (`pipeline_state._parse_cursors_payload`) also
+accepts the older map-keyed shape (`{chats: {jid: {ts, external_id}}}`)
+as a transition aid. The current Mikoshi uses the array shape above.
 
 ### Status codes
 
-- `200` — success, return the JSON body above.
-- `401` — invalid / missing / revoked token. The client surfaces a
-  decoded hint (see `decode_auth_error` in `push_via_api.py`); the body
-  format the client tries to parse is anything containing the words
-  `token`, `account`, `disabled`, `expired`, `revoked`, etc.
-- `404` — endpoint not deployed. The client treats this as "old Mikoshi"
-  and falls back silently. **Don't accidentally return 404 for "account
-  has no commits yet" — return 200 with `chats: {}` instead.**
-
-### Suggested SQL
-
-Assuming a `messages` table with `(account_id, chat_jid, timestamp,
-external_id)` columns and an index on `(account_id, chat_jid, timestamp DESC)`:
-
-```sql
-SELECT chat_jid,
-       MAX(timestamp) AS ts,
-       (
-         SELECT external_id
-           FROM messages m2
-          WHERE m2.account_id = m.account_id
-            AND m2.chat_jid = m.chat_jid
-          ORDER BY m2.timestamp DESC, m2.id DESC
-          LIMIT 1
-       ) AS external_id
-  FROM messages m
- WHERE account_id = :account_id
- GROUP BY chat_jid;
-```
-
-Or if you already have an `ingestion_cursor` (or similar) table that
-tracks the watermark at write time — that's even better; just project
-its rows.
-
-### Performance
-
-The client polls this once per TUI open and once per sync run (throttled
-to 30s in the TUI). It should return in <100ms for an account with a few
-hundred chats. Add an index if it doesn't.
+- `200` — success, return the body above. **Important:** return 200
+  with `cursors: []` for "account exists but has no commits yet" — do
+  not return 404 for that case (the client treats 404 as "server
+  doesn't have this endpoint at all").
+- `401` — invalid / missing / revoked token. The client decodes via
+  `push_via_api.decode_auth_error` and surfaces a friendly hint.
 
 ## Endpoint 2 — `committed_cursors` in `POST /commit` response
 
-### Purpose
+### Status: **shipped in `feat/ingest-committed-cursors`** (branch on jetson, not yet merged to main)
 
-Today the commit response is `{stats: {...}}`. The new client wants the
-server to *also* echo back the per-chat watermarks it just advanced.
-That's the value the client writes into its local cache — it's the
-strongest possible guarantee that local state matches server state,
-because it comes straight from the server's own database after the write
-succeeded.
-
-### Response (200 OK) — addition
-
-The existing `stats` field stays exactly as it is. Add:
+The commit handler now returns an additional top-level field:
 
 ```json
 {
-  "stats": { ... existing fields ... },
+  "ok": true,
+  "stats": { "messagesInserted": 1247, "...": "..." },
   "committed_cursors": {
     "<jid>": {
       "ts": "2026-05-26T07:14:17Z",
-      "external_id": "ios:1834219"
-    },
-    ...
+      "external_id": "wa:STANZA-7"
+    }
   }
 }
 ```
 
-The server already computes the max-per-chat to advance its own cursor
-inside the commit handler — just echo that data back instead of
-discarding it.
+The client writes those values into its local `.sync_state.json`
+cache. The numeric counters stay under `stats` to keep the existing
+wire shape stable.
 
-### When `committed_cursors` should be present
+### When `committed_cursors` is empty
 
-Only for chats whose cursor was *changed* by this commit. Echoing the
-unchanged ones is fine but adds bytes; the client tolerates either.
+The field is always present so the contract is stable. It's `{}` when:
 
-### Client fallback when missing
+- the commit is idempotent (same `push_id` seen twice — the second
+  commit short-circuits via the "already committed" branch); or
+- every message in the manifest was a duplicate (no cursor was
+  moved).
 
-When the field is absent (old server), the client computes cursors
-locally from the manifest it just successfully pushed and tags them with
-`source: "extracted (offline)"`. The next drift check re-verifies them
-against the server. So this change is a quality-of-signal improvement,
-not a correctness requirement.
+Clients should treat "missing entries" as "nothing to update for those
+JIDs", not as an error.
 
-## Endpoint 3 (optional) — `POST /api/ingest/v1/cursors/rewind`
+### Append-only invariant
 
-### Purpose
+The cursor handler refuses to retreat. If a commit brings messages
+strictly older than the existing cursor (a backfill of long history),
+the rows are inserted, but the cursor does not move backwards. The
+server emits a structured warning (`refusing retrograde cursor
+update`) and omits the affected JID from `committed_cursors`. Clients
+should keep their own (higher) watermark in that case.
 
-Power-user recovery: rewind the server-side cursor for one chat so a
-re-push picks up messages older than the current watermark.
+## Legacy external_id dedup
 
-Today the same effect is achievable by re-submitting the older messages
-with their original `external_id` values — the server's dedup is by
-external_id, not by timestamp range, so the bytes still land. But that
-requires re-running the client with `--mode full-contact` and ignoring
-the cursor (which the redesign no longer lets the client do trivially).
+### Status: shipped in `feat/ingest-committed-cursors`
 
-A rewind endpoint cuts this to a single click in the TUI's `Tools →
-Rewind cursor for one chat`.
+`ManifestMessageSchema` now accepts an optional `legacy_external_id`
+field per message. Use case: the client is migrating from
+`external_id="ios:<Z_PK>"` to `external_id="wa:<ZSTANZAID>"` and ships
+both for messages it has already pushed in the old format. The commit
+handler:
 
-### Request
+1. looks up `(account_id, platform_message_id = external_id)`. If
+   present, dedup → skip.
+2. otherwise looks up `(account_id, platform_message_id =
+   legacy_external_id)`. If present, **update the existing row** in
+   place to the new external_id and skip. Lazy migration — no
+   backfill script needed.
+3. otherwise insert with `external_id` as the primary key.
 
-```http
-POST /api/ingest/v1/cursors/rewind
-Authorization: Bearer <ingest-token>
-Content-Type: application/json
+This means the wire transition can happen one row at a time as each
+chat is re-synced from the new client. Server-side tests live in
+`tests/apiIngestCommit.test.ts`.
 
-{
-  "chat_jid": "34xxxxxxxxx@s.whatsapp.net",
-  "to_ts": "2026-01-01T00:00:00Z"  // rewind to this timestamp; null = full rewind
-}
-```
+## What is **explicitly out**
 
-### Response (200 OK)
-
-```json
-{ "ok": true, "new_cursor_ts": "2026-01-01T00:00:00Z" }
-```
-
-### Authorization
-
-Same Bearer token. Optionally gate behind a separate scope/role if the
-ingest token is supposed to be append-only.
-
-### Notes
-
-- This must not delete any committed messages; it only moves the cursor
-  back. The next client push re-submits messages, which dedup as no-ops.
-- Audit-log every rewind. Single-user tools shouldn't need this often;
-  if you see frequent rewinds, something else is wrong.
+- **No server-side wipe / rewind endpoint.** A previous draft of this
+  doc proposed an admin endpoint that would let the client purge or
+  rewind a server-side cursor for one chat. The user has decided
+  against shipping that — recovery scenarios that need it should be
+  resolved by re-pushing the affected messages (server dedup handles
+  the bytes), or by direct SQL on the jetson box if absolutely
+  necessary. The endpoint is **not** implemented and **not** planned.
 
 ## Schema versioning
 
-The client still sends `schema_version: "1.2"` in the manifest, and the
-server still pins-checks that exact string. None of the additions here
-require a schema bump — they're new endpoints and additive response
-fields. If the server wants to advertise capability:
-
-```http
-GET /api/ingest/v1/capabilities
-→ { "schema_versions": ["1.2"], "endpoints": ["cursors", "cursors-rewind", "commit-echo"] }
-```
-
-Optional. The client doesn't probe this today; it just tries the
-endpoint and degrades on 404.
+The client still sends `schema_version: "1.2"` in the manifest. All
+changes here are additive (new response fields, optional manifest
+field). No bump required; if a future change is non-additive, the
+client and server pin a new literal version and the
+`IngestionManifestSchema.parse` rejects mismatches early.
 
 ## Testing the round-trip
 
@@ -213,17 +142,14 @@ After deploying both endpoints, on the client:
 
 ```bash
 ./mikoshi-whatsapp.sh test-auth
-# expect: "OK — https://your-mikoshi accepts this token (cursors endpoint reachable)."
-
-./mikoshi-whatsapp.sh status
-# expect: "Server: ✓ <url>  N chats tracked   last commit <ts>"
+# expect: "OK — https://your-mikoshi accepts this token (cursor endpoint reachable)."
 
 ./mikoshi-whatsapp.sh sync
-# expect: cursor cache updated from server response (committed_cursors for N chats)
+# expect: "[OK] cursor cache updated from server (committed_cursors for N chats)"
 ```
 
-If `committed_cursors` is missing from the commit response the client
-logs:
+If `committed_cursors` is missing from the commit response (very old
+server), the client logs:
 
 ```
 [OK] cursor cache updated from manifest (server didn't echo committed_cursors — old Mikoshi?)
