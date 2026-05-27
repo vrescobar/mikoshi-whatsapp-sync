@@ -58,6 +58,54 @@ against the server's per-chat cursors (`GET /api/ingest/v1/cursors`).
 "0 messages" means "the server already has everything past your local
 cursors" — it's the success path, not a bug.
 
+### What is a cursor, in plain language?
+
+A **cursor** is a per-chat watermark. It answers exactly one question:
+
+> "What is the timestamp of the last message I've already pushed to
+> Mikoshi for this chat?"
+
+There is one cursor per WhatsApp conversation. If you've pushed messages
+up to `2026-05-26 09:00:00` for Alice and `2026-05-25 17:33:00` for the
+family group, that's two cursors — one number each.
+
+**Where does it live?** In the server's `ingestion_cursor` table.
+That's the source of truth. `.sync_state.json` on your Mac is a
+*mirror* of that table; if it disappears, the next sync rebuilds it
+from `GET /api/ingest/v1/cursor` and nothing is lost.
+
+**What does "advance the cursor" mean?** It means: "move the
+watermark forward so the next sync only extracts messages newer than
+this." A sync that pushes 10 new messages then advances the cursor by
+those 10 timestamps. A sync that doesn't push (because the server
+rejected it) leaves the cursor where it was — that's the redesign's
+core invariant, and it's what closed the silent-drift bug.
+
+**Why does it matter that the *server* holds it?** Because the local
+file can lie. Before the redesign, the client would advance its local
+cursor at *extraction* time — before push. If the push then failed,
+the client thought the data was synced while the server had nothing,
+and every subsequent run quietly reported "0 messages" without ever
+recovering. Making the server the source of truth means a failed push
+literally cannot move the watermark.
+
+**What does "drift" mean?** The TUI's status header compares your local
+cache against the server's view and reports one of:
+
+- `IN_SYNC` — both agree. (Should be the steady state.)
+- `LOCAL_AHEAD` — your local cache says you've pushed past a point the
+  server doesn't have. Used to be silent-drift territory; now flagged
+  and recoverable by re-running Sync (the planner will re-push from the
+  server's cursor downward).
+- `SERVER_AHEAD` — your cache is stale (you reset it, or pushed from
+  another machine). Next sync will silently catch up.
+- `NO_SERVER_RECORD` — first sync for this chat; the server has never
+  seen it. Normal on new chats.
+- `NO_LOCAL_RECORD` — server has it, your cache doesn't. Cache will
+  rehydrate from `/cursor`.
+
+In day-to-day use you should only ever see `IN_SYNC`.
+
 ### Cursors live server-side
 
 The pre-redesign pipeline advanced `.sync_state.json` immediately after
