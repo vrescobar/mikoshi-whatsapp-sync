@@ -168,6 +168,15 @@ cmd_sync() {
         case "$1" in
             --all) force_all=true; shift ;;
             --full) force_full=true; shift ;;
+            --sources)
+                # Pass the comma-separated source list through to
+                # run_pipeline.sh as MIKOSHI_SOURCES. Wrapper-side
+                # validation is deliberately loose — the Python side
+                # rejects unknown names with a clear error.
+                [[ -z "${2:-}" ]] && { echo "[mikoshi] --sources requires a value" >&2; exit 1; }
+                export MIKOSHI_SOURCES="$2"
+                shift 2
+                ;;
             *) args+=("$1"); shift ;;
         esac
     done

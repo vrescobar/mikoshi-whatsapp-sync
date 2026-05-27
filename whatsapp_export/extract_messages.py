@@ -594,10 +594,176 @@ def extract_messages(
     return new_state
 
 
+def extract_messages_multi_source(
+    sources,
+    output_path,
+    attachments_dir,
+    sync_state,
+    mode="incremental",
+    target_contact=None,
+    target_chat_jid=None,
+    since_iso=None,
+    include_system=False,
+    favorite_jids=None,
+):
+    """Run extraction against N sources, reconcile, write one manifest.
+
+    Calls ``extract_messages`` once per source (each writes its own
+    transient JSON to a temp file), then merges the results with
+    ``reconciler.reconcile`` into a single per-chat-deduped manifest at
+    ``output_path``.
+
+    ``sources`` is a list of ``sources.base.Source`` instances; each
+    must be available (``s.is_available() == True``). Cursor / state
+    semantics match single-source extraction: per-chat cursors are the
+    union of "what each source has seen", but the returned
+    ``new_state`` is only used for the legacy MIKOSHI_TRUST_LOCAL_CURSOR
+    path — the server's commit response is still the canonical update
+    in the redesign.
+    """
+    import tempfile
+
+    from reconciler import reconcile
+
+    if not sources:
+        raise ValueError("extract_messages_multi_source: at least one source required")
+
+    per_source_chats: dict[str, dict[str, list[dict]]] = {}
+    per_source_state: dict[str, dict[str, str]] = {}
+    per_source_attachments_per_chat: dict[str, dict[str, list[dict]]] = {}
+
+    # Each source extracts into its own temp output so we can read both
+    # back as native manifest dicts and run them through the reconciler.
+    for source in sources:
+        with tempfile.NamedTemporaryFile(
+            prefix=f"mikoshi-extract-{source.name}-",
+            suffix=".json",
+            delete=False,
+            dir=str(output_path.parent),
+        ) as tf:
+            tmp_path = Path(tf.name)
+        per_source_attachments_dir = attachments_dir  # share — all sha256-keyed
+        new_state = extract_messages(
+            db_path=source.db_path(),
+            extracted_root=source.media_root() or source.db_path().parent,
+            output_path=tmp_path,
+            attachments_dir=per_source_attachments_dir,
+            sync_state=sync_state,
+            mode=mode,
+            target_contact=target_contact,
+            target_chat_jid=target_chat_jid,
+            since_iso=since_iso,
+            include_system=include_system,
+            favorite_jids=favorite_jids,
+        )
+        if new_state is None:
+            # Source had nothing matching the filter — skip cleanly.
+            tmp_path.unlink(missing_ok=True)
+            continue
+        with open(tmp_path, encoding="utf-8") as f:
+            payload = json.load(f)
+        tmp_path.unlink(missing_ok=True)
+        per_source_chats[source.name] = {
+            chat["jid"]: chat["messages"] for chat in payload["chats"]
+        }
+        per_source_attachments_per_chat[source.name] = {
+            chat["jid"]: chat for chat in payload["chats"]
+        }
+        per_source_state[source.name] = new_state
+
+    if not per_source_chats:
+        return None
+
+    # Run the dedup. Order: iphone before mac (the iPhone backup is the
+    # media authority — its rows win attachment-provenance ties).
+    merged_chats = reconcile(
+        per_source_chats,
+        source_order=["iphone_backup", "mac_live"],
+    )
+
+    # Carry chat metadata (name, is_group, participants) from whichever
+    # source described the chat — prefer iphone_backup, fall back to mac_live.
+    merged_state: dict[str, str] = {}
+    for jid, msgs in merged_chats.items():
+        for st in per_source_state.values():
+            if jid in st:
+                # Latest timestamp wins across sources.
+                if jid not in merged_state or (st[jid] or "") > merged_state[jid]:
+                    merged_state[jid] = st[jid]
+
+    output_chats = []
+    total_msgs = 0
+    total_attachments = 0
+    skipped_attachments = 0
+    for jid, msgs in merged_chats.items():
+        meta = None
+        for src_name in ("iphone_backup", "mac_live"):
+            if src_name in per_source_attachments_per_chat:
+                meta = per_source_attachments_per_chat[src_name].get(jid)
+                if meta:
+                    break
+        if not meta:
+            continue
+        chat_out = {
+            "jid": jid,
+            "name": meta.get("name"),
+            "is_group": meta.get("is_group", False),
+            "participants": meta.get("participants", []),
+            "messages": msgs,
+        }
+        output_chats.append(chat_out)
+        total_msgs += len(msgs)
+        for m in msgs:
+            att = m.get("attachment")
+            if att and att.get("skipped") is False:
+                total_attachments += 1
+            elif att and att.get("skipped") is True:
+                skipped_attachments += 1
+
+    # Reuse the manifest envelope of the first source's output.
+    export = {
+        "schema_version": "1.2",
+        "client_id": os.environ.get("MIKOSHI_CLIENT_ID", platform.node() or "macos-client"),
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "mode": mode,
+        "target_contact": target_contact,
+        "target_chat_jid": target_chat_jid,
+        "since": since_iso,
+        "include_system_messages": include_system,
+        "sources": sorted(per_source_chats.keys()),
+        "chats": output_chats,
+        "stats": {
+            "total_chats": len(output_chats),
+            "total_messages": total_msgs,
+            "attachments_kept": total_attachments,
+            "attachments_skipped": skipped_attachments,
+        },
+    }
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(export, f, indent=2, ensure_ascii=False, default=str)
+
+    print(
+        f"[INFO] multi-source: {total_msgs} messages across {len(output_chats)} chats "
+        f"after reconcile (sources: {', '.join(sorted(per_source_chats.keys()))})"
+    )
+    return merged_state
+
+
 def main():
     parser = argparse.ArgumentParser(description="WhatsApp extractor for Mikoshi")
-    parser.add_argument("--db", required=True, type=Path)
-    parser.add_argument("--extracted-root", required=True, type=Path)
+    # `--db` and `--extracted-root` are required for single-source mode.
+    # `--sources` selects multi-source mode (paths are discovered from
+    # the `sources/` registry rather than passed in).
+    parser.add_argument("--db", type=Path, help="Single-source: path to ChatStorage.sqlite")
+    parser.add_argument("--extracted-root", type=Path, help="Single-source: media tree root")
+    parser.add_argument(
+        "--sources",
+        help="Comma-separated list of source names (e.g. 'iphone_backup,mac_live'). "
+             "When set, takes precedence over --db/--extracted-root; the chosen "
+             "sources are merged and deduped via reconciler.reconcile.",
+    )
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--attachments-dir", required=True, type=Path)
     parser.add_argument("--state-file", required=True, type=Path)
@@ -635,7 +801,13 @@ def main():
     if args.mode == "full-contact" and not args.contact:
         parser.error("--contact required when --mode=full-contact")
 
-    if not args.db.exists():
+    if not args.sources and not args.db:
+        parser.error("either --sources or --db is required")
+
+    if args.sources and (args.db or args.extracted_root):
+        parser.error("--sources is mutually exclusive with --db / --extracted-root")
+
+    if args.db and not args.db.exists():
         print(f"[ERROR] DB not found: {args.db}", file=sys.stderr)
         sys.exit(1)
 
@@ -655,19 +827,50 @@ def main():
         print("[INFO] Full sync mode: resetting state")
         sync_state = {"version": 1, "last_global_sync": None, "chats": {}}
 
-    new_chats_state = extract_messages(
-        db_path=args.db,
-        extracted_root=args.extracted_root,
-        output_path=args.output,
-        attachments_dir=args.attachments_dir,
-        sync_state=sync_state,
-        mode=args.mode,
-        target_contact=args.contact,
-        target_chat_jid=args.chat_jid,
-        since_iso=args.since,
-        include_system=args.include_system,
-        favorite_jids=favorite_jids,
-    )
+    if args.sources:
+        from sources import get_source
+        source_names = [s.strip() for s in args.sources.split(",") if s.strip()]
+        source_objs = []
+        for name in source_names:
+            try:
+                src = get_source(name)
+            except KeyError:
+                print(f"[ERROR] unknown source: {name}", file=sys.stderr)
+                sys.exit(1)
+            if not src.is_available():
+                print(f"[WARN] source {name} not available on this Mac — skipping",
+                      file=sys.stderr)
+                continue
+            source_objs.append(src)
+        if not source_objs:
+            print("[ERROR] no requested sources are available", file=sys.stderr)
+            sys.exit(2)
+        new_chats_state = extract_messages_multi_source(
+            sources=source_objs,
+            output_path=args.output,
+            attachments_dir=args.attachments_dir,
+            sync_state=sync_state,
+            mode=args.mode,
+            target_contact=args.contact,
+            target_chat_jid=args.chat_jid,
+            since_iso=args.since,
+            include_system=args.include_system,
+            favorite_jids=favorite_jids,
+        )
+    else:
+        new_chats_state = extract_messages(
+            db_path=args.db,
+            extracted_root=args.extracted_root,
+            output_path=args.output,
+            attachments_dir=args.attachments_dir,
+            sync_state=sync_state,
+            mode=args.mode,
+            target_contact=args.contact,
+            target_chat_jid=args.chat_jid,
+            since_iso=args.since,
+            include_system=args.include_system,
+            favorite_jids=favorite_jids,
+        )
 
     if new_chats_state is None:
         sys.exit(2)

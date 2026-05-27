@@ -551,13 +551,22 @@ extract_and_export() {
     EXPORT_FILE="${EXPORTS_DIR}/whatsapp_export_${TIMESTAMP}.json"
 
     local args=(
-        --db "$CHAT_STORAGE"
-        --extracted-root "$EXTRACT_DIR"
         --output "$EXPORT_FILE"
         --attachments-dir "$ATTACHMENTS_DIR"
         --state-file "$STATE_FILE"
         --mode "$SYNC_MODE"
     )
+    # When MIKOSHI_SOURCES is set (e.g. "iphone_backup,mac_live"), use
+    # the multi-source extractor — it pulls from each source, reconciles
+    # by stanza id, and writes one deduped manifest. Otherwise fall back
+    # to single-source mode using the decrypted iPhone backup, which is
+    # what the cron path has done since the redesign.
+    if [[ -n "${MIKOSHI_SOURCES:-}" ]]; then
+        args+=(--sources "$MIKOSHI_SOURCES")
+        log "  Sources: $MIKOSHI_SOURCES"
+    else
+        args+=(--db "$CHAT_STORAGE" --extracted-root "$EXTRACT_DIR")
+    fi
     [[ -n "$TARGET_CONTACT" ]] && args+=(--contact "$TARGET_CONTACT")
     [[ -n "$TARGET_CHAT_JID" ]] && args+=(--chat-jid "$TARGET_CHAT_JID")
     [[ -n "$SINCE" ]] && args+=(--since "$SINCE")
