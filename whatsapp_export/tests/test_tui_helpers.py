@@ -562,6 +562,107 @@ class TestFormatSourcesLabel:
         assert "+" in label  # joiner
 
 
+class TestFavoritesRemoveChoices:
+    """The favorites-remove picker used to iterate file-insertion order.
+    Users with months of favorites would scroll past stale chats to find
+    the one they actually wanted to remove. Newest-last-message-first
+    matches every other picker in the app.
+    """
+
+    def setup_method(self):
+        sys.modules.pop("tui", None)
+        import tui
+        self.tui = tui
+
+    def test_orders_by_last_ts_desc(self, monkeypatch, tmp_path):
+        db = tmp_path / "ChatStorage.sqlite"
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE ZWACHATSESSION (
+                Z_PK INTEGER PRIMARY KEY,
+                ZCONTACTJID TEXT,
+                ZPARTNERNAME TEXT,
+                ZLASTMESSAGEDATE REAL
+            );
+            CREATE TABLE ZWAMESSAGE (
+                Z_PK INTEGER PRIMARY KEY,
+                ZCHATSESSION INTEGER
+            );
+            INSERT INTO ZWACHATSESSION VALUES (1, 'old@s.whatsapp.net', 'Old', 100.0);
+            INSERT INTO ZWACHATSESSION VALUES (2, 'mid@s.whatsapp.net', 'Mid', 500.0);
+            INSERT INTO ZWACHATSESSION VALUES (3, 'new@s.whatsapp.net', 'New', 900.0);
+        """)
+        conn.commit()
+        conn.close()
+
+        monkeypatch.setattr(self.tui, "find_existing_chatstorage", lambda: db)
+
+        # Insertion order is mixed
+        favs = [
+            {"jid": "mid@s.whatsapp.net", "name": "Mid"},
+            {"jid": "old@s.whatsapp.net", "name": "Old"},
+            {"jid": "new@s.whatsapp.net", "name": "New"},
+        ]
+        choices = self.tui._favorites_remove_choices(favs)
+        # questionary.Choice.value carries the JID
+        ordered = [c.value for c in choices]
+        assert ordered == [
+            "new@s.whatsapp.net",
+            "mid@s.whatsapp.net",
+            "old@s.whatsapp.net",
+        ], f"Expected DESC by last_ts, got {ordered}"
+
+    def test_missing_jid_sinks_to_bottom(self, monkeypatch, tmp_path):
+        db = tmp_path / "ChatStorage.sqlite"
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE ZWACHATSESSION (
+                Z_PK INTEGER PRIMARY KEY,
+                ZCONTACTJID TEXT,
+                ZPARTNERNAME TEXT,
+                ZLASTMESSAGEDATE REAL
+            );
+            CREATE TABLE ZWAMESSAGE (
+                Z_PK INTEGER PRIMARY KEY,
+                ZCHATSESSION INTEGER
+            );
+            INSERT INTO ZWACHATSESSION VALUES (1, 'live@s.whatsapp.net', 'Live', 100.0);
+        """)
+        conn.commit()
+        conn.close()
+
+        monkeypatch.setattr(self.tui, "find_existing_chatstorage", lambda: db)
+
+        favs = [
+            {"jid": "deleted@s.whatsapp.net", "name": "Deleted"},
+            {"jid": "live@s.whatsapp.net", "name": "Live"},
+        ]
+        choices = self.tui._favorites_remove_choices(favs)
+        # Live first, deleted last; deleted label flagged
+        assert choices[0].value == "live@s.whatsapp.net"
+        assert choices[-1].value == "deleted@s.whatsapp.net"
+        # The "no longer in local DB" marker is on the missing entry
+        # questionary.Choice.title is the label (varies across versions)
+        last_label = getattr(choices[-1], "title", None) or getattr(choices[-1], "label", None)
+        # Some questionary versions expose the visible text via `.title`
+        # as a list of (style, text) tuples. Coerce to string for matching.
+        assert "no longer in local DB" in str(last_label)
+
+    def test_no_db_falls_back_to_file_order(self, monkeypatch):
+        # find_existing_chatstorage returns None → no sort, original order kept
+        monkeypatch.setattr(self.tui, "find_existing_chatstorage", lambda: None)
+        favs = [
+            {"jid": "b@s.whatsapp.net", "name": "B"},
+            {"jid": "a@s.whatsapp.net", "name": "A"},
+        ]
+        choices = self.tui._favorites_remove_choices(favs)
+        assert [c.value for c in choices] == ["b@s.whatsapp.net", "a@s.whatsapp.net"]
+
+    def test_empty_favorites(self, monkeypatch):
+        monkeypatch.setattr(self.tui, "find_existing_chatstorage", lambda: None)
+        assert self.tui._favorites_remove_choices([]) == []
+
+
 class TestRunEnvExtra:
     """The MIKOSHI_SOURCES env var must reach the subprocess. Regression
     target: a refactor of ``run()`` would silently break multi-source

@@ -233,6 +233,44 @@ SOURCE_DISPLAY = {
 }
 
 
+def _favorites_remove_choices(favorites: list[dict]) -> list:
+    """Build the questionary.Choice list for "remove favorites".
+
+    Sorted newest-last-message-first using the local ChatStorage when
+    available. Favorites referencing chats that no longer exist in the
+    local DB sink to the bottom with a dim suffix so the user notices
+    them but they don't crowd out the active ones.
+    """
+    chat_last_ts: dict[str, float] = {}
+    db = find_existing_chatstorage()
+    if db:
+        try:
+            for row in list_chats_from_db(db):
+                if row.get("jid") and row.get("last_ts") is not None:
+                    chat_last_ts[row["jid"]] = float(row["last_ts"])
+        except Exception:
+            # Reading the DB shouldn't break the picker — degrade to file order
+            chat_last_ts = {}
+
+    def _sort_key(fav: dict) -> tuple[int, float]:
+        ts = chat_last_ts.get(fav.get("jid"))
+        if ts is None:
+            return (0, 0.0)  # missing → bottom
+        return (1, ts)       # present → ordered DESC by ts
+
+    sorted_favs = sorted(favorites, key=_sort_key, reverse=True)
+
+    choices = []
+    for f in sorted_favs:
+        label_text = (f.get("name") or f["jid"])[:35]
+        if f.get("jid") not in chat_last_ts and chat_last_ts:
+            label = f"{label_text}  ({f['jid']})  [no longer in local DB]"
+        else:
+            label = f"{label_text}  ({f['jid']})"
+        choices.append(Choice(label, f["jid"]))
+    return choices
+
+
 def _pick_sources(entries: list[dict]) -> list[str] | None:
     """Ask the user which sources to feed extraction.
 
@@ -976,10 +1014,7 @@ def action_favorites():
                 continue
             picked = questionary.checkbox(
                 "Select favorites to remove:",
-                choices=[
-                    Choice(f"{(f.get('name') or f['jid'])[:35]}  ({f['jid']})", f["jid"])
-                    for f in data["favorites"]
-                ],
+                choices=_favorites_remove_choices(data["favorites"]),
                 use_search_filter=True,
                 use_jk_keys=False,
             ).ask()
