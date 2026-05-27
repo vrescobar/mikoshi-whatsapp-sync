@@ -763,22 +763,29 @@ main() {
         if [[ "$FROM_PHASE" -ge 4 ]]; then
             EXTRACT_DIR="${TEMP_DIR}/extracted"
             CHAT_STORAGE="${EXTRACT_DIR}/ChatStorage.sqlite"
-            if [[ ! -f "$CHAT_STORAGE" ]]; then
-                error "--from-phase $FROM_PHASE needs $CHAT_STORAGE to exist."
-                exit 1
-            fi
-            # SQLite header sanity check (a killed Phase 3 leaves a zero-headered
-            # file; size > 0 isn't enough).
-            if ! python3 -c "
+            # Mac-live-only sync: extract reads from the Catalyst app DB
+            # under ~/Library/Group Containers/... — no decrypted iPhone
+            # backup is needed and CHAT_STORAGE may legitimately be absent.
+            if [[ -n "${MIKOSHI_SOURCES:-}" && ",${MIKOSHI_SOURCES}," != *",iphone_backup,"* ]]; then
+                log "  Mac-live-only sync (MIKOSHI_SOURCES=$MIKOSHI_SOURCES) — skipping iPhone ChatStorage check"
+            else
+                if [[ ! -f "$CHAT_STORAGE" ]]; then
+                    error "--from-phase $FROM_PHASE needs $CHAT_STORAGE to exist."
+                    exit 1
+                fi
+                # SQLite header sanity check (a killed Phase 3 leaves a zero-headered
+                # file; size > 0 isn't enough).
+                if ! python3 -c "
 import sys
 with open('$CHAT_STORAGE', 'rb') as f:
     sys.exit(0 if f.read(16) == b'SQLite format 3\\x00' else 1)
 " 2>/dev/null; then
-                error "$CHAT_STORAGE is corrupt (bad SQLite header) — likely from a killed Phase 3."
-                error "  rm '$CHAT_STORAGE' && ./mikoshi-whatsapp.sh sync --from-phase 3"
-                exit 1
+                    error "$CHAT_STORAGE is corrupt (bad SQLite header) — likely from a killed Phase 3."
+                    error "  rm '$CHAT_STORAGE' && ./mikoshi-whatsapp.sh sync --from-phase 3"
+                    exit 1
+                fi
+                log "  Reusing decrypted ChatStorage at $CHAT_STORAGE"
             fi
-            log "  Reusing decrypted ChatStorage at $CHAT_STORAGE"
         fi
     fi
 

@@ -381,3 +381,216 @@ class TestActionsTable:
                         "Sync", "Push", "sqlite"):
             assert any(keyword.lower() in lbl.lower() for lbl in labels), \
                 f"Missing menu entry containing {keyword!r}"
+
+
+# ─── multi-source: probe / picker / label helpers ──────────────────────────
+
+class TestProbeSources:
+    """``_probe_sources`` must never raise — the TUI header refresh path
+    calls it on every render."""
+
+    def setup_method(self):
+        sys.modules.pop("tui", None)
+        import tui
+        self.tui = tui
+
+    def test_returns_one_entry_per_registered_source(self):
+        result = self.tui._probe_sources()
+        # Exactly two sources registered today: iphone_backup + mac_live.
+        names = {e["name"] for e in result}
+        assert names == {"iphone_backup", "mac_live"}, \
+            f"unexpected source registry: {names}"
+
+    def test_each_entry_has_required_keys(self):
+        for entry in self.tui._probe_sources():
+            assert set(entry.keys()) >= {"name", "available", "snapshot", "error"}
+
+    def test_unavailable_source_reports_cleanly(self, monkeypatch, tmp_path):
+        # Force both sources to look unavailable — point MIKOSHI_BACKUP_DIR at
+        # a nonexistent path and override the mac_live root.
+        monkeypatch.setenv("MIKOSHI_BACKUP_DIR", str(tmp_path / "no-backup"))
+        from sources import mac_live
+        monkeypatch.setattr(mac_live, "GROUP_CONTAINER", tmp_path / "no-mac")
+        result = self.tui._probe_sources()
+        for entry in result:
+            # When the file isn't there, is_available() returns False and we
+            # don't try to snapshot — so error stays None and snapshot is None.
+            assert entry["available"] is False
+            assert entry["snapshot"] is None
+
+    def test_swallowed_snapshot_exception_lands_in_error(self, monkeypatch):
+        """If is_available() lies and snapshot() blows up, the probe must
+        capture the error string rather than crashing the header."""
+        from sources import IphoneBackupSource
+
+        def fake_available(self):
+            return True
+
+        def fake_snapshot(self):
+            raise RuntimeError("simulated lock contention")
+
+        monkeypatch.setattr(IphoneBackupSource, "is_available", fake_available)
+        monkeypatch.setattr(IphoneBackupSource, "snapshot", fake_snapshot)
+
+        result = self.tui._probe_sources()
+        by_name = {e["name"]: e for e in result}
+        iphone = by_name["iphone_backup"]
+        assert iphone["available"] is True
+        assert iphone["snapshot"] is None
+        assert "simulated lock contention" in iphone["error"]
+
+
+class TestSourcesSummaryRow:
+    def setup_method(self):
+        sys.modules.pop("tui", None)
+        import tui
+        self.tui = tui
+
+    def _entry(self, name, available=True, count=0, mtime="2026-05-28T18:42:00+00:00"):
+        from sources.base import SourceSnapshot
+        if not available:
+            return {"name": name, "available": False, "snapshot": None, "error": None}
+        snap = SourceSnapshot(
+            name=name,
+            db_path=Path("/tmp/fake.sqlite"),
+            mtime_iso=mtime,
+            message_count=count,
+            media_with_local_path=0,
+        )
+        return {"name": name, "available": True, "snapshot": snap, "error": None}
+
+    def test_empty(self):
+        assert "none" in self.tui._sources_summary_row([]).lower()
+
+    def test_both_available_shows_counts(self):
+        row = self.tui._sources_summary_row([
+            self._entry("iphone_backup", count=1_032_268),
+            self._entry("mac_live", count=303_642),
+        ])
+        # Both labels present
+        assert "iPhone bkp" in row
+        assert "Mac live" in row
+        # Compact counts (1.0M, 304k)
+        assert "1.0M" in row
+        assert "304k" in row
+        # Time formatted as HH:MM
+        assert "18:42" in row
+
+    def test_one_available_one_missing(self):
+        row = self.tui._sources_summary_row([
+            self._entry("iphone_backup", count=500_000),
+            self._entry("mac_live", available=False),
+        ])
+        assert "iPhone bkp" in row
+        # Missing source gets a dim "not linked" hint
+        assert "not linked" in row
+
+    def test_small_count_not_rounded_to_zero_k(self):
+        row = self.tui._sources_summary_row([
+            self._entry("iphone_backup", count=42),
+        ])
+        assert "42" in row
+        assert "k" not in row.replace("bkp", "")  # no spurious "k" suffix
+
+
+class TestPickSourcesNonInteractive:
+    """``_pick_sources`` short-circuits when there's nothing to ask. The
+    interactive 2-source branch is exercised by the action_sync wiring
+    but not unit-tested here (it requires a TTY)."""
+
+    def setup_method(self):
+        sys.modules.pop("tui", None)
+        import tui
+        self.tui = tui
+
+    def test_no_sources_falls_back_to_iphone(self):
+        result = self.tui._pick_sources([])
+        assert result == ["iphone_backup"]
+
+    def test_single_available_source_returns_it(self):
+        entries = [
+            {"name": "iphone_backup", "available": False, "snapshot": None, "error": None},
+            {"name": "mac_live", "available": True, "snapshot": None, "error": None},
+        ]
+        assert self.tui._pick_sources(entries) == ["mac_live"]
+
+    def test_only_iphone_available_returns_it(self):
+        entries = [
+            {"name": "iphone_backup", "available": True, "snapshot": None, "error": None},
+            {"name": "mac_live", "available": False, "snapshot": None, "error": None},
+        ]
+        assert self.tui._pick_sources(entries) == ["iphone_backup"]
+
+
+class TestFormatSourcesLabel:
+    def setup_method(self):
+        sys.modules.pop("tui", None)
+        import tui
+        self.tui = tui
+
+    def _entry(self, name, count):
+        from sources.base import SourceSnapshot
+        return {
+            "name": name,
+            "available": True,
+            "snapshot": SourceSnapshot(
+                name=name,
+                db_path=Path("/tmp/x.sqlite"),
+                mtime_iso="2026-05-28T18:42:00+00:00",
+                message_count=count,
+                media_with_local_path=0,
+            ),
+            "error": None,
+        }
+
+    def test_single_source_no_reconcile_suffix(self):
+        label = self.tui._format_sources_label(
+            ["iphone_backup"], [self._entry("iphone_backup", 100_000)]
+        )
+        assert "iPhone backup" in label
+        assert "reconciled" not in label
+
+    def test_two_sources_adds_reconcile_suffix(self):
+        entries = [
+            self._entry("iphone_backup", 1_032_268),
+            self._entry("mac_live", 303_642),
+        ]
+        label = self.tui._format_sources_label(["iphone_backup", "mac_live"], entries)
+        assert "iPhone backup" in label
+        assert "Mac live" in label
+        assert "reconciled" in label
+        assert "+" in label  # joiner
+
+
+class TestRunEnvExtra:
+    """The MIKOSHI_SOURCES env var must reach the subprocess. Regression
+    target: a refactor of ``run()`` would silently break multi-source
+    sync because the bash wrapper only switches on this env var."""
+
+    def setup_method(self):
+        sys.modules.pop("tui", None)
+        import tui
+        self.tui = tui
+
+    def test_env_extra_merged_into_subprocess_env(self, monkeypatch):
+        captured = {}
+
+        def fake_call(cmd, env=None, cwd=None):
+            captured["env"] = env
+            return 0
+
+        monkeypatch.setattr("subprocess.call", fake_call)
+        self.tui.run(["echo", "hi"], env_extra={"MIKOSHI_SOURCES": "iphone_backup,mac_live"})
+        assert captured["env"]["MIKOSHI_SOURCES"] == "iphone_backup,mac_live"
+
+    def test_no_env_extra_leaves_existing_env_untouched(self, monkeypatch):
+        captured = {}
+
+        def fake_call(cmd, env=None, cwd=None):
+            captured["env"] = env
+            return 0
+
+        monkeypatch.setattr("subprocess.call", fake_call)
+        monkeypatch.delenv("MIKOSHI_SOURCES", raising=False)
+        self.tui.run(["echo", "hi"])
+        assert "MIKOSHI_SOURCES" not in captured["env"]

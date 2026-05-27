@@ -224,6 +224,102 @@ def _best_from_phase() -> tuple[int, str]:
     return pipeline_state.best_from_phase(get_backup_dir(cfg))
 
 
+# ─── multi-source probing (iPhone backup + Mac live) ─────────────────────
+
+
+SOURCE_DISPLAY = {
+    "iphone_backup": "iPhone backup",
+    "mac_live": "Mac live",
+}
+
+
+def _pick_sources(entries: list[dict]) -> list[str] | None:
+    """Ask the user which sources to feed extraction.
+
+    Returns a list of source names ordered ``iphone_backup`` first
+    (matches the reconciler's tie-break priority). Returns ``None`` if
+    the user cancels.
+
+    Skips the picker entirely when there's no actual choice — single
+    available source or none at all (we fall back to iphone_backup so
+    the legacy single-source path keeps working).
+    """
+    available = [e["name"] for e in entries if e["available"]]
+    if not available:
+        return ["iphone_backup"]  # legacy fallback; phase-1 flow will error if needed
+    if len(available) == 1:
+        return available
+    # Two sources available — present a 3-way choice.
+    choice = questionary.select(
+        "Which sources should feed this sync?",
+        choices=[
+            Choice(
+                "🪢  Both — reconcile iPhone backup + Mac live (recommended)",
+                ["iphone_backup", "mac_live"],
+            ),
+            Choice("📱  iPhone backup only (full history; media authority)", ["iphone_backup"]),
+            Choice("💻  Mac live only (fast; ~3× shorter history; no iPhone needed)", ["mac_live"]),
+            Choice("← Cancel", "__cancel__"),
+        ],
+        instruction="(both will dedup by stanza id; almost zero overlap on Mac-only days)",
+    ).ask()
+    if choice in (None, "__cancel__"):
+        return None
+    return choice
+
+
+def _format_sources_label(selected: list[str], entries: list[dict]) -> str:
+    """Human-readable description of the selected sources, with msg counts
+    when the snapshot is available."""
+    by_name = {e["name"]: e for e in entries}
+    bits = []
+    for name in selected:
+        label = SOURCE_DISPLAY.get(name, name)
+        entry = by_name.get(name) or {}
+        snap = entry.get("snapshot")
+        if snap is not None:
+            count = snap.message_count
+            if count >= 1_000_000:
+                bits.append(f"{label} ({count / 1_000_000:.1f}M msgs)")
+            elif count >= 1_000:
+                bits.append(f"{label} ({count / 1_000:.0f}k msgs)")
+            else:
+                bits.append(f"{label} ({count} msgs)")
+        else:
+            bits.append(label)
+    if len(selected) > 1:
+        return " + ".join(bits) + " — reconciled"
+    return bits[0]
+
+
+def _probe_sources() -> list[dict]:
+    """Cheap availability + snapshot probe of every registered source.
+
+    Returns one dict per registered source with::
+
+        {"name": ..., "available": bool, "snapshot": SourceSnapshot|None, "error": str|None}
+
+    Never raises — the TUI header refresh path depends on this being
+    safe to call even when the Mac WhatsApp DB is mid-write or the
+    iPhone backup hasn't been produced yet.
+    """
+    try:
+        from sources import IphoneBackupSource, MacLiveSource
+    except ImportError:
+        return []
+    out = []
+    for src in (IphoneBackupSource(), MacLiveSource()):
+        entry = {"name": src.name, "available": False, "snapshot": None, "error": None}
+        try:
+            if src.is_available():
+                entry["available"] = True
+                entry["snapshot"] = src.snapshot()
+        except Exception as exc:
+            entry["error"] = str(exc)
+        out.append(entry)
+    return out
+
+
 # ─── status header (the heart of the new TUI mental model) ────────────────
 
 
@@ -279,6 +375,9 @@ def _gather_header_snapshot(cfg: dict) -> dict:
     cache = pipeline_state.load_cursor_cache(STATE_FILE)
     snap["cache"] = cache
     snap["drift"] = pipeline_state.detect_drift(cache, snap["server_cursors"])
+
+    # Multi-source: iPhone backup + Mac live availability + counts
+    snap["sources"] = _probe_sources()
     return snap
 
 
@@ -381,9 +480,43 @@ def render_header(snap: dict) -> None:
     table.add_row("Backup", backup_row)
     table.add_row("Decrypt", decrypt_row)
     table.add_row("Server", server_row)
+    table.add_row("Sources", _sources_summary_row(snap.get("sources", [])))
     table.add_row("State", state_row)
 
     console.print(Panel(table, title="[bold cyan]Mikoshi WhatsApp[/]", expand=False))
+
+
+def _sources_summary_row(sources: list[dict]) -> str:
+    """One-line "Sources" row for the header.
+
+    Both available  → "✓ iPhone bkp 1.0M msgs · ✓ Mac live 304k msgs (fresh 18:42)"
+    Only one        → "✓ iPhone bkp 1.0M msgs · ✗ Mac live (not linked)"
+    None            → "[dim]none detected[/]"
+    """
+    if not sources:
+        return "[dim]none detected[/]"
+    parts = []
+    for entry in sources:
+        label = "iPhone bkp" if entry["name"] == "iphone_backup" else "Mac live"
+        if entry["available"] and entry["snapshot"] is not None:
+            snap = entry["snapshot"]
+            n = snap.message_count
+            if n >= 1_000_000:
+                count = f"{n / 1_000_000:.1f}M"
+            elif n >= 1_000:
+                count = f"{n / 1_000:.0f}k"
+            else:
+                count = str(n)
+            mtime_short = snap.mtime_iso[11:16]  # "HH:MM" out of "YYYY-MM-DDTHH:MM:SS+00:00"
+            parts.append(f"[green]✓ {label}[/] {count} msgs [dim](fresh {mtime_short})[/]")
+        elif entry["available"]:
+            # available_but_snapshot_failed — Mac DB locked at probe time, etc.
+            err = entry.get("error") or "snapshot failed"
+            parts.append(f"[yellow]? {label}[/] [dim]({err[:40]})[/]")
+        else:
+            reason = "not linked" if entry["name"] == "mac_live" else "no backup yet"
+            parts.append(f"[dim]✗ {label} ({reason})[/]")
+    return "  ·  ".join(parts)
 
 
 # ─── plan screen ─────────────────────────────────────────────────────────
@@ -400,7 +533,13 @@ def _scope_jids_for_mode(mode: str, db: Path | None) -> set[str] | None:
     return None  # one-chat handled separately by the caller
 
 
-def render_plan(plan: pipeline_state.Plan, *, scope_label: str, source_label: str) -> None:
+def render_plan(
+    plan: pipeline_state.Plan,
+    *,
+    scope_label: str,
+    source_label: str,
+    sources_label: str | None = None,
+) -> None:
     body = Table(show_header=True, header_style="bold cyan", box=None)
     body.add_column("Chat", min_width=20)
     body.add_column("Cutoff", style="dim")
@@ -425,6 +564,8 @@ def render_plan(plan: pipeline_state.Plan, *, scope_label: str, source_label: st
         f"{len(nonzero)}/{len(plan.chats)} chats, "
         f"{plan.total_attachments} attachments\n"
     )
+    if sources_label:
+        summary = f"[bold]Feeds:[/]   {sources_label}\n" + summary
     if not plan.server_endpoint_present:
         summary += (
             "[yellow]⚠[/] Server [dim]/cursors[/] endpoint unreachable — "
@@ -497,11 +638,23 @@ def action_sync():
         if scope_choice == "favorites":
             extra_args.append("--favorites")
 
-    # Source pick — only when we have a meaningful choice.
+    # Sources feed — which data sources will the extractor merge?
+    # iPhone backup is the historical / media authority; Mac live is the
+    # fresh-but-shallow Catalyst app DB. The user can pick either or both.
+    sources_entries = snap.get("sources") or []
+    selected_sources = _pick_sources(sources_entries)
+    if selected_sources is None:
+        return  # user cancelled
+    mac_only = selected_sources == ["mac_live"]
+
+    # iPhone-side source pick — only meaningful when iphone_backup feeds
+    # extraction. Mac-only sync skips Phases 1-3 entirely.
     default_phase, default_label = _best_from_phase()
-    if default_phase != 1:
+    if mac_only:
+        phase = 4  # extract runs straight from Mac live DB; no decrypt
+    elif default_phase != 1:
         source_choice = questionary.select(
-            "How do you want to source?",
+            "How do you want to source the iPhone backup?",
             choices=[
                 Choice(f"⚡ {default_label}", default_phase),
                 Choice("🔄 Refresh from iPhone (incremental — fetches only new data)", 1),
@@ -524,7 +677,8 @@ def action_sync():
     source_label = {
         1: "iPhone (incremental backup → decrypt → extract → push)",
         3: "cached encrypted backup (re-decrypt → extract → push)",
-        4: "cached decrypted DB (extract → push only)",
+        4: ("cached decrypted DB (extract → push only)" if not mac_only
+            else "Mac live DB only (no iPhone needed)"),
     }[phase]
 
     # Plan (only possible when we already have a decrypted DB, i.e. phase ≥ 4).
@@ -541,10 +695,18 @@ def action_sync():
         "one-chat": jid_for_one or "one chat (manual)",
     }[scope_choice]
 
+    sources_label = _format_sources_label(selected_sources, sources_entries)
+
     if plan:
-        render_plan(plan, scope_label=scope_label_human, source_label=source_label)
+        render_plan(
+            plan,
+            scope_label=scope_label_human,
+            source_label=source_label,
+            sources_label=sources_label,
+        )
     else:
         console.print(Panel(
+            f"[bold]Feeds:[/]   {sources_label}\n"
             f"[bold]Source:[/]  {source_label}\n"
             f"[bold]Scope:[/]   {scope_label_human}\n"
             "[dim]Plan not available until ChatStorage has been decrypted.\n"
@@ -564,7 +726,15 @@ def action_sync():
         cmd += ["--from-phase", str(phase)]
     if skip_remote:
         cmd.append("--skip-remote-sync")
-    run(cmd)
+
+    # Only set MIKOSHI_SOURCES when the choice differs from the legacy
+    # single-iPhone-source default. Avoids changing the cron-path's
+    # behaviour by accident if someone invokes action_sync programmatically.
+    env_extra = None
+    if selected_sources != ["iphone_backup"]:
+        env_extra = {"MIKOSHI_SOURCES": ",".join(selected_sources)}
+
+    run(cmd, env_extra=env_extra)
 
     _invalidate_header_cache()
     pause()
