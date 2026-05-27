@@ -175,37 +175,6 @@ def decrypt_chatstorage(work_dir: Path) -> Path:
     return chat_db
 
 
-def decrypt_media(work_dir: Path) -> Path:
-    """
-    Decrypt the WhatsApp media domain into work_dir/media/.
-
-    Delegates to selective_decrypt.decrypt_whatsapp(..., incremental=True) so
-    files already on disk with fresher-or-equal mtime are skipped at the
-    file level. The previous wholesale "if media/ is non-empty, skip
-    everything" shortcut meant new attachments from later backups were
-    never fetched.
-    """
-    media_dir = work_dir / "media"
-    base = get_backup_dir()
-    device_backup = find_device_backup(base)
-    validate_backup_structure(device_backup)
-    passphrase = get_passphrase()
-
-    print("[INFO] Decrypting WhatsApp media (incremental — skips files already on disk)...")
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    def _do():
-        import selective_decrypt
-        selective_decrypt.decrypt_whatsapp(
-            backup_dir=device_backup,
-            password=passphrase,
-            out_dir=work_dir,
-            incremental=True,
-        )
-    _safe_decrypt("decrypting WhatsApp media", _do)
-    return media_dir
-
-
 def cmd_list_chats(args):
     import sqlite3
     from datetime import datetime, timezone

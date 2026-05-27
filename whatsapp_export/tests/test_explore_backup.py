@@ -222,44 +222,6 @@ class TestDecryptChatstorage:
         assert result.read_bytes() == b"decrypted db"
 
 
-# ─── decrypt_media no longer skips when media/ is non-empty ────────────────
-
-class TestDecryptMediaIncremental:
-    """Regression: the old decrypt_media() short-circuited the entire decrypt
-    if `media/` had any file in it. That meant once you decrypted once,
-    later iPhone backups would never bring in new attachments. The new
-    body delegates to selective_decrypt with incremental=True, which
-    skips per-file by mtime, not whole-domain by directory presence.
-    """
-
-    def test_does_not_skip_when_media_dir_is_non_empty(self, fake_backup_dir, monkeypatch):
-        work_dir = fake_backup_dir / "extracted"
-        media_dir = work_dir / "media"
-        media_dir.mkdir(parents=True)
-        # Pre-populate media/ with a stale file (the old code's footgun)
-        (media_dir / "stale.jpg").write_bytes(b"old contents")
-
-        monkeypatch.setattr(eb, "get_passphrase", lambda: "fake-pw")
-
-        called = {"n": 0, "kwargs": None}
-
-        def fake_decrypt_whatsapp(**kwargs):
-            called["n"] += 1
-            called["kwargs"] = kwargs
-            # Simulate the real call: it would write into out_dir/media/
-            from selective_decrypt import DecryptStats
-            return DecryptStats()
-
-        import selective_decrypt
-        monkeypatch.setattr(selective_decrypt, "decrypt_whatsapp", fake_decrypt_whatsapp)
-
-        eb.decrypt_media(work_dir)
-
-        assert called["n"] == 1, "decrypt_media must NOT skip when media/ is non-empty"
-        assert called["kwargs"]["incremental"] is True
-        assert called["kwargs"]["out_dir"] == work_dir
-
-
 # ─── decrypt_chatstorage validates structure ───────────────────────────────
 
 class TestDecryptValidatesStructure:
