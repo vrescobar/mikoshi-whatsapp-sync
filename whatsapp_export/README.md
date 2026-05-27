@@ -123,34 +123,25 @@ To verify it was stored:
 security find-generic-password -a iphone_backup -s iphone_backup_password
 ```
 
-### 4. Configure Remote SSH Sync (Optional)
+### 4. Configure Mikoshi push
 
-Create `~/.whatsapp_export.conf`:
+Push to the Mikoshi server happens over HTTP (`push_via_api.py`).
+Create `~/.mikoshi-ingest.conf`:
 
 ```bash
-cat > ~/.whatsapp_export.conf << 'EOF'
-SSH_HOST="your.server.com"
-SSH_USER="whatsapp_user"
-SSH_PATH="/home/whatsapp_user/exports"
-VERBOSE=false
+cat > ~/.mikoshi-ingest.conf << 'EOF'
+MIKOSHI_URL=https://your-mikoshi-host.example
+MIKOSHI_TOKEN=your-ingest-token
 EOF
+
+chmod 600 ~/.mikoshi-ingest.conf
 ```
 
-**Requirements for SSH:**
-- SSH key-based auth (not password)
-- Create SSH key if needed:
-  ```bash
-  ssh-keygen -t ed25519 -f ~/.ssh/id_whatsapp_export
-  ```
-- Add public key to server:
-  ```bash
-  ssh-copy-id -i ~/.ssh/id_whatsapp_export.pub whatsapp_user@your.server.com
-  ```
+Get the token from your Mikoshi server's
+`/accounts/<id>/ingestion/edit` page.
 
-Make config file readable only by you:
-```bash
-chmod 600 ~/.whatsapp_export.conf
-```
+> The legacy rsync flow (`~/.whatsapp_export.conf` with SSH_HOST etc.)
+> has been removed — push is now HTTP-only.
 
 ## Usage
 
@@ -283,17 +274,6 @@ security add-generic-password \
   -w 'YOUR_BACKUP_PASSWORD'
 ```
 
-### "rsync connection refused"
-
-Check SSH configuration:
-```bash
-# Test SSH connection
-ssh -i ~/.ssh/id_whatsapp_export whatsapp_user@your.server.com echo "OK"
-
-# Verify config file
-cat ~/.whatsapp_export.conf
-```
-
 ### "Pipeline is already running"
 
 Concurrent execution detected. Either:
@@ -341,18 +321,12 @@ If different location, we may need to update the extraction logic. Please share 
 Override defaults via environment:
 ```bash
 export VERBOSE=true
-export SSH_HOST="myserver.com"
 bash run_pipeline.sh
 ```
 
-### Disable Remote Sync
-
-Leave `SSH_HOST` empty in `~/.whatsapp_export.conf`:
-```bash
-# SSH_HOST=""  # Disabled
-SSH_USER="whatsapp_user"
-SSH_PATH="/path"
-```
+See `mikoshi-whatsapp.sh --help` for the full set of env vars
+(`MIKOSHI_BACKUP_DIR`, `MIKOSHI_SOURCES`, `MIKOSHI_TRUST_LOCAL_CURSOR`,
+etc.).
 
 ### Keep Multiple Backup Versions
 

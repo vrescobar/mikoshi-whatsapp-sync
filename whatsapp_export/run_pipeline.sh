@@ -39,7 +39,6 @@ EXPORTS_DIR="${SCRIPT_DIR}/exports"
 ATTACHMENTS_DIR="${SCRIPT_DIR}/exports/attachments"
 STATE_FILE="${SCRIPT_DIR}/.sync_state.json"
 LOCK_FILE="${SCRIPT_DIR}/.pipeline.lock"
-CONFIG_FILE="${HOME}/.whatsapp_export.conf"                      # legacy rsync (deprecated)
 INGEST_CONF="${MIKOSHI_INGEST_CONF:-${HOME}/.mikoshi-ingest.conf}"
 EXTRACTOR="${SCRIPT_DIR}/extract_messages.py"
 VALIDATOR="${SCRIPT_DIR}/validate_export.py"
@@ -224,12 +223,6 @@ if [[ -f "$INGEST_CONF" ]]; then
 else
     warn "$INGEST_CONF not found. Push to Mikoshi will be skipped (extraction still runs)."
     warn "To enable push, create the file with: MIKOSHI_URL=... and MIKOSHI_TOKEN=..."
-fi
-
-# Legacy rsync config kept for back-compat. Silently source if present.
-if [[ -f "$CONFIG_FILE" ]]; then
-    # shellcheck disable=SC1090
-    source "$CONFIG_FILE"
 fi
 
 # ─── lock with PID liveness check ────────────────────────────────────────

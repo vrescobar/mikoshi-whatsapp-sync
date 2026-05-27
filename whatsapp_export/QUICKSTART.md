@@ -60,25 +60,22 @@ security add-generic-password \
 **Don't remember the password?**
 - Set a new one: iPhone → Settings → [Your Name] → iCloud → iCloud Backup → Choose Backup Options → Backup Password
 
-## Step 5: (Optional) Configure Remote Sync
+## Step 5: Configure Mikoshi push
 
-If you want to sync to a remote server, create `~/.whatsapp_export.conf`:
+Create `~/.mikoshi-ingest.conf` (referenced by `run_pipeline.sh`):
 
 ```bash
-cat > ~/.whatsapp_export.conf << 'EOF'
-SSH_HOST="your.server.com"
-SSH_USER="your_username"
-SSH_PATH="/path/to/exports"
+cat > ~/.mikoshi-ingest.conf << 'EOF'
+MIKOSHI_URL=https://your-mikoshi-host.example
+MIKOSHI_TOKEN=your-ingest-token
 EOF
 
-chmod 600 ~/.whatsapp_export.conf
+chmod 600 ~/.mikoshi-ingest.conf
 ```
 
-**You must have SSH key-based auth set up.** If you don't:
-```bash
-ssh-keygen -t ed25519 -f ~/.ssh/id_whatsapp_export
-ssh-copy-id -i ~/.ssh/id_whatsapp_export.pub your_username@your.server.com
-```
+The token comes from the Mikoshi server's `/accounts/<id>/ingestion/edit`
+page. The legacy rsync flow that older versions of this doc described
+has been removed — push is now HTTP-only via `push_via_api.py`.
 
 ## Step 6: Run the Pipeline!
 

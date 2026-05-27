@@ -10,7 +10,6 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${HOME}/.whatsapp_export.conf"           # legacy rsync flow
 INGEST_CONF="${MIKOSHI_INGEST_CONF:-${HOME}/.mikoshi-ingest.conf}"  # HTTP API flow
 
 pass() {
@@ -250,12 +249,6 @@ PYEOF
             fail "Mikoshi token rejected — see message above"
         fi
     fi
-elif [[ -f "$CONFIG_FILE" ]]; then
-    # Legacy rsync flow — still supported but discouraged
-    source "$CONFIG_FILE"
-    warn "Legacy rsync config detected: $CONFIG_FILE"
-    info "  Project now uses HTTP push (push_via_api.py). Migrate when convenient:"
-    info "  see whatsapp_export/push_via_api.py for MIKOSHI_URL/MIKOSHI_TOKEN."
 else
     warn "No Mikoshi config found"
     echo ""
