@@ -4,6 +4,8 @@ Automated, secure pipeline to extract WhatsApp conversation history from iPhone 
 
 **Status**: WiFi Sync enabled on device, data extraction from encrypted backup, secure local processing, remote sync via rsync+SSH.
 
+> **Looking for "how do I use this"?** See [`docs/USER_GUIDE.md`](../docs/USER_GUIDE.md), or open the TUI and pick **📚 Help** for an in-app cheatsheet covering every menu action, every CLI flag, the two-source model, cursors, and the LaunchAgent.
+
 ## Overview
 
 This pipeline:

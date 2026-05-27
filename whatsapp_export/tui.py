@@ -1323,6 +1323,159 @@ def action_toggle_preserve_extracted():
     pause()
 
 
+# ─── help / cheatsheet ────────────────────────────────────────────────────
+
+
+HELP_TOPICS = [
+    ("📖  Main menu actions — what each one does", "actions"),
+    ("⚡  Sync command-line flags (mikoshi-whatsapp.sh)", "cli"),
+    ("🪢  Two-source model: iPhone backup + Mac live", "sources"),
+    ("📍  What is a cursor? (and drift states)", "cursor"),
+    ("⏰  LaunchAgent: how the daily auto-sync works", "schedule"),
+    ("📂  Where the user guide lives (in-repo doc)", "guide"),
+]
+
+
+def action_help():
+    """One-screen cheatsheet covering every menu action, every wrapper
+    flag, the two-source model, cursors, and the LaunchAgent. Picks a
+    topic, prints a Rich panel, returns to the topic list. No
+    interactivity beyond the picker — read-only documentation."""
+    while True:
+        choice = questionary.select(
+            "Help topics:",
+            choices=[Choice(label, key) for label, key in HELP_TOPICS]
+                    + [Choice("← Back", "__back__")],
+        ).ask()
+        if choice in (None, "__back__"):
+            return
+        console.print(Panel(
+            _help_panel(choice),
+            title=f"[bold cyan]📚  {dict(HELP_TOPICS)[choice].split('  ', 1)[-1]}[/]",
+            expand=False,
+        ))
+        pause()
+
+
+def _help_panel(topic: str) -> str:
+    """Render a help topic as Rich-formatted prose. Lives in code so it
+    stays in lockstep with the TUI's actual behaviour — when an action
+    changes, the cheatsheet next to it changes in the same commit."""
+    if topic == "actions":
+        return (
+            "[bold]🔂  Sync[/] — the centerpiece. Pick scope (favorites / all "
+            "chats / one chat), pick sources (iPhone backup, Mac live, or "
+            "both reconciled), see a plan, then run.\n\n"
+            "[bold]📊  Inspect[/] — read-only views: list local chats, view "
+            "per-chat drift between local cache and server cursors, see "
+            "config status.\n\n"
+            "[bold]📌  Manage favorites[/] — pick chats to sync incrementally "
+            "(stored in ~/.mikoshi-favorites.json). Plain `sync` uses these "
+            "automatically when the file exists.\n\n"
+            "[bold]⏰  Schedule automatic sync[/] — install / change / remove "
+            "a daily LaunchAgent that runs `mikoshi-whatsapp.sh sync` at a "
+            "user-picked time (Mac local).\n\n"
+            "[bold]⚙   Setup & verify[/] — run setup checks, validate "
+            "Mikoshi auth against /cursor, edit ~/.mikoshi-ingest.conf, "
+            "verify backup integrity (1-4 levels of thoroughness).\n\n"
+            "[bold]🛠   Tools[/] — advanced: push an existing export to "
+            "Mikoshi, refresh local backup only (no push), drop into the "
+            "ChatStorage sqlite shell."
+        )
+    if topic == "cli":
+        return (
+            "[bold]./mikoshi-whatsapp.sh <subcommand>[/]\n\n"
+            "[bold]tui[/]   open the interactive menu (default).\n"
+            "[bold]sync[/]  non-interactive incremental sync.\n"
+            "   • Default with no flags: auto-detects favorites + sources,\n"
+            "     picks the cheapest start phase, exits rc=0 if there's\n"
+            "     nothing to sync (cron-friendly).\n"
+            "   • [cyan]--all[/]               ignore favorites, sync all chats.\n"
+            "   • [cyan]--full[/]              full re-sync from scratch.\n"
+            "   • [cyan]--chat-jid <jid>[/]    restrict to one chat.\n"
+            "   • [cyan]--since <YYYY-MM-DD>[/] only messages on/after.\n"
+            "   • [cyan]--skip-remote-sync[/]  extract but don't push.\n"
+            "   • [cyan]--sources <list>[/]    comma-separated source names\n"
+            "                          (iphone_backup, mac_live). Default:\n"
+            "                          auto-detect.\n\n"
+            "[bold]status[/]          print config + backup + cursor state.\n"
+            "[bold]test-auth[/]       validate MIKOSHI_TOKEN against /cursor.\n"
+            "[bold]reset-backup[/]    wipe partial iPhone backup directory.\n"
+            "[bold]verify-backup[/]   integrity check (--level 1-4).\n"
+            "[bold]purge-extracted[/] shred decrypted ChatStorage + media.\n"
+        )
+    if topic == "sources":
+        return (
+            "Two sources of WhatsApp data this client can read:\n\n"
+            "[bold]iphone_backup[/] — the decrypted ChatStorage.sqlite from\n"
+            "  an iPhone backup. Slow to refresh (full iPhone backup + decrypt)\n"
+            "  but covers the entire message history the iPhone has ever held,\n"
+            "  including media bytes on disk.\n\n"
+            "[bold]mac_live[/] — the live ChatStorage at\n"
+            "  ~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/\n"
+            "  written by the Mac Catalyst WhatsApp app. Always fresh (Multi-\n"
+            "  Device propagation is near-real-time) but ~3× shorter history\n"
+            "  and almost no media bytes (mostly thumbnails / cloud-fetch\n"
+            "  metadata).\n\n"
+            "The reconciler dedups by [bold]ZSTANZAID[/] (stable across\n"
+            "devices) → fingerprint fallback (rounded ts + JIDs + text hash)\n"
+            "for null-stanza rows. Provenance: when both sources see the\n"
+            "same message, iPhone's row wins for attachments (it's the\n"
+            "media authority).\n\n"
+            "Full spec: docs/design/sources-and-reconciliation.md"
+        )
+    if topic == "cursor":
+        return (
+            "A [bold]cursor[/] is one chat's commit watermark — \"the latest\n"
+            "message we've already pushed for this chat.\" Two stores:\n\n"
+            "  • [bold]Server-side[/] (Mikoshi's [cyan]ingestion_cursor[/] table) — the\n"
+            "    canonical, authoritative value. The TUI fetches it via\n"
+            "    GET /api/ingest/v1/cursor.\n"
+            "  • [bold]Local cache[/] ([cyan].sync_state.json[/]) — a mirror of the\n"
+            "    server's view. Read-only after a successful commit; never\n"
+            "    advances ahead of the server.\n\n"
+            "[bold]Drift states[/] in the header / Inspect screen:\n"
+            "  • [green]IN_SYNC[/] — local cache matches server.\n"
+            "  • [cyan]SERVER_AHEAD[/] — another client pushed; refresh.\n"
+            "  • [yellow]NO_LOCAL_RECORD[/] — server tracks this chat but we\n"
+            "    don't yet (fresh install / wiped cache).\n"
+            "  • [dim]NO_SERVER_RECORD[/] — local has data, server hasn't seen\n"
+            "    it yet (next push will create the cursor).\n"
+            "  • [red]LOCAL_AHEAD[/] — should not happen post-redesign;\n"
+            "    indicates a bug or a manual edit of .sync_state.json."
+        )
+    if topic == "schedule":
+        return (
+            "The Schedule action manages a single LaunchAgent at\n"
+            "[cyan]~/Library/LaunchAgents/com.mikoshi.sync.plist[/].\n\n"
+            "When enabled, launchd runs [bold]./mikoshi-whatsapp.sh sync[/]\n"
+            "at the user-picked time (Mac local time, daily). Sync uses\n"
+            "auto-detected sources + favorites, so the agent does the right\n"
+            "thing without any further configuration.\n\n"
+            "Why launchd vs cron: launchd survives sleep, recovers missed\n"
+            "runs after wake, and integrates with macOS's power-management.\n"
+            "Cron still works if the user prefers — see README's manual\n"
+            "snippet — but the TUI assistant only manages the LaunchAgent.\n\n"
+            "Logs land under [cyan]logs/launchagent.out.log[/] and\n"
+            "[cyan]logs/launchagent.err.log[/]; per-run cron-style logs\n"
+            "appear at [cyan]logs/cron_<timestamp>.log[/]."
+        )
+    if topic == "guide":
+        return (
+            "Deeper documentation lives in-repo at:\n\n"
+            "  • [cyan]docs/USER_GUIDE.md[/]  step-by-step setup + workflow\n"
+            "  • [cyan]docs/design/sources-and-reconciliation.md[/]  source model\n"
+            "  • [cyan]docs/design/accounts.md[/]  server-side ingestion + cursors\n"
+            "  • [cyan]README.md[/]  project overview + quick start\n"
+            "  • [cyan]REDESIGN.md[/]  why the TUI looks the way it does\n"
+            "\n"
+            "Run from the project root:\n"
+            "  [bold]./mikoshi-whatsapp.sh --help[/]  for the wrapper's flag\n"
+            "  cheatsheet (same content as the 'CLI flags' topic in this menu)."
+        )
+    return "Unknown topic."
+
+
 # ─── scheduled automatic sync (LaunchAgent) ──────────────────────────────
 
 
@@ -1605,6 +1758,7 @@ ACTIONS = [
     ("⏰  Schedule automatic sync (LaunchAgent)", "schedule"),
     ("⚙   Setup & verify (Verify setup, auth, config)", "setup"),
     ("🛠   Tools (Push, sqlite, advanced)", "tools"),
+    ("📚  Help — cheatsheet & docs",      "help"),
 ]
 
 _ACTION_DISPATCH = {
@@ -1614,6 +1768,7 @@ _ACTION_DISPATCH = {
     "schedule": action_schedule,
     "setup": action_setup_verify,
     "tools": action_tools,
+    "help": lambda: action_help(),
 }
 
 

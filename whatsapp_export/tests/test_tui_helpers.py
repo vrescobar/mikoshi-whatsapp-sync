@@ -378,9 +378,70 @@ class TestActionsTable:
         for 'Push' or 'sqlite' via questionary's filter find a route."""
         labels = [label for label, _ in self.tui.ACTIONS]
         for keyword in ("status", "Verify", "List chats", "Manage favorites",
-                        "Sync", "Push", "sqlite"):
+                        "Sync", "Push", "sqlite", "Help"):
             assert any(keyword.lower() in lbl.lower() for lbl in labels), \
                 f"Missing menu entry containing {keyword!r}"
+
+
+class TestHelpAction:
+    """The Help / Cheatsheet action documents every TUI feature and
+    every wrapper flag in plain language. The renderer is data-driven
+    — each topic must produce non-empty content that mentions the
+    feature the topic claims to cover."""
+
+    def setup_method(self):
+        sys.modules.pop("tui", None)
+        import tui
+        self.tui = tui
+
+    def test_all_topics_render_non_empty(self):
+        for label, key in self.tui.HELP_TOPICS:
+            content = self.tui._help_panel(key)
+            assert len(content) > 60, f"Topic {key!r} renders too little: {content!r}"
+
+    def test_actions_topic_mentions_each_action_label(self):
+        content = self.tui._help_panel("actions")
+        # Each top-level action should be documented; key phrases match
+        # the labels (case-insensitive) so a renamed action breaks the
+        # cheatsheet in the same PR.
+        for keyword in ("Sync", "Inspect", "favorites", "Schedule",
+                        "Setup & verify", "Tools"):
+            assert keyword in content, \
+                f"Help topic 'actions' does not mention {keyword!r}"
+
+    def test_cli_topic_lists_subcommands_and_flags(self):
+        content = self.tui._help_panel("cli")
+        for keyword in ("tui", "sync", "test-auth", "reset-backup",
+                        "verify-backup", "--all", "--full", "--sources",
+                        "--skip-remote-sync"):
+            assert keyword in content, \
+                f"Help topic 'cli' is missing {keyword!r}"
+
+    def test_sources_topic_explains_both_sources(self):
+        content = self.tui._help_panel("sources")
+        assert "iphone_backup" in content
+        assert "mac_live" in content
+        assert "ZSTANZAID" in content or "stanza" in content.lower()
+
+    def test_cursor_topic_lists_drift_states(self):
+        content = self.tui._help_panel("cursor")
+        for state in ("IN_SYNC", "LOCAL_AHEAD", "SERVER_AHEAD",
+                      "NO_LOCAL_RECORD", "NO_SERVER_RECORD"):
+            assert state in content, \
+                f"Cursor help missing drift state {state!r}"
+
+    def test_schedule_topic_mentions_plist_path(self):
+        content = self.tui._help_panel("schedule")
+        assert "com.mikoshi.sync.plist" in content
+        assert "LaunchAgent" in content
+
+    def test_unknown_topic_returns_placeholder(self):
+        # Defensive: a stray topic name shouldn't crash the renderer
+        assert self.tui._help_panel("__bogus__") == "Unknown topic."
+
+    def test_help_action_registered_in_dispatch(self):
+        assert "help" in self.tui._ACTION_DISPATCH
+        assert callable(self.tui._ACTION_DISPATCH["help"])
 
 
 # ─── multi-source: probe / picker / label helpers ──────────────────────────
