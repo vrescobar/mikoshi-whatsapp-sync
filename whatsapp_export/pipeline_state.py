@@ -74,6 +74,11 @@ class ChatCursor:
     committed_through_ts: str | None = None        # ISO-8601, UTC
     committed_through_external_id: str | None = None  # "ios:<Z_PK>"
     source: str = SOURCE_SERVER
+    # Number of messages the server has committed for this chat. The
+    # current Mikoshi server includes it in the /cursor response; we
+    # surface it on the cursor so the TUI's post-sync verification can
+    # compute "how many new messages landed this run" by diffing.
+    message_count: int | None = None
 
     def iso_to_ios(self) -> float:
         return iso_to_ios_ts(self.committed_through_ts)
@@ -449,6 +454,12 @@ def _parse_cursors_payload(data: object) -> dict[str, ChatCursor]:
             jid = entry.get("chat_jid") or entry.get("jid")
             if not jid:
                 continue
+            raw_count = entry.get("message_count")
+            mc: int | None
+            try:
+                mc = int(raw_count) if raw_count is not None else None
+            except (TypeError, ValueError):
+                mc = None
             cursors[jid] = ChatCursor(
                 committed_through_ts=(
                     entry.get("last_message_at")
@@ -459,6 +470,7 @@ def _parse_cursors_payload(data: object) -> dict[str, ChatCursor]:
                     entry.get("last_external_id") or entry.get("external_id")
                 ),
                 source=SOURCE_SERVER,
+                message_count=mc,
             )
         return cursors
 

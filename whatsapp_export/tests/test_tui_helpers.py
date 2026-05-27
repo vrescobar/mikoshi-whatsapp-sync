@@ -562,6 +562,124 @@ class TestFormatSourcesLabel:
         assert "+" in label  # joiner
 
 
+class TestVerifySyncResult:
+    """The post-sync verification Panel uses before/after cursors and
+    the plan estimate to give the user a confidence verdict."""
+
+    def setup_method(self):
+        sys.modules.pop("tui", None)
+        import tui
+        self.tui = tui
+
+    def _cursor(self, ts="2026-05-28T18:00:00Z", count=10):
+        from pipeline_state import ChatCursor
+        return ChatCursor(committed_through_ts=ts, message_count=count)
+
+    def _plan(self, total_messages: int):
+        from pipeline_state import Plan, ChatPlanEntry
+        # One chat carrying the requested total — keeps the test compact.
+        entry = ChatPlanEntry(
+            jid="a@s.whatsapp.net", name="A", cutoff_ts=None,
+            new_messages=total_messages, new_attachments=0,
+        )
+        return Plan(scope="all", chats=[entry], server_endpoint_present=True)
+
+    def _panel_text(self, panel) -> str:
+        from rich.console import Console
+        from io import StringIO
+        buf = StringIO()
+        Console(file=buf, force_terminal=False, width=120, no_color=True).print(panel)
+        return buf.getvalue()
+
+    def test_non_zero_exit_is_red_failure(self):
+        out = self._panel_text(self.tui._verify_sync_result(
+            before_cursors={}, after_cursors={}, plan=self._plan(0),
+            exit_code=42, skip_remote=False,
+        ))
+        assert "Sync failed" in out
+        assert "42" in out
+
+    def test_skip_remote_shows_blue_local_only(self):
+        out = self._panel_text(self.tui._verify_sync_result(
+            before_cursors={}, after_cursors={}, plan=self._plan(15),
+            exit_code=0, skip_remote=True,
+        ))
+        assert "nothing pushed" in out
+        assert "15" in out
+
+    def test_server_unreachable_after_sync_yellow(self):
+        out = self._panel_text(self.tui._verify_sync_result(
+            before_cursors=None, after_cursors=None, plan=self._plan(10),
+            exit_code=0, skip_remote=False,
+        ))
+        assert "server cursor unreachable" in out
+
+    def test_close_match_is_green_confirmed(self):
+        before = {"a@s.whatsapp.net": self._cursor(count=100)}
+        after = {"a@s.whatsapp.net": self._cursor(count=110)}
+        out = self._panel_text(self.tui._verify_sync_result(
+            before_cursors=before, after_cursors=after, plan=self._plan(10),
+            exit_code=0, skip_remote=False,
+        ))
+        assert "Sync confirmed" in out
+        assert "10" in out
+
+    def test_significantly_low_count_is_yellow_mismatch(self):
+        before = {"a@s.whatsapp.net": self._cursor(count=100)}
+        after = {"a@s.whatsapp.net": self._cursor(count=102)}  # only 2 landed
+        out = self._panel_text(self.tui._verify_sync_result(
+            before_cursors=before, after_cursors=after, plan=self._plan(50),
+            exit_code=0, skip_remote=False,
+        ))
+        assert "Mismatch" in out
+        assert "2" in out
+        assert "50" in out
+
+    def test_no_messages_to_push_is_clean_ok(self):
+        before = {"a@s.whatsapp.net": self._cursor(count=100)}
+        after = {"a@s.whatsapp.net": self._cursor(count=100)}
+        out = self._panel_text(self.tui._verify_sync_result(
+            before_cursors=before, after_cursors=after, plan=self._plan(0),
+            exit_code=0, skip_remote=False,
+        ))
+        assert "no new messages" in out
+
+
+class TestCountNewCommitted:
+    def setup_method(self):
+        sys.modules.pop("tui", None)
+        import tui
+        self.tui = tui
+
+    def _cur(self, count=None):
+        from pipeline_state import ChatCursor
+        return ChatCursor(message_count=count)
+
+    def test_basic_delta(self):
+        before = {"a": self._cur(10), "b": self._cur(5)}
+        after = {"a": self._cur(15), "b": self._cur(5)}
+        assert self.tui._count_new_committed(before, after) == 5
+
+    def test_new_chat_counts_full(self):
+        """Chat appearing only in `after` contributes its full count
+        (treated as a brand-new chat the server just learned about)."""
+        before = {"a": self._cur(10)}
+        after = {"a": self._cur(10), "newchat": self._cur(7)}
+        assert self.tui._count_new_committed(before, after) == 7
+
+    def test_negative_delta_ignored(self):
+        """Append-only server should never go down, but if a cursor
+        somehow regresses we don't subtract."""
+        before = {"a": self._cur(10)}
+        after = {"a": self._cur(5)}
+        assert self.tui._count_new_committed(before, after) == 0
+
+    def test_missing_message_count_skipped(self):
+        before = {"a": self._cur(None)}
+        after = {"a": self._cur(None)}
+        assert self.tui._count_new_committed(before, after) == 0
+
+
 class TestRenderPlanMultiSource:
     """When ``ChatPlanEntry.per_source`` is populated, the per-chat
     table grows extra columns. Renders to an in-memory Console so we

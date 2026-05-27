@@ -847,10 +847,136 @@ def action_sync():
     if selected_sources != ["iphone_backup"]:
         env_extra = {"MIKOSHI_SOURCES": ",".join(selected_sources)}
 
-    run(cmd, env_extra=env_extra)
+    # Snapshot server cursors before the run so we can compute the diff
+    # post-sync and tell the user how many messages actually landed.
+    before_cursors = snap.get("server_cursors")  # may be None if endpoint unreachable
+
+    exit_code = run(cmd, env_extra=env_extra)
 
     _invalidate_header_cache()
+    # Re-fetch server cursors and render the verification panel.
+    cfg = load_ingest_conf()
+    after_cursors = pipeline_state.fetch_server_cursors(
+        cfg.get("MIKOSHI_URL", "").rstrip("/"),
+        cfg.get("MIKOSHI_TOKEN", ""),
+        timeout=5.0,
+    )
+    console.print(_verify_sync_result(
+        before_cursors=before_cursors,
+        after_cursors=after_cursors,
+        plan=plan,
+        exit_code=exit_code,
+        skip_remote=skip_remote,
+    ))
     pause()
+
+
+def _verify_sync_result(
+    *,
+    before_cursors: dict | None,
+    after_cursors: dict | None,
+    plan: pipeline_state.Plan | None,
+    exit_code: int,
+    skip_remote: bool,
+) -> Panel:
+    """Build the post-sync result Panel.
+
+    Logic:
+    - Non-zero exit code → red ✗ with the exit code surfaced.
+    - skip_remote → blue "extraction succeeded, push skipped".
+    - Server unreachable before/after → yellow ⚠ ("can't verify
+      server-side; the pipeline reported success though").
+    - Comparing before vs after cursor counts:
+        * Sum of per-chat (after.message_count - before.message_count)
+          gives the number of new rows the server actually committed.
+        * Compare to plan.total_messages (what we expected to push).
+        * ≥95% match → green ✓; less → yellow ⚠.
+    """
+    if exit_code != 0:
+        return Panel(
+            f"[red]✗ Sync failed[/] (exit code {exit_code}).\n"
+            "[dim]Scroll back through the log above for the root cause.[/]",
+            title="[bold red]Result[/]", expand=False,
+        )
+
+    if skip_remote:
+        local = (
+            f"{plan.total_messages} messages reconciled locally"
+            if plan else "extraction succeeded"
+        )
+        return Panel(
+            f"[cyan]ℹ Sync OK; nothing pushed[/] (--skip-remote-sync).\n"
+            f"  {local}.\n"
+            "[dim]Re-run without skip to push to Mikoshi.[/]",
+            title="[bold]Result[/]", expand=False,
+        )
+
+    if after_cursors is None:
+        return Panel(
+            "[yellow]⚠ Sync completed but server cursor unreachable[/] — "
+            "can't independently confirm what landed.\n"
+            "[dim]Re-open the TUI in a minute; the header will probe again.[/]",
+            title="[bold]Result[/]", expand=False,
+        )
+
+    # Cursor-diff path: count new rows on the server.
+    new_committed = _count_new_committed(before_cursors or {}, after_cursors)
+    expected = plan.total_messages if plan else None
+
+    if expected is None:
+        return Panel(
+            f"[green]✓ Sync OK[/] — server tracks {len(after_cursors)} chats now.\n"
+            f"  {new_committed} new message(s) committed across all chats.",
+            title="[bold]Result[/]", expand=False,
+        )
+
+    # The plan estimate is an UPPER BOUND (it counts pre-dedup messages
+    # from each source). new_committed reflects post-dedup server reality.
+    # A 0.95 floor catches the "push truly succeeded" case; below that
+    # something was likely dropped.
+    if expected == 0:
+        verdict = "[green]✓ Sync OK[/] — no new messages to push."
+    elif new_committed >= 0.95 * expected:
+        verdict = (
+            f"[green]✓ Sync confirmed[/] — server committed "
+            f"{new_committed} new message(s) (plan estimated {expected})."
+        )
+    else:
+        verdict = (
+            f"[yellow]⚠ Mismatch[/] — server committed {new_committed} new "
+            f"message(s) but plan estimated {expected}.\n"
+            "[dim]Causes: cross-source dedup absorbed duplicates, the push "
+            "was partial, or some chats hit append-only cursor protection. "
+            "Re-running the sync should be safe.[/]"
+        )
+    return Panel(verdict, title="[bold]Result[/]", expand=False)
+
+
+def _count_new_committed(
+    before: dict,
+    after: dict,
+) -> int:
+    """Sum of per-chat (after.message_count - before.message_count).
+
+    Both maps key JID → ChatCursor-shaped record. Chats not present in
+    `before` count their full after.message_count (they're new chats).
+    Cursors with `message_count=None` (very old server response shape)
+    contribute 0; we don't have enough info to compute a delta and would
+    rather under-report than mislead.
+    """
+    total = 0
+    for jid, cur in after.items():
+        cur_count = getattr(cur, "message_count", None)
+        if cur_count is None:
+            continue
+        prev = before.get(jid)
+        prev_count = getattr(prev, "message_count", None) if prev else 0
+        if prev_count is None:
+            prev_count = 0
+        delta = int(cur_count) - int(prev_count)
+        if delta > 0:
+            total += delta
+    return total
 
 
 def action_inspect():
