@@ -117,8 +117,12 @@ class ChatPlanEntry:
     jid: str
     name: str | None
     cutoff_ts: str | None      # the timestamp we're starting from (max of local cache vs server cursor)
-    new_messages: int          # rows past the cutoff
+    new_messages: int          # rows past the cutoff; merged-unique estimate when multi-source
     new_attachments: int       # rows past the cutoff that have a ZWAMEDIAITEM
+    # per_source[name] = {"new_messages": int, "max_ts": iso|None} when the
+    # plan was computed against more than one source. None for single-source
+    # plans so the existing renderer / tests don't have to special-case it.
+    per_source: dict[str, dict] | None = None
 
 
 @dataclass
@@ -630,6 +634,7 @@ def compute_plan(
     cache: CursorCache,
     server: dict[str, ChatCursor] | None,
     scope_jids: set[str] | None = None,
+    extra_dbs: dict[str, Path] | None = None,
 ) -> Plan:
     """
     Without extracting anything, count how many messages would be pushed
@@ -640,6 +645,15 @@ def compute_plan(
     rule extract_messages.py applies in incremental mode.
 
     `scope_jids=None` = "all chats". Anything else restricts to that set.
+
+    `extra_dbs` runs the same per-chat count against additional ChatStorage
+    DBs and exposes the breakdown on ``ChatPlanEntry.per_source``. The
+    canonical use case is a multi-source plan with the Mac live DB as an
+    extra. ``new_messages`` becomes ``max(per_source.values())`` — an
+    upper-bound estimate of merged unique; the server's commit-time dedup
+    is authoritative. Each extra DB is opened read-only via
+    ``?mode=ro&immutable=1`` so a live writer (the Catalyst app on
+    ``mac_live``) doesn't see our reads.
     """
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
@@ -685,15 +699,29 @@ def compute_plan(
             """,
             (chat["chat_pk"], cutoff_ios_ts),
         ).fetchone()[0]
+        primary_count = int(msg_count or 0)
+        entry_per_source: dict[str, dict] | None = None
+        if extra_dbs:
+            # The primary DB is "iphone_backup" by convention (the existing
+            # single-source path always reads it). Record its count under
+            # that name so the per-source breakdown is symmetric.
+            entry_per_source = {
+                "iphone_backup": {"new_messages": primary_count, "max_ts": None},
+            }
+
         entries.append(ChatPlanEntry(
             jid=jid,
             name=chat["name"],
             cutoff_ts=cutoff_iso,
-            new_messages=int(msg_count or 0),
+            new_messages=primary_count,
             new_attachments=int(att_count or 0),
+            per_source=entry_per_source,
         ))
 
     conn.close()
+
+    if extra_dbs:
+        _annotate_per_source_counts(entries, cache, server, extra_dbs)
 
     scope_label = "all" if scope_jids is None else (
         "one-chat" if scope_jids and len(scope_jids) == 1 else "favorites"
@@ -703,6 +731,80 @@ def compute_plan(
         chats=sorted(entries, key=lambda e: -e.new_messages),
         server_endpoint_present=server is not None,
     )
+
+
+def _annotate_per_source_counts(
+    entries: list[ChatPlanEntry],
+    cache: CursorCache,
+    server: dict[str, ChatCursor] | None,
+    extra_dbs: dict[str, Path],
+) -> None:
+    """Populate `entry.per_source[<extra-name>]` for each extra DB and
+    refresh `entry.new_messages` to the merged-unique estimate.
+
+    Mac-only chats (JIDs present in the extra DB but not the primary
+    iPhone DB) are NOT added here — the iPhone backup historically
+    covers every chat the device has ever held. Worth revisiting if the
+    Mac live source ever holds chats the iPhone has fully purged.
+    """
+    if not extra_dbs:
+        return
+    by_jid = {e.jid: e for e in entries}
+    for source_name, db_path in extra_dbs.items():
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
+        except sqlite3.OperationalError:
+            # Source unavailable mid-flight — degrade silently rather than
+            # blow up the whole plan render.
+            continue
+        try:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            chats = cur.execute(
+                "SELECT Z_PK, ZCONTACTJID FROM ZWACHATSESSION WHERE ZCONTACTJID IS NOT NULL"
+            ).fetchall()
+            for c in chats:
+                jid = c["ZCONTACTJID"]
+                entry = by_jid.get(jid)
+                if entry is None:
+                    continue
+                cutoff_ios_ts = _cutoff_ios_ts(jid, cache, server)
+                row = cur.execute(
+                    """
+                    SELECT COUNT(*), MAX(ZMESSAGEDATE)
+                      FROM ZWAMESSAGE WHERE ZCHATSESSION = ? AND ZMESSAGEDATE > ?
+                    """,
+                    (c["Z_PK"], cutoff_ios_ts),
+                ).fetchone()
+                count = int(row[0] or 0)
+                max_ts_iso = ios_to_iso(row[1])
+                if entry.per_source is None:
+                    entry.per_source = {}
+                entry.per_source[source_name] = {
+                    "new_messages": count,
+                    "max_ts": max_ts_iso,
+                }
+        finally:
+            conn.close()
+
+    # Refresh new_messages to merged-unique estimate. Stanza-id overlap
+    # makes max() a tight upper bound; the server's commit dedup is
+    # exact, so this is only used for display.
+    for e in entries:
+        if e.per_source:
+            e.new_messages = max(s["new_messages"] for s in e.per_source.values())
+
+
+def _cutoff_ios_ts(
+    jid: str,
+    cache: CursorCache,
+    server: dict[str, ChatCursor] | None,
+) -> float:
+    """Same precedence rule as compute_plan's main loop, but lifted into
+    a helper so the extra-DB pass uses identical logic."""
+    if server and jid in server:
+        return iso_to_ios_ts(server[jid].committed_through_ts)
+    return cache.cutoff_ios(jid)
 
 
 # ─── server-cursor fail-fast policy ───────────────────────────────────────

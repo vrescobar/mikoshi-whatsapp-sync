@@ -581,19 +581,54 @@ def render_plan(
     body = Table(show_header=True, header_style="bold cyan", box=None)
     body.add_column("Chat", min_width=20)
     body.add_column("Cutoff", style="dim")
-    body.add_column("New msgs", justify="right")
-    body.add_column("New att", justify="right")
 
     nonzero = [c for c in plan.chats if c.new_messages > 0]
+    multi_source = any(c.per_source for c in nonzero)
+    extra_source_names: list[str] = []
+    if multi_source:
+        seen = set()
+        for c in nonzero:
+            if not c.per_source:
+                continue
+            for name in c.per_source:
+                if name not in seen:
+                    seen.add(name)
+                    extra_source_names.append(name)
+        # Stable display order: iphone_backup first, then everything else
+        # in encounter order. Single column per source with a "+N" label.
+        extra_source_names.sort(key=lambda n: (0 if n == "iphone_backup" else 1))
+        for name in extra_source_names:
+            short = "iPhone +" if name == "iphone_backup" else (
+                "Mac +" if name == "mac_live" else f"{name} +"
+            )
+            body.add_column(short, justify="right")
+        body.add_column("Unique≈", justify="right")
+    else:
+        body.add_column("New msgs", justify="right")
+    body.add_column("New att", justify="right")
+
     for entry in nonzero[:20]:
-        body.add_row(
+        cells = [
             (entry.name or entry.jid)[:32],
             (entry.cutoff_ts or "—")[:19],
-            str(entry.new_messages),
-            str(entry.new_attachments),
-        )
+        ]
+        if multi_source:
+            for name in extra_source_names:
+                ps = (entry.per_source or {}).get(name)
+                cells.append(str(ps["new_messages"]) if ps else "—")
+            cells.append(str(entry.new_messages))  # merged-unique estimate
+        else:
+            cells.append(str(entry.new_messages))
+        cells.append(str(entry.new_attachments))
+        body.add_row(*cells)
     if len(nonzero) > 20:
-        body.add_row("…", "", f"+{len(nonzero) - 20} more chats", "")
+        # Trailing row keeps the same column count as the header
+        tail = ["…", "", f"+{len(nonzero) - 20} more chats"]
+        if multi_source:
+            tail.extend([""] * len(extra_source_names))
+            tail.append("")  # Unique≈
+        tail.append("")
+        body.add_row(*tail)
 
     summary = (
         f"[bold]Source:[/]  {source_label}\n"
@@ -616,8 +651,17 @@ def render_plan(
         console.print(body)
 
 
-def compute_plan_if_possible(scope_mode: str, jid_for_one: str | None) -> pipeline_state.Plan | None:
-    """Return None if we don't have a decrypted DB to plan against yet."""
+def compute_plan_if_possible(
+    scope_mode: str,
+    jid_for_one: str | None,
+    selected_sources: list[str] | None = None,
+) -> pipeline_state.Plan | None:
+    """Return None if we don't have a decrypted DB to plan against yet.
+
+    ``selected_sources`` enables the multi-source plan view: when
+    ``mac_live`` is in the list (and available), we hand its DB to
+    ``compute_plan`` so each entry gets a ``per_source`` breakdown.
+    """
     db = find_existing_chatstorage()
     if not db:
         return None
@@ -632,7 +676,37 @@ def compute_plan_if_possible(scope_mode: str, jid_for_one: str | None) -> pipeli
         scope = {jid_for_one}
     else:
         scope = _scope_jids_for_mode(scope_mode, db)
-    return pipeline_state.compute_plan(db, cache, srv, scope_jids=scope)
+
+    extra_dbs = _extra_dbs_for_sources(selected_sources)
+    return pipeline_state.compute_plan(
+        db, cache, srv, scope_jids=scope, extra_dbs=extra_dbs,
+    )
+
+
+def _extra_dbs_for_sources(selected_sources: list[str] | None) -> dict[str, Path] | None:
+    """Map selected source names to their DB paths for the extra-DB
+    plan pass. ``iphone_backup`` is the primary DB (already passed
+    positionally to compute_plan); only sources OTHER than iphone_backup
+    end up here. Returns None when there's no additional source.
+    """
+    if not selected_sources:
+        return None
+    try:
+        from sources import get_source
+    except ImportError:
+        return None
+    extras: dict[str, Path] = {}
+    for name in selected_sources:
+        if name == "iphone_backup":
+            continue
+        try:
+            src = get_source(name)
+        except KeyError:
+            continue
+        if not src.is_available():
+            continue
+        extras[name] = src.db_path()
+    return extras or None
 
 
 # ─── top-level actions (the 5-screen menu) ───────────────────────────────
@@ -725,6 +799,7 @@ def action_sync():
         plan = compute_plan_if_possible(
             scope_mode="one-chat" if jid_for_one else scope_choice,
             jid_for_one=jid_for_one,
+            selected_sources=selected_sources,
         )
 
     scope_label_human = {

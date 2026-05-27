@@ -562,6 +562,97 @@ class TestFormatSourcesLabel:
         assert "+" in label  # joiner
 
 
+class TestRenderPlanMultiSource:
+    """When ``ChatPlanEntry.per_source`` is populated, the per-chat
+    table grows extra columns. Renders to an in-memory Console so we
+    can string-match the output without touching the real terminal.
+    """
+
+    def setup_method(self):
+        sys.modules.pop("tui", None)
+        import tui
+        self.tui = tui
+
+    def _make_plan(self, *, multi: bool):
+        from pipeline_state import Plan, ChatPlanEntry
+        entry = ChatPlanEntry(
+            jid="alice@s.whatsapp.net",
+            name="Alice",
+            cutoff_ts="2026-05-24T00:00:00+00:00",
+            new_messages=7,
+            new_attachments=2,
+            per_source=(
+                {
+                    "iphone_backup": {"new_messages": 3, "max_ts": None},
+                    "mac_live": {"new_messages": 7, "max_ts": None},
+                }
+                if multi else None
+            ),
+        )
+        return Plan(scope="all", chats=[entry], server_endpoint_present=True)
+
+    def _capture(self, plan):
+        from rich.console import Console
+        from io import StringIO
+        buf = StringIO()
+        cap_console = Console(file=buf, force_terminal=False, width=140, no_color=True)
+        # Monkey-patch the module-level console to capture
+        original = self.tui.console
+        self.tui.console = cap_console
+        try:
+            self.tui.render_plan(
+                plan, scope_label="all", source_label="Mac live only",
+                sources_label="iPhone backup (X) + Mac live (Y)",
+            )
+        finally:
+            self.tui.console = original
+        return buf.getvalue()
+
+    def test_single_source_keeps_classic_columns(self):
+        out = self._capture(self._make_plan(multi=False))
+        assert "New msgs" in out
+        assert "iPhone +" not in out
+        assert "Mac +" not in out
+        assert "Unique" not in out
+
+    def test_multi_source_shows_per_source_columns(self):
+        out = self._capture(self._make_plan(multi=True))
+        # New header columns
+        assert "iPhone +" in out
+        assert "Mac +" in out
+        assert "Unique" in out
+        # Per-source counts present as cells
+        assert "3" in out  # iPhone count
+        assert "7" in out  # Mac count + Unique≈
+
+
+class TestExtraDbsForSources:
+    def setup_method(self):
+        sys.modules.pop("tui", None)
+        import tui
+        self.tui = tui
+
+    def test_returns_none_for_iphone_only(self, monkeypatch):
+        # iphone_backup is the primary; nothing goes into extra_dbs
+        from sources import IphoneBackupSource
+        monkeypatch.setattr(IphoneBackupSource, "is_available", lambda self: True)
+        assert self.tui._extra_dbs_for_sources(["iphone_backup"]) is None
+
+    def test_includes_mac_when_selected_and_available(self, monkeypatch, tmp_path):
+        from sources import MacLiveSource
+        fake_db = tmp_path / "ChatStorage.sqlite"
+        fake_db.write_bytes(b"SQLite format 3\x00")
+        monkeypatch.setattr(MacLiveSource, "is_available", lambda self: True)
+        monkeypatch.setattr(MacLiveSource, "db_path", lambda self: fake_db)
+        extras = self.tui._extra_dbs_for_sources(["iphone_backup", "mac_live"])
+        assert extras == {"mac_live": fake_db}
+
+    def test_skips_unavailable_source(self, monkeypatch):
+        from sources import MacLiveSource
+        monkeypatch.setattr(MacLiveSource, "is_available", lambda self: False)
+        assert self.tui._extra_dbs_for_sources(["iphone_backup", "mac_live"]) is None
+
+
 class TestFavoritesRemoveChoices:
     """The favorites-remove picker used to iterate file-insertion order.
     Users with months of favorites would scroll past stale chats to find

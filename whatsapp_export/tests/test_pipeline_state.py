@@ -8,7 +8,9 @@ The two scenarios that *must* never regress:
 """
 from __future__ import annotations
 
+import importlib
 import json
+import sqlite3
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -356,6 +358,152 @@ class TestComputePlan:
         plan = pipeline_state.compute_plan(synthetic_db, cache, server={})
         assert plan.total_messages == 3 + 2 + 3
         assert plan.total_attachments == 0 + 1 + 1
+
+    def test_no_per_source_when_no_extra_dbs(self, synthetic_db):
+        """Single-source plans must not carry per_source — keeps the
+        renderer simple and avoids confusing the user with a useless
+        breakdown."""
+        cache = pipeline_state.CursorCache()
+        plan = pipeline_state.compute_plan(synthetic_db, cache, server={})
+        for entry in plan.chats:
+            assert entry.per_source is None
+
+
+# ─── multi-source plan (iPhone backup + Mac live) ────────────────────────
+
+
+IOS_EPOCH_OFFSET = 978307200  # matches conftest._ios_ts
+
+
+def _ios_ts(year, month, day, hour=12, minute=0):
+    from datetime import datetime, timezone
+    dt = datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
+    return dt.timestamp() - IOS_EPOCH_OFFSET
+
+
+class TestComputePlanMultiSource:
+    """``extra_dbs`` enriches each plan entry with per-source counts so
+    the TUI can show 'iPhone: 12 · Mac: 38 · Unique≈ 38' per chat."""
+
+    def _build_mac_like_db(self, db_path, *, alice_count, bob_count):
+        """Build a second ChatStorage.sqlite with the same schema as
+        the synthetic_db fixture but a different number of messages per
+        chat. Lets us assert per_source picks up divergence across
+        sources."""
+        _ts = _ios_ts
+        conn = sqlite3.connect(db_path)
+        conn.executescript("""
+            CREATE TABLE ZWACHATSESSION (
+                Z_PK INTEGER PRIMARY KEY,
+                ZCONTACTJID TEXT,
+                ZPARTNERNAME TEXT,
+                ZLASTMESSAGEDATE REAL
+            );
+            CREATE TABLE ZWAMESSAGE (
+                Z_PK INTEGER PRIMARY KEY,
+                ZCHATSESSION INTEGER,
+                ZTEXT TEXT,
+                ZMESSAGEDATE REAL,
+                ZFROMJID TEXT,
+                ZTOJID TEXT,
+                ZISFROMME INTEGER,
+                ZMESSAGETYPE INTEGER,
+                ZPUSHNAME TEXT,
+                ZSTANZAID TEXT
+            );
+            CREATE TABLE ZWAMEDIAITEM (
+                Z_PK INTEGER PRIMARY KEY,
+                ZMESSAGE INTEGER,
+                ZMEDIALOCALPATH TEXT,
+                ZMEDIASIZE INTEGER
+            );
+        """)
+        conn.execute(
+            "INSERT INTO ZWACHATSESSION VALUES (1, 'alice@s.whatsapp.net', 'Alice', ?)",
+            (_ts(2026, 5, 26),),
+        )
+        conn.execute(
+            "INSERT INTO ZWACHATSESSION VALUES (2, 'bob@s.whatsapp.net', 'Bob', ?)",
+            (_ts(2026, 5, 26),),
+        )
+        for i in range(alice_count):
+            conn.execute(
+                "INSERT INTO ZWAMESSAGE VALUES (?, 1, 'mac', ?, 'alice@s.whatsapp.net', 'me', 0, 0, 'Alice', ?)",
+                (5000 + i, _ts(2026, 5, 26, 10, i), f"MAC-A-{i}"),
+            )
+        for i in range(bob_count):
+            conn.execute(
+                "INSERT INTO ZWAMESSAGE VALUES (?, 2, 'mac', ?, 'bob@s.whatsapp.net', 'me', 0, 0, 'Bob', ?)",
+                (6000 + i, _ts(2026, 5, 26, 11, i), f"MAC-B-{i}"),
+            )
+        conn.commit()
+        conn.close()
+
+    def test_per_source_populated_when_extra_db_provided(self, tmp_path, synthetic_db):
+        mac_db = tmp_path / "mac.sqlite"
+        self._build_mac_like_db(mac_db, alice_count=7, bob_count=4)
+        cache = pipeline_state.CursorCache()
+        plan = pipeline_state.compute_plan(
+            synthetic_db, cache, server={},
+            extra_dbs={"mac_live": mac_db},
+        )
+        per_jid = {c.jid: c for c in plan.chats}
+        alice = per_jid["alice@s.whatsapp.net"]
+        assert alice.per_source is not None
+        assert alice.per_source["iphone_backup"]["new_messages"] == 3
+        assert alice.per_source["mac_live"]["new_messages"] == 7
+
+    def test_new_messages_becomes_merged_unique_max(self, tmp_path, synthetic_db):
+        """When per_source carries multiple sources, new_messages is the
+        max() — best upper-bound estimate of merged-unique. The exact
+        count is dedup'd authoritatively at commit time by the server."""
+        mac_db = tmp_path / "mac.sqlite"
+        self._build_mac_like_db(mac_db, alice_count=7, bob_count=0)
+        cache = pipeline_state.CursorCache()
+        plan = pipeline_state.compute_plan(
+            synthetic_db, cache, server={},
+            extra_dbs={"mac_live": mac_db},
+        )
+        per_jid = {c.jid: c for c in plan.chats}
+        # Alice: iPhone=3, Mac=7 → max=7
+        assert per_jid["alice@s.whatsapp.net"].new_messages == 7
+        # Bob: iPhone=2, Mac=0 → max=2
+        assert per_jid["bob@s.whatsapp.net"].new_messages == 2
+
+    def test_extra_db_with_missing_file_degrades_silently(self, tmp_path, synthetic_db):
+        """If the Mac DB vanishes between probe and plan (file deleted,
+        permissions changed, race with the OS), the plan should still
+        succeed against the primary."""
+        cache = pipeline_state.CursorCache()
+        plan = pipeline_state.compute_plan(
+            synthetic_db, cache, server={},
+            extra_dbs={"mac_live": tmp_path / "does-not-exist.sqlite"},
+        )
+        # Every entry's per_source has iphone_backup but no mac_live
+        per_jid = {c.jid: c for c in plan.chats}
+        alice = per_jid["alice@s.whatsapp.net"]
+        # iphone_backup recorded; mac_live absent
+        assert "iphone_backup" in alice.per_source
+        assert "mac_live" not in alice.per_source
+
+    def test_mac_only_chat_not_added(self, tmp_path, synthetic_db):
+        """A chat that exists only in the extra DB is currently NOT
+        added to the plan. Documented behaviour — keep this test until
+        we choose to revisit it."""
+        mac_db = tmp_path / "mac.sqlite"
+        self._build_mac_like_db(mac_db, alice_count=0, bob_count=0)
+        # Add a Mac-only group chat
+        conn = sqlite3.connect(mac_db)
+        conn.execute("INSERT INTO ZWACHATSESSION VALUES (99, 'maconly@g.us', 'Mac Only', 0.0)")
+        conn.commit()
+        conn.close()
+        cache = pipeline_state.CursorCache()
+        plan = pipeline_state.compute_plan(
+            synthetic_db, cache, server={},
+            extra_dbs={"mac_live": mac_db},
+        )
+        jids = {c.jid for c in plan.chats}
+        assert "maconly@g.us" not in jids
 
 
 # ─── server cursor fetch graceful degradation ────────────────────────────
