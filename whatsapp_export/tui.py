@@ -1323,6 +1323,98 @@ def action_toggle_preserve_extracted():
     pause()
 
 
+# ─── scheduled automatic sync (LaunchAgent) ──────────────────────────────
+
+
+def action_schedule():
+    """Activate, change, or deactivate the daily LaunchAgent sync.
+
+    Shows current state, last-run summary, and the four typical actions.
+    The actual install/uninstall logic lives in ``scheduler.py`` so it
+    can be unit-tested without going near the TUI.
+    """
+    import re
+
+    import scheduler
+
+    while True:
+        info = scheduler.current_schedule()
+        if info is None:
+            status = "[dim]Not scheduled — automatic sync is disabled.[/]"
+            current_label = None
+        else:
+            current_label = f"{info.hour:02d}:{info.minute:02d}"
+            state = "[green]enabled[/]" if info.enabled else "[yellow]disabled[/]"
+            status = (
+                f"{state}, daily at [bold]{current_label}[/] (Mac local time)\n"
+                f"[dim]Plist: {info.plist_path}[/]"
+            )
+
+        last = scheduler.last_run_summary()
+        body = status
+        if last:
+            body += f"\n[dim]Last run log: {last}[/]"
+
+        console.print(Panel(
+            body,
+            title="[bold]⏰  Scheduled automatic sync[/]",
+            expand=False,
+        ))
+
+        choices = []
+        if info is None:
+            choices.append(Choice("🟢  Enable — pick a daily time", "enable"))
+        else:
+            choices.append(Choice(f"🔁  Change time (currently {current_label})", "enable"))
+            choices.append(Choice("🔴  Disable — remove the LaunchAgent", "disable"))
+        choices.append(Choice("← Back", "__back__"))
+
+        action = questionary.select("What now?", choices=choices).ask()
+        if action in (None, "__back__"):
+            return
+
+        if action == "enable":
+            time_str = questionary.text(
+                "Daily run time (HH:MM, Mac local):",
+                default=current_label or "06:00",
+                validate=lambda t: bool(re.fullmatch(r"\d{2}:\d{2}", t.strip())) and
+                                   _valid_hhmm(t.strip()),
+            ).ask()
+            if not time_str:
+                continue
+            hour, minute = (int(x) for x in time_str.strip().split(":"))
+            try:
+                path = scheduler.install_schedule(hour, minute)
+                console.print(
+                    f"[green]✓ LaunchAgent installed:[/] daily at {hour:02d}:{minute:02d}.\n"
+                    f"[dim]{path}[/]"
+                )
+            except (RuntimeError, ValueError, FileNotFoundError) as e:
+                console.print(f"[red]Failed:[/] {e}")
+            pause()
+
+        elif action == "disable":
+            if not questionary.confirm(
+                "Remove the daily LaunchAgent? (Manual syncs still work.)",
+                default=True,
+            ).ask():
+                continue
+            removed = scheduler.disable_schedule()
+            if removed:
+                console.print("[green]✓ Disabled.[/] LaunchAgent removed.")
+            else:
+                console.print("[yellow]Nothing to remove (already disabled).[/]")
+            pause()
+
+
+def _valid_hhmm(s: str) -> bool:
+    try:
+        hh, mm = s.split(":")
+        return 0 <= int(hh) <= 23 and 0 <= int(mm) <= 59
+    except (ValueError, AttributeError):
+        return False
+
+
 # ─── tools (advanced) ─────────────────────────────────────────────────────
 
 
@@ -1503,13 +1595,14 @@ def action_status():
 
 # ─── main loop ────────────────────────────────────────────────────────────
 
-# Five intent-based top-level actions (REDESIGN.md §5.1).
+# Intent-based top-level actions (REDESIGN.md §5.1).
 # The label text includes the cross-reference keyword "Sync" / "Push" / etc.
 # in sub-screens so users still find them via the menu's search filter.
 ACTIONS = [
     ("🔂  Sync (recommended)",           "sync"),
     ("📊  Inspect (List chats, drift, status)", "inspect"),
     ("📌  Manage favorites",             "favorites"),
+    ("⏰  Schedule automatic sync (LaunchAgent)", "schedule"),
     ("⚙   Setup & verify (Verify setup, auth, config)", "setup"),
     ("🛠   Tools (Push, sqlite, advanced)", "tools"),
 ]
@@ -1518,6 +1611,7 @@ _ACTION_DISPATCH = {
     "sync": action_sync,
     "inspect": action_inspect,
     "favorites": action_favorites,
+    "schedule": action_schedule,
     "setup": action_setup_verify,
     "tools": action_tools,
 }
