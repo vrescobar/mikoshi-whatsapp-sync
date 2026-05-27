@@ -506,6 +506,60 @@ class TestComputePlanMultiSource:
         assert "maconly@g.us" not in jids
 
 
+class TestDetectSources:
+    """``detect_sources()`` is the shared cron-path / TUI source probe.
+    Wrapper calls it via `python3 -m pipeline_state detect-sources`."""
+
+    def test_returns_both_when_available(self, monkeypatch):
+        from sources import IphoneBackupSource, MacLiveSource
+        monkeypatch.setattr(IphoneBackupSource, "is_available", lambda self: True)
+        monkeypatch.setattr(MacLiveSource, "is_available", lambda self: True)
+        assert pipeline_state.detect_sources() == ["iphone_backup", "mac_live"]
+
+    def test_returns_only_available(self, monkeypatch):
+        from sources import IphoneBackupSource, MacLiveSource
+        monkeypatch.setattr(IphoneBackupSource, "is_available", lambda self: False)
+        monkeypatch.setattr(MacLiveSource, "is_available", lambda self: True)
+        assert pipeline_state.detect_sources() == ["mac_live"]
+
+    def test_empty_when_none_available(self, monkeypatch):
+        from sources import IphoneBackupSource, MacLiveSource
+        monkeypatch.setattr(IphoneBackupSource, "is_available", lambda self: False)
+        monkeypatch.setattr(MacLiveSource, "is_available", lambda self: False)
+        assert pipeline_state.detect_sources() == []
+
+    def test_swallowed_exception_doesnt_crash_cron_path(self, monkeypatch):
+        from sources import IphoneBackupSource, MacLiveSource
+
+        def boom(self):
+            raise RuntimeError("file system race")
+
+        monkeypatch.setattr(IphoneBackupSource, "is_available", boom)
+        monkeypatch.setattr(MacLiveSource, "is_available", lambda self: True)
+        # The failing source is skipped, not propagated
+        assert pipeline_state.detect_sources() == ["mac_live"]
+
+
+class TestDetectSourcesCLI:
+    """The wrapper invokes `python3 -m pipeline_state detect-sources`
+    and reads one source name per line."""
+
+    def test_cli_prints_each_name_on_its_own_line(self, monkeypatch, capsys):
+        monkeypatch.setattr(pipeline_state, "detect_sources",
+                            lambda: ["iphone_backup", "mac_live"])
+        rc = pipeline_state._main(["detect-sources"])
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert captured.out.splitlines() == ["iphone_backup", "mac_live"]
+
+    def test_cli_empty_output_when_none(self, monkeypatch, capsys):
+        monkeypatch.setattr(pipeline_state, "detect_sources", lambda: [])
+        rc = pipeline_state._main(["detect-sources"])
+        assert rc == 0
+        # No stdout — wrapper interprets empty as "nothing to sync"
+        assert capsys.readouterr().out == ""
+
+
 # ─── server cursor fetch graceful degradation ────────────────────────────
 
 

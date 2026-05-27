@@ -853,6 +853,34 @@ def require_server_cursor(
 # ─── tiny CLI so bash can call this without a full Python wrapper ─────────
 
 
+def detect_sources() -> list[str]:
+    """Return the names of available sources, in reconciler priority order.
+
+    The reconciler tie-breaks `iphone_backup` before `mac_live`, so the
+    ordering here matters for both the wrapper (which passes the list
+    to ``extract_messages --sources``) and the TUI header.
+
+    The wrapper uses the output as: empty list → "nothing to sync,
+    exit cleanly"; non-empty → set ``MIKOSHI_SOURCES`` to the
+    comma-joined list. Shared between bash and Python so they can't
+    disagree about what's available.
+    """
+    try:
+        from sources import IphoneBackupSource, MacLiveSource
+    except ImportError:
+        return []
+    found: list[str] = []
+    for src in (IphoneBackupSource(), MacLiveSource()):
+        try:
+            if src.is_available():
+                found.append(src.name)
+        except Exception:
+            # is_available() is supposed to be safe; if a future source
+            # raises we'd rather skip it than crash the cron path.
+            continue
+    return found
+
+
 def _main(argv: list[str] | None = None) -> int:
     """Internal CLI — used by mikoshi-whatsapp.sh to share `best_from_phase`
     with the cron path. Stdout is a single short string. Stderr is human."""
@@ -863,6 +891,11 @@ def _main(argv: list[str] | None = None) -> int:
     p_best.add_argument("--backup-dir", type=Path, help="Override MIKOSHI_BACKUP_DIR")
     p_best.add_argument("--require-iphone", action="store_true",
                         help="Bail (exit 2) when phase 1 would be required but no iPhone is reachable")
+
+    sub.add_parser(
+        "detect-sources",
+        help="Print available sources (one per line); empty output = none available.",
+    )
 
     p_drift = sub.add_parser("drift", help="Print drift summary as JSON")
     p_drift.add_argument("--state-file", type=Path, required=True)
@@ -904,6 +937,11 @@ def _main(argv: list[str] | None = None) -> int:
             "summary": summary,
             "entries": [asdict(e) | {"status": e.status.value} for e in report],
         }, indent=2))
+        return 0
+
+    if args.cmd == "detect-sources":
+        for name in detect_sources():
+            print(name)
         return 0
 
     if args.cmd == "check-server-cursor":

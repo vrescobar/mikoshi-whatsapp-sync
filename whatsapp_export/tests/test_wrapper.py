@@ -59,7 +59,7 @@ def stub_pipeline(tmp_path, monkeypatch):
     # stub returns predictable values so wrapper tests are deterministic.
     # Phase=4 means "everything is cached, run extract."
     (fake_root / "pipeline_state.py").write_text(
-        "import sys\n"
+        "import os, sys\n"
         "if len(sys.argv) >= 2 and sys.argv[1] == 'best-phase':\n"
         "    if '--require-iphone' in sys.argv:\n"
         "        sys.exit(0)\n"
@@ -67,6 +67,14 @@ def stub_pipeline(tmp_path, monkeypatch):
         "    sys.exit(0)\n"
         "if len(sys.argv) >= 2 and sys.argv[1] == 'check-server-cursor':\n"
         "    print('server cursor OK (stub)')\n"
+        "    sys.exit(0)\n"
+        "if len(sys.argv) >= 2 and sys.argv[1] == 'detect-sources':\n"
+        # MIKOSHI_TEST_SOURCES is an env var the test harness can set to
+        # override what the stub reports. Default: both available so the
+        # existing wrapper tests don't need to opt in.
+        "    raw = os.environ.get('MIKOSHI_TEST_SOURCES', 'iphone_backup,mac_live')\n"
+        "    for name in [s for s in raw.split(',') if s]:\n"
+        "        print(name)\n"
         "    sys.exit(0)\n"
         "sys.exit(0)\n"
     )
@@ -224,6 +232,61 @@ class TestSyncDispatch:
         assert result.returncode == 0
         forwarded = stub_pipeline["args_log"].read_text().strip()
         assert "--mode" in forwarded and "full" in forwarded
+
+
+# ─── auto-source detection (plain sync, no --sources flag) ────────────────
+
+
+class TestSyncAutoSources:
+    """Plain `sync` should auto-pick whichever sources are available.
+    The stub's `detect-sources` subcommand respects MIKOSHI_TEST_SOURCES."""
+
+    def test_both_sources_auto_picked(self, stub_pipeline):
+        result = _run_stub(
+            stub_pipeline, ["sync", "--skip-remote-sync"], favorites=None,
+            env_extra={"MIKOSHI_TEST_SOURCES": "iphone_backup,mac_live"},
+        )
+        assert result.returncode == 0
+        assert "auto-detected sources: iphone_backup,mac_live" in result.stdout
+
+    def test_mac_only_falls_back_to_phase_4(self, stub_pipeline):
+        """When only Mac is available, no iPhone phase 1-3 work makes
+        sense — the wrapper should jump straight to phase 4."""
+        result = _run_stub(
+            stub_pipeline, ["sync", "--skip-remote-sync"], favorites=None,
+            env_extra={"MIKOSHI_TEST_SOURCES": "mac_live"},
+        )
+        assert result.returncode == 0
+        forwarded = stub_pipeline["args_log"].read_text().strip()
+        assert "--from-phase 4" in forwarded
+        assert "Mac-only sync" in result.stdout
+
+    def test_no_sources_exits_cleanly(self, stub_pipeline):
+        """The cron-friendly 'nothing to do' rc=0 path — neither iPhone
+        nor Mac source is available; sync must not crash, must not push
+        anything, must exit 0 so the cron job doesn't email a failure."""
+        result = _run_stub(
+            stub_pipeline, ["sync", "--skip-remote-sync"], favorites=None,
+            env_extra={"MIKOSHI_TEST_SOURCES": ""},
+        )
+        assert result.returncode == 0
+        assert "nothing to sync" in result.stdout
+        # The pipeline stub must NOT have been invoked
+        assert not stub_pipeline["args_log"].exists()
+
+    def test_explicit_sources_flag_bypasses_auto(self, stub_pipeline):
+        """If the user passes --sources X explicitly, the wrapper must
+        honour it instead of overriding with the auto-detect result."""
+        result = _run_stub(
+            stub_pipeline,
+            ["sync", "--skip-remote-sync", "--sources", "iphone_backup"],
+            favorites=None,
+            # auto-detect would pick both, but user said iphone_backup only
+            env_extra={"MIKOSHI_TEST_SOURCES": "iphone_backup,mac_live"},
+        )
+        assert result.returncode == 0
+        # No "auto-detected" line — user-supplied flag won
+        assert "auto-detected sources" not in result.stdout
 
 
 # ─── status / tui subcommand presence ──────────────────────────────────────

@@ -27,18 +27,29 @@ Mikoshi WhatsApp pipeline entrypoint.
 
 Subcommands:
   tui          Open the interactive menu (default if no subcommand given).
-  sync [OPTS]  Non-interactive sync. Suitable for cron.
+  sync [OPTS]  Non-interactive sync. Suitable for cron / LaunchAgent.
                   --all                Sync all chats (ignore favorites).
                   --full               Full re-sync from scratch.
                   --chat-jid <jid>     Restrict to one chat (selective decrypt).
                   --since <date>       Only messages since YYYY-MM-DD.
                   --skip-remote-sync   Run extraction but don't push.
+                  --sources <list>     Comma-separated source names — override
+                                       the default auto-detect. Currently
+                                       supported: iphone_backup, mac_live.
                   Anything else gets forwarded to run_pipeline.sh.
 
-                  Cron-friendly behaviour: when no iPhone is detected,
-                  the run falls back to a cached encrypted backup if one
-                  exists, or exits cleanly (rc=0) with "nothing to do"
-                  when neither is available.
+                  Default behaviour (no flags):
+                    1. Auto-pick sources: both iPhone backup and Mac live
+                       if both are available; whichever single source is
+                       present otherwise; clean rc=0 exit if neither is.
+                       The reconciler dedups across sources by stanza id.
+                    2. Auto-detect favorites: if ~/.mikoshi-favorites.json
+                       exists, sync only those chats (incremental). Else
+                       fall back to all chats.
+                    3. Auto-pick the cheapest start phase based on what's
+                       on disk — cached backup → skip backup phase; cached
+                       decrypted DB → skip decrypt phase; Mac-only sync
+                       skips iPhone phases entirely.
 
   status       Print pipeline status (config, backup, sync state, drift).
   reset-backup [--force]
@@ -194,6 +205,21 @@ cmd_sync() {
         fi
     fi
 
+    # Auto-detect sources when the user didn't pass --sources explicitly.
+    # detect-sources returns one name per line, in reconciler priority order.
+    # Empty output → neither iPhone backup nor Mac live DB is available;
+    # exit 0 cleanly (cron: "nothing to do" beats "failed").
+    if [[ -z "${MIKOSHI_SOURCES:-}" ]]; then
+        local detected
+        detected=$(cd "$SCRIPT_DIR" && python3 -m pipeline_state detect-sources | paste -sd, -)
+        if [[ -z "$detected" ]]; then
+            echo "[mikoshi] no iPhone backup AND no Mac live DB available → nothing to sync (rc=0)"
+            exit 0
+        fi
+        export MIKOSHI_SOURCES="$detected"
+        echo "[mikoshi] auto-detected sources: $MIKOSHI_SOURCES"
+    fi
+
     # Smart phase selection — same logic the TUI uses (REDESIGN.md §6.2).
     # If the user didn't pass --from-phase, pick the cheapest based on
     # on-disk state + iPhone reachability.
@@ -206,21 +232,37 @@ cmd_sync() {
     done
 
     if [[ "$has_from_phase" != true ]]; then
-        local best_out
-        best_out=$(best_phase)
-        local phase="${best_out%%	*}"
-        local label="${best_out#*	}"
-        if [[ "$phase" == "1" ]]; then
-            # Confirm the iPhone is actually reachable; otherwise the run
-            # will fail. If no backup exists either, exit cleanly with
-            # rc=0 (cron: "nothing to do" beats "failed").
-            if ! require_iphone_ok; then
-                echo "[mikoshi] no iPhone reachable and no cached backup → nothing to do (rc=0)"
-                exit 0
-            fi
+        # When iphone_backup is NOT in the auto-picked sources (i.e. we're
+        # syncing Mac-live-only), there's no decrypted iPhone DB to feed
+        # extract from — but extract reads its DB directly from the Mac
+        # source object, so we just skip phases 1-3 outright.
+        if [[ ",${MIKOSHI_SOURCES}," != *",iphone_backup,"* ]]; then
+            echo "[mikoshi] Mac-only sync (sources=$MIKOSHI_SOURCES) → starting from phase 4"
+            args+=(--from-phase 4)
         else
-            echo "[mikoshi] smart-phase: starting from phase $phase ($label)"
-            args+=(--from-phase "$phase")
+            local best_out
+            best_out=$(best_phase)
+            local phase="${best_out%%	*}"
+            local label="${best_out#*	}"
+            if [[ "$phase" == "1" ]]; then
+                # iPhone-side phase 1 needs the iPhone reachable. If it's
+                # not AND we have no cached backup, fall back to whatever
+                # other source is available; if that's also empty, exit
+                # cleanly with rc=0 (cron: "nothing to do" beats failed).
+                if ! require_iphone_ok; then
+                    if [[ ",${MIKOSHI_SOURCES}," == *",mac_live,"* ]]; then
+                        export MIKOSHI_SOURCES="mac_live"
+                        echo "[mikoshi] no iPhone reachable → falling back to Mac-only sync"
+                        args+=(--from-phase 4)
+                    else
+                        echo "[mikoshi] no iPhone reachable and no cached backup → nothing to do (rc=0)"
+                        exit 0
+                    fi
+                fi
+            else
+                echo "[mikoshi] smart-phase: starting from phase $phase ($label)"
+                args+=(--from-phase "$phase")
+            fi
         fi
     fi
 
