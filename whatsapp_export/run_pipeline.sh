@@ -734,7 +734,14 @@ main() {
     # SCRIPT_DIR/temp/backup/<UDID>/ — whichever has the artifacts.
     if [[ "$FROM_PHASE" -gt 1 ]]; then
         BACKUP_PATH="${TEMP_DIR}/backup"
-        if [[ "$FROM_PHASE" -ge 3 ]]; then
+        # Only phase 3 (re-decrypt) needs the encrypted UDID directory
+        # and the Keychain password. Phase 4 reads the already-decrypted
+        # ChatStorage directly and must not block on the encrypted backup
+        # being present — that broke the LaunchAgent path when an external
+        # SSD wasn't fully populated at trigger time.
+        if [[ "$FROM_PHASE" -eq 3 ]] && \
+           ! { [[ -n "${MIKOSHI_SOURCES:-}" ]] && \
+               [[ ",${MIKOSHI_SOURCES}," != *",iphone_backup,"* ]]; }; then
             local _udid_dir=""
             if [[ -d "$BACKUP_PATH" ]]; then
                 for d in "$BACKUP_PATH"/*; do
