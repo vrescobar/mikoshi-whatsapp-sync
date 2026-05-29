@@ -28,6 +28,9 @@ whatsapp_export/.pipeline.lock
 # Sync cursor (contains JIDs of every contact)
 whatsapp_export/.sync_state.json
 
+# TUI header cache (mirrors snapshot fields incl. paths/server URL)
+whatsapp_export/.tui_cache.json
+
 # Server-side runtime
 server/processed/
 server/quarantine/

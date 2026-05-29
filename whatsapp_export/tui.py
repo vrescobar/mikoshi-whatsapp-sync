@@ -23,8 +23,9 @@ import shlex
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 
 try:
@@ -40,6 +41,7 @@ except ImportError:
     sys.exit(1)
 
 import pipeline_state
+import tui_cache
 
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -361,19 +363,73 @@ def _probe_sources() -> list[dict]:
 # ─── status header (the heart of the new TUI mental model) ────────────────
 
 
-# Cache server probes for ~30 seconds so the menu doesn't feel sluggish.
-# Setting this to 0 forces a refresh on every render — used by the "Refresh"
-# action and after operations that change state.
-_HEADER_CACHE: dict = {"ts": 0.0, "ttl": 30.0, "snapshot": None}
+# Two-tier cache:
+#   • In-memory snapshot survives the lifetime of one Python process and is
+#     consulted first — refresh costs nothing within a session.
+#   • Disk snapshot at SCRIPT_DIR/.tui_cache.json survives across launches
+#     so the user gets first paint in milliseconds even on cold start.
+#
+# When the cached snapshot is stale-but-usable we kick off a daemon thread
+# to recompute in the background; the main thread keeps using the cached
+# snapshot until the user returns to the menu, at which point the live
+# value naturally takes over.
+_HEADER_CACHE: dict = {
+    "ts": 0.0,
+    "ttl": tui_cache.SOFT_TTL,
+    "snapshot": None,
+}
+_REFRESH_LOCK = threading.Lock()
+_REFRESH_THREAD: threading.Thread | None = None
 
 
 def _invalidate_header_cache():
+    """Drop both the in-memory and the on-disk cache.
+
+    Called after operations that change state (sync run, schedule change,
+    config edit) so the next render reflects reality, not stale numbers.
+    """
     _HEADER_CACHE["ts"] = 0.0
+    _HEADER_CACHE["snapshot"] = None
+    tui_cache.invalidate(SCRIPT_DIR)
 
 
-def _gather_header_snapshot(cfg: dict) -> dict:
-    """Compute every field the header displays. ~3s worst case (server probe)."""
-    snap = {}
+def _schedule_info_dict() -> dict | None:
+    """Return JSON-safe schedule info or None when no LaunchAgent is installed."""
+    try:
+        import scheduler
+    except Exception:
+        return None
+    info = scheduler.current_schedule()
+    if info is None:
+        return None
+    now = datetime.now()
+    target = now.replace(hour=info.hour, minute=info.minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return {
+        "enabled": bool(info.enabled),
+        "hour": int(info.hour),
+        "minute": int(info.minute),
+        "next_fire_iso": target.isoformat(timespec="minutes"),
+    }
+
+
+def _last_run_summary_string() -> str | None:
+    try:
+        import scheduler
+        return scheduler.last_run_summary()
+    except Exception:
+        return None
+
+
+def _gather_header_snapshot(cfg: dict, *, prev: dict | None = None) -> dict:
+    """Compute every field the header displays. ~3s worst case (server probe).
+
+    ``prev`` is the previous snapshot (in-memory or disk) and is used as a
+    fallback when ``du -sk`` times out — we'd rather show a stale-but-real
+    backup size than the placeholder string.
+    """
+    snap: dict = {}
     snap["cfg"] = cfg
 
     # iPhone
@@ -385,7 +441,17 @@ def _gather_header_snapshot(cfg: dict) -> dict:
     if bdir and bdir.exists():
         udids = pipeline_state.find_udid_dirs(bdir)
         snap["backup_udid_count"] = len(udids)
-        snap["backup_size"] = _dir_size_gb(bdir) if udids else "[dim]empty[/]"
+        if udids:
+            size = _dir_size_gb(bdir)
+            # On timeout `_dir_size_gb` returns a placeholder; prefer the last
+            # real measurement when we have one stashed in the previous snapshot.
+            if "still computing" in size and prev and prev.get("backup_size"):
+                prev_size = prev["backup_size"]
+                if "still computing" not in prev_size and "not set" not in prev_size:
+                    size = f"{prev_size} [dim](cached)[/]"
+            snap["backup_size"] = size
+        else:
+            snap["backup_size"] = "[dim]empty[/]"
     else:
         snap["backup_udid_count"] = 0
         snap["backup_size"] = "[dim]not set[/]"
@@ -412,25 +478,177 @@ def _gather_header_snapshot(cfg: dict) -> dict:
     # Cache + drift
     cache = pipeline_state.load_cursor_cache(STATE_FILE)
     snap["cache"] = cache
-    snap["drift"] = pipeline_state.detect_drift(cache, snap["server_cursors"])
+    snap["last_successful_commit"] = getattr(cache, "last_successful_commit", None)
+    drift = pipeline_state.detect_drift(cache, snap["server_cursors"])
+    snap["drift"] = drift
+    snap["drift_summary"] = {
+        status.value: count
+        for status, count in pipeline_state.drift_summary(drift).items()
+    }
 
     # Multi-source: iPhone backup + Mac live availability + counts
     snap["sources"] = _probe_sources()
+
+    # Totals for the new "Delta" header row
+    server_total = None
+    if isinstance(snap["server_cursors"], dict):
+        server_total = sum(
+            int(getattr(c, "message_count", 0) or 0)
+            for c in snap["server_cursors"].values()
+        )
+    snap["server_total_msgs"] = server_total
+    local_max = 0
+    for entry in snap["sources"]:
+        s = entry.get("snapshot")
+        if s is not None:
+            local_max = max(local_max, int(getattr(s, "message_count", 0) or 0))
+    snap["local_max_msgs"] = local_max if local_max else None
+
+    # Scheduler
+    snap["schedule_info"] = _schedule_info_dict()
+    snap["last_run_summary"] = _last_run_summary_string()
+
     return snap
+
+
+def _rehydrate_from_disk(cached: dict) -> dict:
+    """Project a disk-cached snapshot into the in-memory shape the
+    renderer expects.
+
+    The renderer reads only JSON-safe fields (see render_header); the
+    rich objects (``snap["cache"]``, ``snap["drift"]``) are only used
+    by callers that force a live refresh (``action_inspect``), so we
+    can leave them out here.
+    """
+    snap: dict = {}
+    snap["cfg"] = {}
+    snap["iphone_reachable"] = bool(cached.get("iphone_reachable"))
+    bdir = cached.get("backup_dir")
+    snap["backup_dir"] = Path(bdir) if bdir else None
+    snap["backup_udid_count"] = int(cached.get("backup_udid_count") or 0)
+    snap["backup_size"] = cached.get("backup_size") or ""
+    chat = cached.get("chatstorage")
+    snap["chatstorage"] = Path(chat) if chat else None
+    cmt = cached.get("chatstorage_mtime_iso")
+    if cmt:
+        try:
+            snap["chatstorage_mtime"] = datetime.fromisoformat(cmt)
+        except ValueError:
+            snap["chatstorage_mtime"] = None
+    else:
+        snap["chatstorage_mtime"] = None
+    snap["server_url"] = cached.get("server_url") or ""
+    # We don't round-trip the per-JID cursor dict; the renderer only needs
+    # the count, so synthesize a sentinel that satisfies len()/None checks.
+    cursors_count = cached.get("server_cursors_count")
+    snap["server_cursors"] = {"__cached__": cursors_count} if cursors_count is not None else None
+    snap["server_cursors_count"] = cursors_count
+    snap["server_total_msgs"] = cached.get("server_total_msgs")
+    snap["last_successful_commit"] = cached.get("last_successful_commit")
+    snap["drift_summary"] = cached.get("drift_summary") or {}
+
+    # Rebuild the "sources" list with lightweight stand-ins for SourceSnapshot
+    # (the renderer reads attributes via getattr, so a SimpleNamespace works).
+    from types import SimpleNamespace
+    sources_out: list[dict] = []
+    for entry in cached.get("sources") or []:
+        e = {
+            "name": entry.get("name"),
+            "available": bool(entry.get("available")),
+            "error": entry.get("error"),
+            "snapshot": None,
+        }
+        s = entry.get("snapshot")
+        if s:
+            e["snapshot"] = SimpleNamespace(
+                name=s.get("name"),
+                db_path=Path(s["db_path"]) if s.get("db_path") else None,
+                mtime_iso=s.get("mtime_iso") or "",
+                message_count=int(s.get("message_count") or 0),
+                media_with_local_path=int(s.get("media_with_local_path") or 0),
+            )
+        sources_out.append(e)
+    snap["sources"] = sources_out
+
+    local_max = 0
+    for entry in sources_out:
+        s = entry.get("snapshot")
+        if s is not None:
+            local_max = max(local_max, int(getattr(s, "message_count", 0) or 0))
+    snap["local_max_msgs"] = local_max if local_max else None
+
+    snap["schedule_info"] = cached.get("schedule_info")
+    snap["last_run_summary"] = cached.get("last_run_summary")
+    snap["_from_cache"] = True
+    snap["_cache_age_s"] = tui_cache.age_seconds(cached)
+    return snap
+
+
+def _spawn_background_refresh(prev: dict | None) -> None:
+    """Refresh the header snapshot off the main thread.
+
+    Idempotent: a single in-flight refresh at a time. We never write to
+    the console from here (would garble questionary's terminal state);
+    we only update the in-memory and on-disk caches so the next render
+    picks up the new value.
+    """
+    global _REFRESH_THREAD
+    with _REFRESH_LOCK:
+        if _REFRESH_THREAD is not None and _REFRESH_THREAD.is_alive():
+            return
+
+        def _worker():
+            try:
+                cfg = load_ingest_conf()
+                fresh = _gather_header_snapshot(cfg, prev=prev)
+                _HEADER_CACHE["snapshot"] = fresh
+                _HEADER_CACHE["ts"] = time.time()
+                tui_cache.save(SCRIPT_DIR, fresh)
+            except Exception:
+                # Don't crash the TUI on a background refresh failure —
+                # the user will see slightly older data, that's all.
+                pass
+
+        t = threading.Thread(target=_worker, name="tui-header-refresh", daemon=True)
+        _REFRESH_THREAD = t
+        t.start()
 
 
 def get_header_snapshot(force_refresh: bool = False) -> dict:
     now = time.time()
+    # 1) Hot path: fresh in-memory snapshot.
     if (
         not force_refresh
         and _HEADER_CACHE["snapshot"] is not None
         and (now - _HEADER_CACHE["ts"]) < _HEADER_CACHE["ttl"]
     ):
         return _HEADER_CACHE["snapshot"]
+
+    cached = tui_cache.load(SCRIPT_DIR)
+
+    # 2) Disk cache is fresh enough → use it directly, no background work.
+    if not force_refresh and tui_cache.is_fresh(cached):
+        snap = _rehydrate_from_disk(cached)
+        _HEADER_CACHE["snapshot"] = snap
+        _HEADER_CACHE["ts"] = now
+        return snap
+
+    # 3) Disk cache is stale but usable → return it immediately and kick off
+    #    a background refresh that will overwrite it before the user's next loop.
+    if not force_refresh and tui_cache.is_usable(cached):
+        snap = _rehydrate_from_disk(cached)
+        _HEADER_CACHE["snapshot"] = snap
+        _HEADER_CACHE["ts"] = now
+        _spawn_background_refresh(prev=snap)
+        return snap
+
+    # 4) Nothing usable → block on a live gather. First launch ever, or a
+    #    forced refresh, or after _invalidate_header_cache().
     cfg = load_ingest_conf()
-    snap = _gather_header_snapshot(cfg)
+    snap = _gather_header_snapshot(cfg, prev=cached)
     _HEADER_CACHE["snapshot"] = snap
     _HEADER_CACHE["ts"] = now
+    tui_cache.save(SCRIPT_DIR, snap)
     return snap
 
 
@@ -469,7 +687,10 @@ def render_header(snap: dict) -> None:
         decrypt_row = "[yellow]no decrypted DB yet[/]"
 
     url = snap.get("server_url") or ""
-    cursors = snap["server_cursors"]
+    cursors = snap.get("server_cursors")
+    cursors_count = snap.get("server_cursors_count")
+    if cursors_count is None and isinstance(cursors, dict) and "__cached__" not in cursors:
+        cursors_count = len(cursors)
     if not url:
         server_row = "[red]MIKOSHI_URL not set[/]"
     elif cursors is None:
@@ -478,19 +699,18 @@ def render_header(snap: dict) -> None:
             f"(old Mikoshi? Network down? Bad token?)[/]"
         )
     else:
-        cache = snap["cache"]
-        last_commit = cache.last_successful_commit or "—"
+        last_commit = snap.get("last_successful_commit") or "—"
         server_row = (
             f"[green]✓ {url}[/]  "
-            f"{len(cursors)} chats tracked   "
+            f"{cursors_count or 0} chats tracked   "
             f"last commit {(last_commit or '—')[:19]}"
         )
 
-    summary = pipeline_state.drift_summary(snap["drift"])
-    n_local_ahead = summary.get(pipeline_state.DriftStatus.LOCAL_AHEAD, 0)
-    n_in_sync = summary.get(pipeline_state.DriftStatus.IN_SYNC, 0)
-    n_no_server = summary.get(pipeline_state.DriftStatus.NO_SERVER_RECORD, 0)
-    n_no_local = summary.get(pipeline_state.DriftStatus.NO_LOCAL_RECORD, 0)
+    summary = snap.get("drift_summary") or {}
+    n_local_ahead = summary.get(pipeline_state.DriftStatus.LOCAL_AHEAD.value, 0)
+    n_in_sync = summary.get(pipeline_state.DriftStatus.IN_SYNC.value, 0)
+    n_no_server = summary.get(pipeline_state.DriftStatus.NO_SERVER_RECORD.value, 0)
+    n_no_local = summary.get(pipeline_state.DriftStatus.NO_LOCAL_RECORD.value, 0)
 
     if cursors is None:
         state_row = "[dim]drift unknown (server unreachable)[/]"
@@ -511,6 +731,10 @@ def render_header(snap: dict) -> None:
             bits.append(f"{n_no_local} server-only")
         state_row = "  ·  ".join(bits) or "[dim](empty)[/]"
 
+    last_sync_row = _last_sync_row(snap)
+    schedule_row = _schedule_row(snap)
+    delta_row = _delta_row(snap)
+
     table = Table(show_header=False, box=None, padding=(0, 1))
     table.add_column("Key", style="cyan")
     table.add_column("Value")
@@ -519,9 +743,102 @@ def render_header(snap: dict) -> None:
     table.add_row("Decrypt", decrypt_row)
     table.add_row("Server", server_row)
     table.add_row("Sources", _sources_summary_row(snap.get("sources", [])))
+    table.add_row("Delta", delta_row)
+    table.add_row("Last sync", last_sync_row)
+    table.add_row("Schedule", schedule_row)
     table.add_row("State", state_row)
 
-    console.print(Panel(table, title="[bold cyan]Mikoshi WhatsApp[/]", expand=False))
+    title = "[bold cyan]Mikoshi WhatsApp[/]"
+    if snap.get("_from_cache"):
+        age = snap.get("_cache_age_s") or 0.0
+        if age >= tui_cache.SOFT_TTL:
+            title += f" [dim](cached {_format_age(age)}, refreshing…)[/]"
+    console.print(Panel(table, title=title, expand=False))
+
+
+def _format_age(seconds: float) -> str:
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s ago"
+    if s < 3600:
+        return f"{s // 60}m ago"
+    if s < 86400:
+        return f"{s // 3600}h ago"
+    return f"{s // 86400}d ago"
+
+
+def _format_count(n: int | None) -> str:
+    if n is None:
+        return "—"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}k"
+    return str(int(n))
+
+
+def _last_sync_row(snap: dict) -> str:
+    iso = snap.get("last_successful_commit")
+    if not iso:
+        return "[dim]never (no successful commit recorded yet)[/]"
+    try:
+        # last_successful_commit is an ISO timestamp written by push_via_api
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        age = (datetime.now(tz=timezone.utc) - dt).total_seconds()
+        when = _format_age(age)
+    except ValueError:
+        when = iso[:19]
+    bits = [f"[green]{when}[/]", f"[dim]{iso[:19]}[/]"]
+    last_run = snap.get("last_run_summary")
+    if last_run and "exit 0" in last_run:
+        bits.append("[green]exit 0[/]")
+    elif last_run and "exit" in last_run:
+        bits.append("[yellow]non-zero exit[/]")
+    return "  ".join(bits)
+
+
+def _schedule_row(snap: dict) -> str:
+    info = snap.get("schedule_info")
+    if not info:
+        return "[dim]not scheduled[/] [dim](enable in “Schedule automatic sync”)[/]"
+    hh, mm = int(info["hour"]), int(info["minute"])
+    state = "[green]✓[/]" if info.get("enabled", True) else "[yellow]disabled[/]"
+    next_iso = info.get("next_fire_iso")
+    next_part = ""
+    if next_iso:
+        try:
+            target = datetime.fromisoformat(next_iso)
+            now = datetime.now()
+            same_day = target.date() == now.date()
+            when = "today" if same_day else "tomorrow"
+            next_part = f"  [dim](next {when} {target.strftime('%H:%M')})[/]"
+        except ValueError:
+            pass
+    return f"{state} daily at [bold]{hh:02d}:{mm:02d}[/]{next_part}"
+
+
+def _delta_row(snap: dict) -> str:
+    server_total = snap.get("server_total_msgs")
+    local_max = snap.get("local_max_msgs")
+    if server_total is None and local_max is None:
+        return "[dim](no source readable, server unreachable)[/]"
+    if server_total is None:
+        return f"[dim]server unreachable[/]  ·  local max [bold]{_format_count(local_max)}[/]"
+    if local_max is None:
+        return f"server [bold]{_format_count(server_total)}[/]  ·  [dim]no local source[/]"
+    diff = local_max - server_total
+    if diff > 0:
+        delta = f"[yellow](+{_format_count(diff)} local-only)[/]"
+    elif diff < 0:
+        delta = f"[dim]({_format_count(-diff)} server-ahead — older history)[/]"
+    else:
+        delta = "[green](aligned)[/]"
+    return (
+        f"server [bold]{_format_count(server_total)}[/]  ·  "
+        f"local max [bold]{_format_count(local_max)}[/]  {delta}"
+    )
 
 
 def _sources_summary_row(sources: list[dict]) -> str:
@@ -712,6 +1029,52 @@ def _extra_dbs_for_sources(selected_sources: list[str] | None) -> dict[str, Path
 # ─── top-level actions (the 5-screen menu) ───────────────────────────────
 
 
+def _resolve_sources_with_fallback(
+    selected: list[str],
+    snap: dict,
+    phase: int,
+    sources_entries: list[dict],
+) -> tuple[list[str] | None, int, str | None]:
+    """Decide whether to run the sync as picked, degrade to the surviving
+    source, or refuse outright.
+
+    Mirrors the cron-path fallback already implemented in
+    ``mikoshi-whatsapp.sh:252-260``. The TUI used to shell straight into
+    ``run_pipeline.sh`` which doesn't carry that logic, so picking
+    "Both" with no iPhone hard-failed at Phase 1.
+
+    Returns ``(resolved_sources, resolved_phase, reason)``:
+      * ``reason is None`` → no change, proceed.
+      * ``reason == "fatal"`` → ``resolved_sources is None``, caller must
+        abort with a red error.
+      * any other ``reason`` → caller should show it as a yellow warning
+        and confirm before running with the resolved values.
+    """
+    needs_iphone = (phase < 4) or ("iphone_backup" in selected and phase == 1)
+    iphone_reachable = bool(snap.get("iphone_reachable"))
+    has_decrypted_db = snap.get("chatstorage") is not None
+
+    by_name = {e.get("name"): e for e in sources_entries}
+    mac_entry = by_name.get("mac_live") or {}
+    mac_available = bool(mac_entry.get("available")) and mac_entry.get("snapshot") is not None
+
+    iphone_blocked = needs_iphone and not iphone_reachable and not (
+        has_decrypted_db and phase >= 4
+    )
+
+    if not iphone_blocked:
+        return selected, phase, None
+
+    if "mac_live" in selected and mac_available:
+        return (
+            ["mac_live"],
+            4,
+            "iPhone unreachable — degrading to Mac-only sync (skipping Phases 1-3).",
+        )
+
+    return None, phase, "fatal"
+
+
 def action_sync():
     """The redesign's centerpiece: plan-then-act sync.
 
@@ -778,14 +1141,30 @@ def action_sync():
             return
         phase = source_choice
     else:
-        if not snap["iphone_reachable"]:
-            console.print(
-                "[red]No iPhone reachable and no cached backup exists.[/]\n"
-                "Plug the iPhone (unlock + trust) and try again."
-            )
-            pause()
-            return
         phase = 1
+
+    # Cross-check the picked (sources, phase) against what's actually
+    # reachable right now. If the iPhone side is needed but unreachable,
+    # try to degrade to Mac-only before bothering the user.
+    resolved, phase, reason = _resolve_sources_with_fallback(
+        selected_sources, snap, phase, sources_entries,
+    )
+    if reason == "fatal":
+        console.print(
+            "[red]No iPhone reachable and no usable Mac live DB.[/]\n"
+            "Either plug + unlock + trust the iPhone, or install/open WhatsApp Desktop."
+        )
+        pause()
+        return
+    if reason is not None:
+        console.print(f"[yellow]⚠ {reason}[/]")
+        if not questionary.confirm(
+            "Proceed with the degraded sync?", default=True,
+        ).ask():
+            return
+        selected_sources = resolved
+        mac_only = selected_sources == ["mac_live"]
+
     source_label = {
         1: "iPhone (incremental backup → decrypt → extract → push)",
         3: "cached encrypted backup (re-decrypt → extract → push)",
