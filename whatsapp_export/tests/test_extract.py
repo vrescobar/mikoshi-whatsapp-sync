@@ -113,6 +113,7 @@ def run_extract(db, root, out, atts, state_file, **kwargs):
         target_contact=kwargs.get("target_contact"),
         include_system=kwargs.get("include_system", False),
         favorite_jids=kwargs.get("favorite_jids"),
+        dm_min_messages=kwargs.get("dm_min_messages"),
     )
     if new_chats_state is not None:
         _persist_cursors_like_push(state_file, new_chats_state)
@@ -362,6 +363,47 @@ class TestFavoritesFilter:
         )
         assert result is None  # extract_messages signals "nothing extracted"
 
+    def test_dm_min_messages_only_includes_qualifying_dms(
+        self, synthetic_db, extracted_root, output_path, attachments_dir, state_file
+    ):
+        # Synthetic DB: Alice has 3 msgs, Bob has 2 msgs, group has 2 msgs.
+        # Threshold ≥ 3 → only Alice qualifies; group is DM-only excluded.
+        result = run_extract(
+            synthetic_db, extracted_root, output_path, attachments_dir, state_file,
+            mode="full",
+            dm_min_messages=3,
+        )
+        assert result["stats"]["total_chats"] == 1
+        assert result["chats"][0]["jid"] == "alice@s.whatsapp.net"
+
+    def test_dm_min_messages_excludes_groups_even_when_above(
+        self, synthetic_db, extracted_root, output_path, attachments_dir, state_file
+    ):
+        # Threshold ≥ 2 → Alice + Bob qualify; the group has 2 msgs but
+        # is @g.us, so the rule must not pull it in.
+        result = run_extract(
+            synthetic_db, extracted_root, output_path, attachments_dir, state_file,
+            mode="full",
+            dm_min_messages=2,
+        )
+        jids = {c["jid"] for c in result["chats"]}
+        assert jids == {"alice@s.whatsapp.net", "bob@s.whatsapp.net"}
+        assert "12345@g.us" not in jids
+
+    def test_dm_min_messages_unions_with_explicit_favorites(
+        self, synthetic_db, extracted_root, output_path, attachments_dir, state_file
+    ):
+        # Threshold ≥ 3 pulls in Alice; the group is added explicitly.
+        # Final set must contain both.
+        result = run_extract(
+            synthetic_db, extracted_root, output_path, attachments_dir, state_file,
+            mode="full",
+            favorite_jids=["12345@g.us"],
+            dm_min_messages=3,
+        )
+        jids = {c["jid"] for c in result["chats"]}
+        assert jids == {"alice@s.whatsapp.net", "12345@g.us"}
+
 
 class TestFavoritesModule:
     def test_add_and_remove(self, tmp_path):
@@ -389,7 +431,12 @@ class TestFavoritesModule:
     def test_load_missing_file(self, tmp_path):
         import favorites
         data = favorites.load(tmp_path / "nonexistent.json")
-        assert data == {"version": 1, "updated_at": None, "favorites": []}
+        assert data == {
+            "version": 1,
+            "updated_at": None,
+            "dm_min_messages": None,
+            "favorites": [],
+        }
 
     def test_clear(self, tmp_path):
         import favorites
@@ -421,36 +468,141 @@ class TestFavoritesModule:
         out = favorites.filter_dms_with_min_messages(chats, 1)
         assert {c["jid"] for c in out} == {"alice@s.whatsapp.net"}
 
-    def test_filter_dms_unions_via_add(self, tmp_path):
-        # The TUI's "Add all DMs" flow filters then calls favorites.add(),
-        # which dedups by JID — so previously-favorited chats are kept
-        # and not duplicated. This is the "union" semantics the user asked for.
-        import favorites
-        f = tmp_path / "favs.json"
-        favorites.add(
-            [{"jid": "alice@s.whatsapp.net", "name": "Alice"}], file=f
-        )
-        chats = [
-            {"jid": "alice@s.whatsapp.net", "name": "Alice", "msg_count": 1000},
-            {"jid": "bob@s.whatsapp.net", "name": "Bob", "msg_count": 1000},
-            {"jid": "g@g.us", "name": "Group", "msg_count": 9999},
-        ]
-        matching = favorites.filter_dms_with_min_messages(chats, 500)
-        added = favorites.add(
-            [{"jid": c["jid"], "name": c.get("name")} for c in matching],
-            file=f,
-        )
-        # Alice was already there → only Bob is new.
-        assert added == 1
-        assert set(favorites.jids(f)) == {
-            "alice@s.whatsapp.net",
-            "bob@s.whatsapp.net",
-        }
-
     def test_filter_dms_rejects_negative_threshold(self):
         import favorites
         with pytest.raises(ValueError):
             favorites.filter_dms_with_min_messages([], -1)
+
+
+# ─── DM-threshold rule ─────────────────────────────────────────────────────
+
+
+class TestDmThresholdRule:
+    """The threshold rule auto-includes DMs with N+ messages at sync time.
+
+    Setting it prunes redundant DMs from the explicit list (they'd be
+    re-included by the rule anyway). Groups stay in the explicit list
+    no matter what — they're never auto-included and never auto-pruned.
+    """
+
+    def test_load_defaults_threshold_to_none(self, tmp_path):
+        import favorites
+        f = tmp_path / "favs.json"
+        data = favorites.load(f)
+        assert data["dm_min_messages"] is None
+
+    def test_set_dm_threshold_prunes_redundant_dms(self, tmp_path):
+        import favorites
+        f = tmp_path / "favs.json"
+        favorites.add(
+            [
+                {"jid": "alice@s.whatsapp.net", "name": "Alice"},
+                {"jid": "bob@s.whatsapp.net", "name": "Bob"},
+                {"jid": "small@s.whatsapp.net", "name": "Small"},
+            ],
+            file=f,
+        )
+        chats = [
+            {"jid": "alice@s.whatsapp.net", "msg_count": 1000},
+            {"jid": "bob@s.whatsapp.net", "msg_count": 800},
+            {"jid": "small@s.whatsapp.net", "msg_count": 10},
+        ]
+        kept, removed = favorites.set_dm_threshold(500, chats, file=f)
+        # Alice + Bob are redundant (rule will include them); small stays.
+        assert removed == 2
+        assert kept == 1
+        assert set(favorites.jids(f)) == {"small@s.whatsapp.net"}
+        assert favorites.dm_threshold(f) == 500
+
+    def test_set_dm_threshold_keeps_groups(self, tmp_path):
+        # Groups are never pruned by the threshold — they're not DMs
+        # and the rule could never re-include them. User explicitly
+        # asked for this guarantee.
+        import favorites
+        f = tmp_path / "favs.json"
+        favorites.add(
+            [
+                {"jid": "111@g.us", "name": "Big Group"},
+                {"jid": "alice@s.whatsapp.net", "name": "Alice"},
+            ],
+            file=f,
+        )
+        # Even if a group had 9999 msgs, set_dm_threshold should not
+        # consider it for pruning.
+        chats = [
+            {"jid": "111@g.us", "msg_count": 9999},
+            {"jid": "alice@s.whatsapp.net", "msg_count": 1000},
+        ]
+        kept, removed = favorites.set_dm_threshold(500, chats, file=f)
+        assert removed == 1  # only Alice
+        assert kept == 1
+        assert set(favorites.jids(f)) == {"111@g.us"}
+
+    def test_set_dm_threshold_rejects_zero(self, tmp_path):
+        import favorites
+        with pytest.raises(ValueError):
+            favorites.set_dm_threshold(0, [], file=tmp_path / "favs.json")
+
+    def test_clear_dm_threshold_returns_prior_and_keeps_explicit(self, tmp_path):
+        import favorites
+        f = tmp_path / "favs.json"
+        favorites.add([{"jid": "small@s.whatsapp.net"}], file=f)
+        favorites.set_dm_threshold(500, [], file=f)
+        prev = favorites.clear_dm_threshold(f)
+        assert prev == 500
+        assert favorites.dm_threshold(f) is None
+        # Explicit list survives a threshold-clear.
+        assert favorites.jids(f) == ["small@s.whatsapp.net"]
+
+    def test_clear_dm_threshold_when_unset_returns_none(self, tmp_path):
+        import favorites
+        assert favorites.clear_dm_threshold(tmp_path / "favs.json") is None
+
+    def test_effective_jids_unions_explicit_and_rule(self, tmp_path):
+        import favorites
+        f = tmp_path / "favs.json"
+        # Explicit: a group + a small DM the user wants anyway.
+        favorites.add(
+            [
+                {"jid": "111@g.us", "name": "Group"},
+                {"jid": "small@s.whatsapp.net", "name": "Small"},
+            ],
+            file=f,
+        )
+        # Rule: ≥ 500 msg DMs. The DB has one matching DM.
+        favorites.set_dm_threshold(500, [], file=f)  # no pruning needed
+        chats = [
+            {"jid": "alice@s.whatsapp.net", "msg_count": 1000},
+            {"jid": "small@s.whatsapp.net", "msg_count": 10},
+            {"jid": "111@g.us", "msg_count": 9999},
+            {"jid": "tiny@s.whatsapp.net", "msg_count": 1},
+        ]
+        out = set(favorites.effective_jids(chats, file=f))
+        assert out == {
+            "111@g.us",
+            "small@s.whatsapp.net",
+            "alice@s.whatsapp.net",
+        }
+
+    def test_effective_jids_without_threshold_ignores_chats(self, tmp_path):
+        import favorites
+        f = tmp_path / "favs.json"
+        favorites.add([{"jid": "alice@s.whatsapp.net"}], file=f)
+        # The "chats" iterable should be irrelevant when no rule is set.
+        out = favorites.effective_jids(
+            [{"jid": "other@s.whatsapp.net", "msg_count": 9999}],
+            file=f,
+        )
+        assert out == ["alice@s.whatsapp.net"]
+
+    def test_effective_jids_excludes_groups_from_rule(self, tmp_path):
+        # The rule is DM-only; a group with massive msg_count must not
+        # appear via the rule path (it'd only appear if explicitly listed).
+        import favorites
+        f = tmp_path / "favs.json"
+        favorites.set_dm_threshold(500, [], file=f)
+        chats = [{"jid": "huge@g.us", "msg_count": 50_000}]
+        assert favorites.effective_jids(chats, file=f) == []
 
 
 # ─── Edge cases: malformed / empty DB ──────────────────────────────────────

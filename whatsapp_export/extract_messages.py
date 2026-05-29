@@ -334,12 +334,39 @@ def extract_messages(
     since_iso=None,
     include_system=False,
     favorite_jids=None,
+    dm_min_messages=None,
 ):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
     media_size_expr = _resolve_media_size_expr(cursor)
+
+    # Expand favorite_jids with the DM-threshold rule before building the
+    # chats query. The rule means "any 1-on-1 chat with N+ messages": it's
+    # resolved per-DB so each source contributes whatever currently meets
+    # the bar (the Mac live DB has shorter history and may include fewer).
+    if dm_min_messages is not None:
+        threshold_rows = cursor.execute("""
+            SELECT s.ZCONTACTJID
+            FROM ZWACHATSESSION s
+            LEFT JOIN ZWAMESSAGE m ON m.ZCHATSESSION = s.Z_PK
+            WHERE s.ZCONTACTJID IS NOT NULL
+              AND s.ZCONTACTJID NOT LIKE '%@g.us'
+            GROUP BY s.Z_PK
+            HAVING COUNT(m.Z_PK) >= ?
+        """, (int(dm_min_messages),)).fetchall()
+        threshold_jids = {row[0] for row in threshold_rows if row[0]}
+        if threshold_jids:
+            existing = set(favorite_jids or [])
+            unioned = existing | threshold_jids
+            new_from_rule = unioned - existing
+            favorite_jids = sorted(unioned)
+            print(
+                f"[INFO] DM threshold ≥{dm_min_messages} adds "
+                f"{len(new_from_rule)} chat(s) to the favorites filter "
+                f"({len(threshold_jids)} matched the rule)"
+            )
 
     chats_query = """
         SELECT
@@ -605,6 +632,7 @@ def extract_messages_multi_source(
     since_iso=None,
     include_system=False,
     favorite_jids=None,
+    dm_min_messages=None,
 ):
     """Run extraction against N sources, reconcile, write one manifest.
 
@@ -655,6 +683,7 @@ def extract_messages_multi_source(
             since_iso=since_iso,
             include_system=include_system,
             favorite_jids=favorite_jids,
+            dm_min_messages=dm_min_messages,
         )
         if new_state is None:
             # Source had nothing matching the filter — skip cleanly.
@@ -812,11 +841,15 @@ def main():
         sys.exit(1)
 
     favorite_jids = None
+    dm_min_messages = None
     if args.favorites_file:
         # Defer import so the rest of the script doesn't depend on favorites.py
         import favorites as _favs
         favorite_jids = _favs.jids(args.favorites_file)
-        if not favorite_jids:
+        dm_min_messages = _favs.dm_threshold(args.favorites_file)
+        # Either an explicit list OR a threshold rule is enough — the
+        # rule alone will be resolved against each source DB downstream.
+        if not favorite_jids and dm_min_messages is None:
             print(f"[ERROR] Favorites file has no entries: {args.favorites_file}",
                   file=sys.stderr)
             sys.exit(2)
@@ -856,6 +889,7 @@ def main():
             since_iso=args.since,
             include_system=args.include_system,
             favorite_jids=favorite_jids,
+            dm_min_messages=dm_min_messages,
         )
     else:
         new_chats_state = extract_messages(
@@ -870,6 +904,7 @@ def main():
             since_iso=args.since,
             include_system=args.include_system,
             favorite_jids=favorite_jids,
+            dm_min_messages=dm_min_messages,
         )
 
     if new_chats_state is None:

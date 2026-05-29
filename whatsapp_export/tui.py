@@ -899,8 +899,11 @@ def _scope_jids_for_mode(mode: str, db: Path | None) -> set[str] | None:
         return None
     if mode == "favorites":
         import favorites as favs
-        jids = favs.jids()
-        return set(jids) if jids else set()
+        # Threshold-only configs have no explicit JIDs in the file — resolve
+        # the rule against the local DB so the plan preview shows what will
+        # actually sync. Falls back gracefully when no DB is available.
+        chats = list_chats_from_db(db) if db else []
+        return set(favs.effective_jids(chats))
     return None  # one-chat handled separately by the caller
 
 
@@ -1540,11 +1543,29 @@ def _pick_chats_multi(prompt, source_chats, preselect_jids=None):
 def _render_favorites_table():
     data = favs.load()
     items = data.get("favorites", [])
+    threshold = data.get("dm_min_messages")
+
+    if threshold is not None:
+        console.print(
+            f"[bold cyan]DM-threshold rule:[/] auto-include every 1-on-1 "
+            f"chat with ≥ [bold]{threshold}[/] messages "
+            f"[dim](resolved per source DB at sync time)[/]"
+        )
+
     if not items:
-        console.print("[yellow]No favorites yet.[/]")
+        if threshold is None:
+            console.print("[yellow]No favorites yet.[/]")
+        else:
+            console.print(
+                "[dim]Explicit list is empty — only the DM-threshold rule "
+                "is active.[/]"
+            )
         return
     cache = pipeline_state.load_cursor_cache(STATE_FILE)
-    table = Table(title=f"Favorites ({len(items)})", header_style="bold cyan")
+    title = f"Explicit favorites ({len(items)})"
+    if threshold is not None:
+        title += "  — groups + DMs below threshold"
+    table = Table(title=title, header_style="bold cyan")
     table.add_column("Name")
     table.add_column("JID", style="dim")
     table.add_column("Last commit", style="dim")
@@ -1569,16 +1590,22 @@ def action_favorites():
         _render_favorites_table()
         console.print()
 
+        has_threshold = favs.dm_threshold() is not None
+        menu_choices = [
+            Choice("➕  Add chats", "add"),
+            Choice("🎯  Set DM threshold (auto-include DMs with N+ msgs)", "set_threshold"),
+        ]
+        if has_threshold:
+            menu_choices.append(Choice("🚫  Clear DM threshold rule", "clear_threshold"))
+        menu_choices += [
+            Choice("➖  Remove chats", "remove"),
+            Choice("🗑   Clear all", "clear"),
+            Choice("🔂  Sync favorites now", "sync_now"),
+            Choice("← Back", "back"),
+        ]
         choice = questionary.select(
             "Manage favorites:",
-            choices=[
-                Choice("➕  Add chats", "add"),
-                Choice("📥  Add all DMs with more than N messages", "add_dms"),
-                Choice("➖  Remove chats", "remove"),
-                Choice("🗑   Clear all", "clear"),
-                Choice("🔂  Sync favorites now", "sync_now"),
-                Choice("← Back", "back"),
-            ],
+            choices=menu_choices,
         ).ask()
 
         if choice in (None, "back"):
@@ -1603,50 +1630,74 @@ def action_favorites():
             )
             console.print(f"[green]Added {added} new favorite(s)[/]")
             pause()
-        elif choice == "add_dms":
+        elif choice == "set_threshold":
             db = find_existing_chatstorage()
             if not db:
                 console.print("[red]No ChatStorage decrypted yet.[/] Run a sync first.")
                 pause()
                 continue
+            current_threshold = favs.dm_threshold()
+            default_val = str(current_threshold) if current_threshold else "600"
             threshold_str = questionary.text(
-                "Add DMs with at least how many messages?",
-                default="100",
+                "Auto-include every DM with at least how many messages?",
+                default=default_val,
                 validate=lambda t: t.strip().isdigit() and int(t.strip()) > 0,
             ).ask()
             if not threshold_str:
                 continue
             threshold = int(threshold_str.strip())
             all_chats = list_chats_from_db(db)
-            matching = favs.filter_dms_with_min_messages(all_chats, threshold)
-            if not matching:
-                console.print(
-                    f"[yellow]No DMs found with ≥ {threshold} messages.[/]"
-                )
-                pause()
-                continue
-            existing_jids = {f["jid"] for f in favs.load()["favorites"]}
-            new_matching = [c for c in matching if c["jid"] not in existing_jids]
+            matching_dms = favs.filter_dms_with_min_messages(all_chats, threshold)
+            matching_jids = {c["jid"] for c in matching_dms}
+            existing = favs.load()["favorites"]
+            explicit_jids = {f["jid"] for f in existing if f.get("jid")}
+            # What the prune will do (mirrors set_dm_threshold's logic so
+            # the preview matches the action).
+            redundant = {
+                jid for jid in explicit_jids
+                if not jid.endswith("@g.us") and jid in matching_jids
+            }
+            new_from_rule = matching_jids - explicit_jids
+            kept_explicit = explicit_jids - redundant
             console.print(
-                f"[cyan]Found {len(matching)} DM(s) with ≥ {threshold} messages "
-                f"({len(new_matching)} new, {len(matching) - len(new_matching)} "
-                f"already favorited).[/]"
+                f"[cyan]DM threshold: ≥ {threshold} messages → "
+                f"{len(matching_jids)} matching DM(s) in the local DB.[/]\n"
+                f"[dim]  • {len(redundant)} explicit favorite(s) will be "
+                f"removed (redundant — the rule re-includes them)\n"
+                f"  • {len(kept_explicit)} explicit favorite(s) will be kept "
+                f"(groups + DMs below threshold)\n"
+                f"  • {len(new_from_rule)} extra DM(s) will be auto-included "
+                f"by the rule at sync time[/]\n"
+                f"[bold]Effective sync set:[/] {len(kept_explicit) + len(matching_jids)} chat(s)"
             )
-            if not new_matching:
-                console.print("[dim]Nothing to add — all already in favorites.[/]")
-                pause()
-                continue
             if not questionary.confirm(
-                f"Add {len(new_matching)} new DM(s) to favorites?",
+                f"Apply DM threshold ≥ {threshold}?",
                 default=True,
             ).ask():
                 continue
-            added = favs.add(
-                [{"jid": c["jid"], "name": c.get("name")} for c in new_matching]
-            )
+            kept, removed = favs.set_dm_threshold(threshold, all_chats)
             console.print(
-                f"[green]Added {added} new favorite(s)[/]  "
-                f"[dim](union with existing — previous favorites untouched)[/]"
+                f"[green]✓ DM threshold set to ≥ {threshold}.[/]  "
+                f"[dim]{removed} redundant DM(s) pruned, {kept} explicit "
+                f"favorite(s) kept (groups + below-threshold DMs).[/]"
+            )
+            pause()
+        elif choice == "clear_threshold":
+            prev = favs.dm_threshold()
+            if prev is None:
+                console.print("[yellow]No threshold to clear.[/]")
+                pause()
+                continue
+            if not questionary.confirm(
+                f"Remove the DM threshold rule (currently ≥ {prev})? "
+                f"The explicit favorites list is untouched.",
+                default=True,
+            ).ask():
+                continue
+            favs.clear_dm_threshold()
+            console.print(
+                f"[green]✓ DM threshold cleared.[/]  "
+                f"[dim](Previous rule: ≥ {prev}. Explicit favorites unchanged.)[/]"
             )
             pause()
         elif choice == "remove":
@@ -2125,11 +2176,19 @@ def action_refresh_local():
 
     console.print(f"[cyan]Source:[/] {source_desc}")
 
-    # Scope: favorites if file has entries, else all chats.
+    # Scope: favorites if file has explicit entries OR a threshold rule
+    # (threshold-only configs still want --favorites; extract resolves the
+    # rule against each source DB).
     fav_jids = favs.jids()
-    if fav_jids:
+    threshold = favs.dm_threshold()
+    if fav_jids or threshold is not None:
         scope_flags = ["--favorites"]
-        scope_desc = f"favorites ({len(fav_jids)} chats)"
+        bits = []
+        if fav_jids:
+            bits.append(f"{len(fav_jids)} explicit")
+        if threshold is not None:
+            bits.append(f"DMs ≥ {threshold} msgs")
+        scope_desc = "favorites (" + ", ".join(bits) + ")"
     else:
         scope_flags = []
         scope_desc = "all chats"
@@ -2224,8 +2283,15 @@ def action_status():
     exports = sorted(EXPORTS_DIR.glob("whatsapp_export_*.json"))
     table.add_row("Local exports", f"{len(exports)} files" if exports else "[dim]none[/]")
     try:
-        fav_count = len(favs.load().get("favorites", []))
-        table.add_row("Favorites", f"{fav_count} chat(s)" if fav_count else "[dim]none[/]")
+        fav_data = favs.load()
+        fav_count = len(fav_data.get("favorites", []))
+        threshold = fav_data.get("dm_min_messages")
+        bits = []
+        if fav_count:
+            bits.append(f"{fav_count} explicit")
+        if threshold is not None:
+            bits.append(f"DMs ≥ {threshold} msgs (rule)")
+        table.add_row("Favorites", ", ".join(bits) if bits else "[dim]none[/]")
     except Exception:
         pass
     console.print(table)
