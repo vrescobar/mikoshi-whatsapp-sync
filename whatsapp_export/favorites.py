@@ -104,3 +104,24 @@ def clear(file: Path | None = None) -> int:
         data["favorites"] = []
         save(data, file)
     return n
+
+
+def filter_dms_with_min_messages(chats: Iterable[dict], threshold: int) -> list[dict]:
+    """Pick 1-on-1 chats with at least ``threshold`` messages.
+
+    Group JIDs (``@g.us``) are excluded — this helper backs the
+    "Add all DMs with more than N messages" bulk action, which is
+    explicitly DM-only. Rows missing a JID or msg_count are skipped.
+    """
+    if threshold < 0:
+        raise ValueError(f"threshold must be >= 0, got {threshold}")
+    out = []
+    for c in chats:
+        jid = c.get("jid")
+        if not jid or jid.endswith("@g.us"):
+            continue
+        count = c.get("msg_count")
+        if count is None or int(count) < threshold:
+            continue
+        out.append(c)
+    return out

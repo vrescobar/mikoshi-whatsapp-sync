@@ -9,17 +9,23 @@ The plist this module manages lives at::
 
     ~/Library/LaunchAgents/com.mikoshi.sync.plist
 
-It runs ``mikoshi-whatsapp.sh sync`` once per day at a user-picked
-hour/minute (local Mac timezone — launchd's ``StartCalendarInterval``
-is always local).
+It runs ``mikoshi-whatsapp.sh sync`` on a user-picked cadence (local
+Mac timezone — launchd's ``StartCalendarInterval`` is always local).
+Two cadences are supported:
 
-Layout (no per-second cron, no every-N-hours pattern — just one daily
-slot, the only thing the TUI needs to expose right now):
+* **daily** — fire once per day at HH:MM
+* **hourly** — fire once per hour at :MM (launchd interprets a
+  ``StartCalendarInterval`` dict with only ``Minute`` set as
+  "every hour at that minute")
+
+Layout:
 
     {
         Label: "com.mikoshi.sync",
         ProgramArguments: ["/bin/bash", "-lc", '"<abs-path>" sync'],
-        StartCalendarInterval: {Hour: 6, Minute: 30},
+        StartCalendarInterval: {Hour: 6, Minute: 30},   # daily
+        # …or, for hourly:
+        # StartCalendarInterval: {Minute: 15},
         StandardOutPath: "<logs>/launchagent.out.log",
         StandardErrorPath: "<logs>/launchagent.err.log",
         RunAtLoad: false,
@@ -50,9 +56,11 @@ STDERR_LOG = LOG_DIR / "launchagent.err.log"
 @dataclass
 class ScheduleInfo:
     enabled: bool
-    hour: int
+    # For "daily": local hour (0-23). For "hourly": None (any hour).
+    hour: int | None
     minute: int
     plist_path: Path
+    frequency: str = "daily"  # "daily" | "hourly"
 
 
 def current_schedule() -> ScheduleInfo | None:
@@ -77,27 +85,51 @@ def current_schedule() -> ScheduleInfo | None:
         return None
     hour = interval.get("Hour")
     minute = interval.get("Minute", 0)
+    # launchd treats a dict without an Hour key as "fire every hour at
+    # this minute". That's how we encode the hourly cadence.
     if hour is None:
-        return None
+        return ScheduleInfo(
+            enabled=not data.get("Disabled", False),
+            hour=None,
+            minute=int(minute),
+            plist_path=PLIST_PATH,
+            frequency="hourly",
+        )
     return ScheduleInfo(
         enabled=not data.get("Disabled", False),
         hour=int(hour),
         minute=int(minute),
         plist_path=PLIST_PATH,
+        frequency="daily",
     )
 
 
-def install_schedule(hour: int, minute: int) -> Path:
+def install_schedule(
+    hour: int | None,
+    minute: int,
+    frequency: str = "daily",
+) -> Path:
     """Write the plist and bootstrap it via launchctl.
 
     Replaces any existing entry — call ``disable_schedule`` first if
     you want a clean teardown, otherwise the bootstrap+bootout dance
     below handles the in-place update.
 
+    ``frequency`` is ``"daily"`` (default, fires once at HH:MM) or
+    ``"hourly"`` (fires once per hour at :MM; ``hour`` is ignored).
+
     Returns the path to the installed plist for logging.
     """
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        raise ValueError(f"hour/minute out of range: {hour:02d}:{minute:02d}")
+    if frequency not in ("daily", "hourly"):
+        raise ValueError(f"unknown frequency: {frequency!r}")
+    if not (0 <= minute <= 59):
+        raise ValueError(f"minute out of range: {minute}")
+    if frequency == "daily":
+        if hour is None or not (0 <= hour <= 23):
+            raise ValueError(f"hour out of range for daily: {hour}")
+        interval = {"Hour": int(hour), "Minute": int(minute)}
+    else:  # hourly — Hour key omitted ⇒ "every hour at this minute"
+        interval = {"Minute": int(minute)}
     if not WRAPPER.exists():
         # Misconfigured install would write a plist pointing at a non-
         # existent script, which launchd would load and then keep
@@ -113,7 +145,7 @@ def install_schedule(hour: int, minute: int) -> Path:
             "/bin/bash", "-lc",
             f'"{WRAPPER}" sync',
         ],
-        "StartCalendarInterval": {"Hour": int(hour), "Minute": int(minute)},
+        "StartCalendarInterval": interval,
         "StandardOutPath": str(STDOUT_LOG),
         "StandardErrorPath": str(STDERR_LOG),
         # RunAtLoad=false prevents launchd from firing one immediately

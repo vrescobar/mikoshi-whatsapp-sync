@@ -398,6 +398,60 @@ class TestFavoritesModule:
         assert favorites.clear(f) == 1
         assert favorites.jids(f) == []
 
+    def test_filter_dms_with_min_messages_excludes_groups(self):
+        import favorites
+        chats = [
+            {"jid": "alice@s.whatsapp.net", "name": "Alice", "msg_count": 500},
+            {"jid": "111-222@g.us", "name": "Big Group", "msg_count": 9000},
+            {"jid": "bob@s.whatsapp.net", "name": "Bob", "msg_count": 50},
+            {"jid": "carol@s.whatsapp.net", "name": "Carol", "msg_count": 100},
+        ]
+        out = favorites.filter_dms_with_min_messages(chats, 100)
+        jids = {c["jid"] for c in out}
+        assert jids == {"alice@s.whatsapp.net", "carol@s.whatsapp.net"}
+
+    def test_filter_dms_skips_rows_missing_fields(self):
+        import favorites
+        chats = [
+            {"jid": "alice@s.whatsapp.net", "msg_count": 200},
+            {"jid": None, "msg_count": 999},
+            {"jid": "no-count@s.whatsapp.net"},
+            {"jid": "zero@s.whatsapp.net", "msg_count": 0},
+        ]
+        out = favorites.filter_dms_with_min_messages(chats, 1)
+        assert {c["jid"] for c in out} == {"alice@s.whatsapp.net"}
+
+    def test_filter_dms_unions_via_add(self, tmp_path):
+        # The TUI's "Add all DMs" flow filters then calls favorites.add(),
+        # which dedups by JID — so previously-favorited chats are kept
+        # and not duplicated. This is the "union" semantics the user asked for.
+        import favorites
+        f = tmp_path / "favs.json"
+        favorites.add(
+            [{"jid": "alice@s.whatsapp.net", "name": "Alice"}], file=f
+        )
+        chats = [
+            {"jid": "alice@s.whatsapp.net", "name": "Alice", "msg_count": 1000},
+            {"jid": "bob@s.whatsapp.net", "name": "Bob", "msg_count": 1000},
+            {"jid": "g@g.us", "name": "Group", "msg_count": 9999},
+        ]
+        matching = favorites.filter_dms_with_min_messages(chats, 500)
+        added = favorites.add(
+            [{"jid": c["jid"], "name": c.get("name")} for c in matching],
+            file=f,
+        )
+        # Alice was already there → only Bob is new.
+        assert added == 1
+        assert set(favorites.jids(f)) == {
+            "alice@s.whatsapp.net",
+            "bob@s.whatsapp.net",
+        }
+
+    def test_filter_dms_rejects_negative_threshold(self):
+        import favorites
+        with pytest.raises(ValueError):
+            favorites.filter_dms_with_min_messages([], -1)
+
 
 # ─── Edge cases: malformed / empty DB ──────────────────────────────────────
 

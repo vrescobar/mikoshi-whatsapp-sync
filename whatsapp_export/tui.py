@@ -403,12 +403,20 @@ def _schedule_info_dict() -> dict | None:
     if info is None:
         return None
     now = datetime.now()
-    target = now.replace(hour=info.hour, minute=info.minute, second=0, microsecond=0)
-    if target <= now:
-        target += timedelta(days=1)
+    if info.frequency == "hourly":
+        target = now.replace(minute=info.minute, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(hours=1)
+    else:
+        target = now.replace(
+            hour=int(info.hour), minute=info.minute, second=0, microsecond=0
+        )
+        if target <= now:
+            target += timedelta(days=1)
     return {
         "enabled": bool(info.enabled),
-        "hour": int(info.hour),
+        "frequency": info.frequency,
+        "hour": int(info.hour) if info.hour is not None else None,
         "minute": int(info.minute),
         "next_fire_iso": target.isoformat(timespec="minutes"),
     }
@@ -803,7 +811,8 @@ def _schedule_row(snap: dict) -> str:
     info = snap.get("schedule_info")
     if not info:
         return "[dim]not scheduled[/] [dim](enable in “Schedule automatic sync”)[/]"
-    hh, mm = int(info["hour"]), int(info["minute"])
+    mm = int(info["minute"])
+    frequency = info.get("frequency", "daily")
     state = "[green]✓[/]" if info.get("enabled", True) else "[yellow]disabled[/]"
     next_iso = info.get("next_fire_iso")
     next_part = ""
@@ -811,11 +820,18 @@ def _schedule_row(snap: dict) -> str:
         try:
             target = datetime.fromisoformat(next_iso)
             now = datetime.now()
-            same_day = target.date() == now.date()
-            when = "today" if same_day else "tomorrow"
-            next_part = f"  [dim](next {when} {target.strftime('%H:%M')})[/]"
+            if frequency == "hourly":
+                mins = max(0, int((target - now).total_seconds() // 60))
+                next_part = f"  [dim](next in {mins} min)[/]"
+            else:
+                same_day = target.date() == now.date()
+                when = "today" if same_day else "tomorrow"
+                next_part = f"  [dim](next {when} {target.strftime('%H:%M')})[/]"
         except ValueError:
             pass
+    if frequency == "hourly":
+        return f"{state} hourly at [bold]:{mm:02d}[/]{next_part}"
+    hh = int(info["hour"])
     return f"{state} daily at [bold]{hh:02d}:{mm:02d}[/]{next_part}"
 
 
@@ -1557,6 +1573,7 @@ def action_favorites():
             "Manage favorites:",
             choices=[
                 Choice("➕  Add chats", "add"),
+                Choice("📥  Add all DMs with more than N messages", "add_dms"),
                 Choice("➖  Remove chats", "remove"),
                 Choice("🗑   Clear all", "clear"),
                 Choice("🔂  Sync favorites now", "sync_now"),
@@ -1585,6 +1602,52 @@ def action_favorites():
                 [{"jid": c["jid"], "name": c.get("name")} for c in picked]
             )
             console.print(f"[green]Added {added} new favorite(s)[/]")
+            pause()
+        elif choice == "add_dms":
+            db = find_existing_chatstorage()
+            if not db:
+                console.print("[red]No ChatStorage decrypted yet.[/] Run a sync first.")
+                pause()
+                continue
+            threshold_str = questionary.text(
+                "Add DMs with at least how many messages?",
+                default="100",
+                validate=lambda t: t.strip().isdigit() and int(t.strip()) > 0,
+            ).ask()
+            if not threshold_str:
+                continue
+            threshold = int(threshold_str.strip())
+            all_chats = list_chats_from_db(db)
+            matching = favs.filter_dms_with_min_messages(all_chats, threshold)
+            if not matching:
+                console.print(
+                    f"[yellow]No DMs found with ≥ {threshold} messages.[/]"
+                )
+                pause()
+                continue
+            existing_jids = {f["jid"] for f in favs.load()["favorites"]}
+            new_matching = [c for c in matching if c["jid"] not in existing_jids]
+            console.print(
+                f"[cyan]Found {len(matching)} DM(s) with ≥ {threshold} messages "
+                f"({len(new_matching)} new, {len(matching) - len(new_matching)} "
+                f"already favorited).[/]"
+            )
+            if not new_matching:
+                console.print("[dim]Nothing to add — all already in favorites.[/]")
+                pause()
+                continue
+            if not questionary.confirm(
+                f"Add {len(new_matching)} new DM(s) to favorites?",
+                default=True,
+            ).ask():
+                continue
+            added = favs.add(
+                [{"jid": c["jid"], "name": c.get("name")} for c in new_matching]
+            )
+            console.print(
+                f"[green]Added {added} new favorite(s)[/]  "
+                f"[dim](union with existing — previous favorites untouched)[/]"
+            )
             pause()
         elif choice == "remove":
             data = favs.load()
@@ -1710,7 +1773,7 @@ HELP_TOPICS = [
     ("⚡  Sync command-line flags (mikoshi-whatsapp.sh)", "cli"),
     ("🪢  Two-source model: iPhone backup + Mac live", "sources"),
     ("📍  What is a cursor? (and drift states)", "cursor"),
-    ("⏰  LaunchAgent: how the daily auto-sync works", "schedule"),
+    ("⏰  LaunchAgent: how the daily/hourly auto-sync works", "schedule"),
     ("📂  Where the user guide lives (in-repo doc)", "guide"),
 ]
 
@@ -1752,8 +1815,8 @@ def _help_panel(topic: str) -> str:
             "(stored in ~/.mikoshi-favorites.json). Plain `sync` uses these "
             "automatically when the file exists.\n\n"
             "[bold]⏰  Schedule automatic sync[/] — install / change / remove "
-            "a daily LaunchAgent that runs `mikoshi-whatsapp.sh sync` at a "
-            "user-picked time (Mac local).\n\n"
+            "a LaunchAgent that runs `mikoshi-whatsapp.sh sync` either daily "
+            "at a user-picked HH:MM or hourly at a user-picked :MM (Mac local).\n\n"
             "[bold]⚙   Setup & verify[/] — run setup checks, validate "
             "Mikoshi auth against /cursor, edit ~/.mikoshi-ingest.conf, "
             "verify backup integrity (1-4 levels of thoroughness).\n\n"
@@ -1828,9 +1891,11 @@ def _help_panel(topic: str) -> str:
             "The Schedule action manages a single LaunchAgent at\n"
             "[cyan]~/Library/LaunchAgents/com.mikoshi.sync.plist[/].\n\n"
             "When enabled, launchd runs [bold]./mikoshi-whatsapp.sh sync[/]\n"
-            "at the user-picked time (Mac local time, daily). Sync uses\n"
-            "auto-detected sources + favorites, so the agent does the right\n"
-            "thing without any further configuration.\n\n"
+            "on one of two cadences (Mac local time):\n"
+            "  • [bold]daily[/]  at a user-picked HH:MM\n"
+            "  • [bold]hourly[/] at a user-picked :MM (1× per hour)\n"
+            "Sync uses auto-detected sources + favorites, so the agent\n"
+            "does the right thing without any further configuration.\n\n"
             "Why launchd vs cron: launchd survives sleep, recovers missed\n"
             "runs after wake, and integrates with macOS's power-management.\n"
             "Cron still works if the user prefers — see README's manual\n"
@@ -1874,11 +1939,18 @@ def action_schedule():
         if info is None:
             status = "[dim]Not scheduled — automatic sync is disabled.[/]"
             current_label = None
+            current_frequency = None
         else:
-            current_label = f"{info.hour:02d}:{info.minute:02d}"
+            current_frequency = info.frequency
+            if info.frequency == "hourly":
+                current_label = f":{info.minute:02d}"
+                cadence_desc = f"hourly at [bold]{current_label}[/]"
+            else:
+                current_label = f"{info.hour:02d}:{info.minute:02d}"
+                cadence_desc = f"daily at [bold]{current_label}[/]"
             state = "[green]enabled[/]" if info.enabled else "[yellow]disabled[/]"
             status = (
-                f"{state}, daily at [bold]{current_label}[/] (Mac local time)\n"
+                f"{state}, {cadence_desc} (Mac local time)\n"
                 f"[dim]Plist: {info.plist_path}[/]"
             )
 
@@ -1895,9 +1967,15 @@ def action_schedule():
 
         choices = []
         if info is None:
-            choices.append(Choice("🟢  Enable — pick a daily time", "enable"))
+            choices.append(Choice("🟢  Enable daily — pick HH:MM", "enable_daily"))
+            choices.append(Choice("🕒  Enable hourly — pick :MM (1× per hour)", "enable_hourly"))
         else:
-            choices.append(Choice(f"🔁  Change time (currently {current_label})", "enable"))
+            if current_frequency == "hourly":
+                choices.append(Choice(f"🔁  Change hourly minute (currently {current_label})", "enable_hourly"))
+                choices.append(Choice("📅  Switch to daily at HH:MM", "enable_daily"))
+            else:
+                choices.append(Choice(f"🔁  Change daily time (currently {current_label})", "enable_daily"))
+                choices.append(Choice("🕒  Switch to hourly (1× per hour at :MM)", "enable_hourly"))
             choices.append(Choice("🔴  Disable — remove the LaunchAgent", "disable"))
         choices.append(Choice("← Back", "__back__"))
 
@@ -1905,10 +1983,15 @@ def action_schedule():
         if action in (None, "__back__"):
             return
 
-        if action == "enable":
+        if action == "enable_daily":
+            default_time = (
+                current_label
+                if current_label and current_frequency == "daily"
+                else "06:00"
+            )
             time_str = questionary.text(
                 "Daily run time (HH:MM, Mac local):",
-                default=current_label or "06:00",
+                default=default_time,
                 validate=lambda t: bool(re.fullmatch(r"\d{2}:\d{2}", t.strip())) and
                                    _valid_hhmm(t.strip()),
             ).ask()
@@ -1916,9 +1999,33 @@ def action_schedule():
                 continue
             hour, minute = (int(x) for x in time_str.strip().split(":"))
             try:
-                path = scheduler.install_schedule(hour, minute)
+                path = scheduler.install_schedule(hour, minute, frequency="daily")
                 console.print(
                     f"[green]✓ LaunchAgent installed:[/] daily at {hour:02d}:{minute:02d}.\n"
+                    f"[dim]{path}[/]"
+                )
+            except (RuntimeError, ValueError, FileNotFoundError) as e:
+                console.print(f"[red]Failed:[/] {e}")
+            pause()
+
+        elif action == "enable_hourly":
+            default_minute = (
+                f"{info.minute:02d}"
+                if info and current_frequency == "hourly"
+                else "15"
+            )
+            minute_str = questionary.text(
+                "Run every hour at minute (00-59):",
+                default=default_minute,
+                validate=lambda t: t.strip().isdigit() and 0 <= int(t.strip()) <= 59,
+            ).ask()
+            if not minute_str:
+                continue
+            minute = int(minute_str.strip())
+            try:
+                path = scheduler.install_schedule(None, minute, frequency="hourly")
+                console.print(
+                    f"[green]✓ LaunchAgent installed:[/] hourly at :{minute:02d}.\n"
                     f"[dim]{path}[/]"
                 )
             except (RuntimeError, ValueError, FileNotFoundError) as e:
@@ -2134,7 +2241,7 @@ ACTIONS = [
     ("🔂  Sync (recommended)",           "sync"),
     ("📊  Inspect (List chats, drift, status)", "inspect"),
     ("📌  Manage favorites",             "favorites"),
-    ("⏰  Schedule automatic sync (LaunchAgent)", "schedule"),
+    ("⏰  Schedule automatic sync (LaunchAgent, daily or hourly)", "schedule"),
     ("⚙   Setup & verify (Verify setup, auth, config)", "setup"),
     ("🛠   Tools (Push, sqlite, advanced)", "tools"),
     ("📚  Help — cheatsheet & docs",      "help"),

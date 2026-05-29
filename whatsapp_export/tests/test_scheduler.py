@@ -152,6 +152,58 @@ class TestInstallSchedule:
         info = scheduler.current_schedule()
         assert info is not None
         assert (info.hour, info.minute) == (9, 15)
+        assert info.frequency == "daily"
+
+
+# ─── hourly cadence ────────────────────────────────────────────────────────
+
+
+class TestHourlySchedule:
+    def test_hourly_plist_has_no_hour_key(self, patched_paths, mocked_launchctl):
+        # launchd treats {"Minute": N} (no "Hour") as "fire every hour at N".
+        path = scheduler.install_schedule(None, 15, frequency="hourly")
+        with open(path, "rb") as f:
+            data = plistlib.load(f)
+        assert data["StartCalendarInterval"] == {"Minute": 15}
+        assert "Hour" not in data["StartCalendarInterval"]
+
+    def test_hourly_round_trip(self, patched_paths, mocked_launchctl):
+        scheduler.install_schedule(None, 42, frequency="hourly")
+        info = scheduler.current_schedule()
+        assert info is not None
+        assert info.frequency == "hourly"
+        assert info.hour is None
+        assert info.minute == 42
+        assert info.enabled is True
+
+    def test_hourly_ignores_hour_arg(self, patched_paths, mocked_launchctl):
+        # Passing an hour value is harmless in hourly mode; it gets dropped.
+        scheduler.install_schedule(99, 30, frequency="hourly")
+        info = scheduler.current_schedule()
+        assert info is not None
+        assert info.frequency == "hourly"
+        assert info.minute == 30
+
+    def test_daily_requires_valid_hour(self, patched_paths, mocked_launchctl):
+        with pytest.raises(ValueError):
+            scheduler.install_schedule(None, 30, frequency="daily")
+
+    def test_rejects_unknown_frequency(self, patched_paths, mocked_launchctl):
+        with pytest.raises(ValueError):
+            scheduler.install_schedule(6, 0, frequency="weekly")
+
+    def test_hourly_rejects_invalid_minute(self, patched_paths, mocked_launchctl):
+        with pytest.raises(ValueError):
+            scheduler.install_schedule(None, 60, frequency="hourly")
+
+    def test_switching_daily_to_hourly_replaces_plist(self, patched_paths, mocked_launchctl):
+        scheduler.install_schedule(6, 30)
+        scheduler.install_schedule(None, 15, frequency="hourly")
+        info = scheduler.current_schedule()
+        assert info is not None
+        assert info.frequency == "hourly"
+        assert info.hour is None
+        assert info.minute == 15
 
 
 # ─── disable_schedule ──────────────────────────────────────────────────────
