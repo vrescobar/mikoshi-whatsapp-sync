@@ -89,6 +89,7 @@ KEEP_LOCAL_EXPORTS="${KEEP_LOCAL_EXPORTS:-5}"
 FAVORITES_FILE=""
 USE_FAVORITES=false
 FROM_PHASE=1
+RECONCILE=false
 
 usage() {
     cat <<USAGE
@@ -110,6 +111,10 @@ Options:
         Run extraction but don't push to Mikoshi. The cursor cache is NOT
         advanced when push is skipped — there is no commit, so there's no
         confirmation to record.
+  --reconcile
+        Before pushing, ask the server which messages/media it is missing per
+        chat and send only those (server-authoritative gap repair). Best with
+        --mode full. Degrades to a full push on an old server (404).
   --keep-local <N>
         Override KEEP_LOCAL_EXPORTS (default 5).
   --favorites [PATH]
@@ -145,6 +150,7 @@ while [[ $# -gt 0 ]]; do
         --since) SINCE="$2"; shift 2 ;;
         --include-system) INCLUDE_SYSTEM=true; shift ;;
         --skip-remote-sync) SKIP_SYNC=true; shift ;;
+        --reconcile) RECONCILE=true; shift ;;
         --keep-local) KEEP_LOCAL_EXPORTS="$2"; shift 2 ;;
         --favorites)
             USE_FAVORITES=true
@@ -638,12 +644,16 @@ sync_remote() {
         return 1
     fi
 
-    log "Pushing $manifest to $MIKOSHI_URL"
+    # Server-authoritative gap repair: only (re)send what the server reports
+    # missing per chat. Word-splits to nothing when off (bash 3.2 safe).
+    local reconcile_arg=""
+    [[ "$RECONCILE" == true ]] && reconcile_arg="--reconcile"
+    log "Pushing $manifest to $MIKOSHI_URL${reconcile_arg:+ (reconcile)}"
     if MIKOSHI_URL="$MIKOSHI_URL" MIKOSHI_TOKEN="$MIKOSHI_TOKEN" \
         python3 "$SCRIPT_DIR/push_via_api.py" \
             --manifest "$manifest" \
             --attachments-dir "$ATTACHMENTS_DIR" \
-            --state-file "$STATE_FILE"; then
+            --state-file "$STATE_FILE" $reconcile_arg; then
         log "✓ Mikoshi push OK (cursor cache updated from server response)"
         SYNC_SUCCEEDED=true
     else
