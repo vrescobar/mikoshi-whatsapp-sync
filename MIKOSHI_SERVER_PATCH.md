@@ -118,6 +118,78 @@ This means the wire transition can happen one row at a time as each
 chat is re-synced from the new client. Server-side tests live in
 `tests/apiIngestCommit.test.ts`.
 
+## Endpoint 3 — `POST /api/ingest/v1/reconcile` (server-authoritative gap repair)
+
+### Status: **shipped** on the Mikoshi server (`src/ingestion/routes/handleIngestReconcile.ts`)
+
+Fixes the failure mode where the client's local cursor is *ahead* of what
+the server actually stored (a half-finished commit, a lost/corrupt media
+blob): incremental sync never re-sends below the watermark, so the gap is
+permanent. The repair principle: **the server decides what's missing, not
+the client.**
+
+### Request
+
+```http
+POST /api/ingest/v1/reconcile
+Authorization: Bearer <ingest-token>
+Content-Type: application/json
+
+{
+  "chat_jid": "123@g.us",
+  "external_ids": ["wa:A", "wa:B", "wa:C", "..."],
+  "media_hashes": ["<sha256>", "..."]
+}
+```
+
+The client sends the **full** inventory it has for one chat (ids + media
+sha256). Produce it with a full extract (`extract_messages.py --mode full
+--chat-jid <jid>`), not an incremental one.
+
+### Response (200 OK)
+
+```json
+{
+  "account_id": "main",
+  "chat_jid": "123@g.us",
+  "missing_messages": ["wa:B"],
+  "missing_media": ["<sha256>"],
+  "present_messages": 2
+}
+```
+
+- `missing_messages` — ids the server has no row for (gaps to fill).
+- `missing_media` — hashes the server lacks a **usable blob** for: no
+  `media_files` row, OR the row exists but the on-disk blob is absent or
+  zero-length (lost/corrupt sync). Checked against the server's own
+  filesystem.
+
+### Client usage
+
+`push_via_api.py --reconcile` does the round-trip automatically: per chat it
+calls this endpoint and trims the manifest to only the messages the server is
+missing **plus** any present message whose media blob the server lost (so the
+bytes get re-uploaded). Then the normal `manifest → media → commit` runs on
+the trimmed set. Pair it with a full extract:
+
+```bash
+# 1. full extract of the chat (ignores the cursor)
+extract_messages.py --mode full --chat-jid 123@g.us --output /tmp/full.json ...
+# 2. push only what the server is missing
+push_via_api.py --manifest /tmp/full.json --attachments-dir ... --reconcile
+```
+
+If the endpoint is absent (old Mikoshi → 404), `--reconcile` logs a warning
+and pushes the full manifest unchanged (the server still dedups).
+
+### Related server behaviour: blob-aware `prepare`
+
+Independently of `/reconcile`, the commit `prepare` step now treats a media
+hash as "needed" when the `media_files` row exists but the on-disk blob is
+missing/zero-length — not only when the row is absent. So even a plain full
+re-push (`--mode full`, no `--reconcile`) now recovers media lost to a
+half-finished sync, without the client tracking anything.
+
 ## What is **explicitly out**
 
 - **No server-side wipe / rewind endpoint.** A previous draft of this

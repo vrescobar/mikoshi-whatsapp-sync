@@ -717,6 +717,88 @@ def push_one_batch(
     return 0
 
 
+def reconcile_manifest(url: str, token: str, manifest: dict) -> dict:
+    """Trim a (full) manifest down to only what the SERVER is missing.
+
+    For each chat, ask `POST /api/ingest/v1/reconcile` what message ids and
+    media hashes it lacks (the server answers from its own DB + filesystem —
+    we never trust the local cursor to decide this). Keep a message iff the
+    server is missing it OR it carries a media blob the server is missing
+    (so a present message whose blob was lost on the server still re-uploads).
+
+    Degrades gracefully: if the endpoint is absent (404, old Mikoshi) or
+    errors, the chat is left untouched and the normal push proceeds (the
+    server still dedups; a current server also re-requests lost blobs at
+    prepare time). Returns the trimmed manifest (mutated copy of chats).
+    """
+    endpoint = url.rstrip("/") + "/api/ingest/v1/reconcile"
+    kept_chats: list[dict] = []
+    total_kept = 0
+    warned_absent = False
+    for chat in manifest.get("chats", []):
+        msgs = chat.get("messages", [])
+        external_ids = [m["external_id"] for m in msgs if m.get("external_id")]
+        media_hashes = sorted(
+            {
+                m["attachment"]["sha256"]
+                for m in msgs
+                if isinstance(m.get("attachment"), dict)
+                and m["attachment"].get("skipped") is False
+                and m["attachment"].get("sha256")
+            }
+        )
+        status, body = post_json(
+            endpoint,
+            token,
+            {"chat_jid": chat["jid"], "external_ids": external_ids, "media_hashes": media_hashes},
+            timeout=120.0,
+            retry_label="reconcile",
+        )
+        if status != 200 or not isinstance(body, dict):
+            if status == 404 and not warned_absent:
+                print(
+                    "[WARN] server has no /reconcile endpoint (old Mikoshi) — pushing the "
+                    "full manifest; the server still dedups duplicates.",
+                    file=sys.stderr,
+                )
+                warned_absent = True
+            elif status != 404:
+                print(
+                    f"[WARN] reconcile for {chat['jid']} returned {status}; pushing this chat in full.",
+                    file=sys.stderr,
+                )
+            kept_chats.append(chat)
+            total_kept += len(msgs)
+            continue
+
+        missing_msgs = set(body.get("missing_messages", []))
+        missing_media = set(body.get("missing_media", []))
+        kept = [
+            m
+            for m in msgs
+            if m.get("external_id") in missing_msgs
+            or (
+                isinstance(m.get("attachment"), dict)
+                and m["attachment"].get("skipped") is False
+                and m["attachment"].get("sha256") in missing_media
+            )
+        ]
+        print(
+            f"[INFO] reconcile {chat['jid']}: server missing "
+            f"{len(missing_msgs)} msgs / {len(missing_media)} media → re-sending {len(kept)} of {len(msgs)}",
+        )
+        if kept:
+            kept_chats.append({**chat, "messages": kept})
+            total_kept += len(kept)
+
+    trimmed = {**manifest, "chats": kept_chats}
+    stats = dict(trimmed.get("stats", {}))
+    stats["total_chats"] = len(kept_chats)
+    stats["total_messages"] = total_kept
+    trimmed["stats"] = stats
+    return trimmed
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Push a WhatsApp export to a Mikoshi server.")
     parser.add_argument("--manifest", required=True, type=Path, help="Path to export JSON (schema_version 1.2).")
@@ -776,6 +858,16 @@ def main() -> int:
         default=30.0,
         help="How often to log '[INFO] still waiting for commit response…' during /commit.",
     )
+    parser.add_argument(
+        "--reconcile",
+        action="store_true",
+        help=(
+            "Before pushing, ask the server which messages/media it is missing "
+            "per chat and send only those (server-authoritative gap repair). "
+            "Pair with a FULL manifest (extract --mode full) to recover gaps and "
+            "lost/corrupt media. Degrades to a full push on an old server."
+        ),
+    )
     args = parser.parse_args()
 
     cfg = load_config()
@@ -800,6 +892,15 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+
+    if args.reconcile:
+        before = sum(len(c.get("messages", [])) for c in manifest.get("chats", []))
+        manifest = reconcile_manifest(url, token, manifest)
+        after = sum(len(c.get("messages", [])) for c in manifest.get("chats", []))
+        print(f"[INFO] reconcile: {after} of {before} messages need (re)sending")
+        if after == 0:
+            print("[OK] nothing missing on the server — already in sync.")
+            return 0
 
     batches = split_manifest_by_size(manifest, args.batch_bytes, args.batch_messages)
     is_single_batch = len(batches) == 1
