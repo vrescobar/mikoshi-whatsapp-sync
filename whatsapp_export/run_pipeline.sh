@@ -575,8 +575,29 @@ extract_and_export() {
         log "  Favorites file: $FAVORITES_FILE"
     fi
 
-    if ! python3 "$EXTRACTOR" "${args[@]}"; then
-        error "Message extraction failed"
+    # Watchdog: a stalled extract (e.g. a flaky external backup volume, or a
+    # pathological lookup) must not hang forever — a live-but-hung process
+    # keeps $LOCK_FILE held, which blocks every subsequent cron run (launchd
+    # won't start a new instance and acquire_lock() only reclaims DEAD owners).
+    # Wrap it in a hard timeout so a stall self-clears and releases the lock.
+    # Tunable via MIKOSHI_EXTRACT_TIMEOUT (seconds; 0 disables).
+    local extract_timeout="${MIKOSHI_EXTRACT_TIMEOUT:-2700}"
+    local timeout_bin=""
+    command -v gtimeout >/dev/null 2>&1 && timeout_bin="gtimeout"
+    [[ -z "$timeout_bin" ]] && command -v timeout >/dev/null 2>&1 && timeout_bin="timeout"
+
+    local rc=0
+    if [[ -n "$timeout_bin" && "$extract_timeout" != "0" ]]; then
+        "$timeout_bin" --signal=KILL "$extract_timeout" python3 "$EXTRACTOR" "${args[@]}" || rc=$?
+        if [[ "$rc" == "137" || "$rc" == "124" ]]; then
+            error "Message extraction timed out after ${extract_timeout}s (killed) — lock released for next run"
+            return 1
+        fi
+    else
+        python3 "$EXTRACTOR" "${args[@]}" || rc=$?
+    fi
+    if [[ "$rc" != "0" ]]; then
+        error "Message extraction failed (rc=$rc)"
         return 1
     fi
     log "✓ Export: $EXPORT_FILE"

@@ -240,16 +240,24 @@ def find_attachment_file(media_local_path, extracted_root, attachments_index=Non
         if target_rel in by_relpath:
             return Path(by_relpath[target_rel])
 
-        # The decrypter may write WhatsApp shared media under an extra
-        # prefix (e.g. "media/Media/foo.jpg" when the relpath in the DB is
-        # just "Media/foo.jpg"). Try the suffix match.
-        for rel, full in by_relpath.items():
-            if rel.endswith("/" + target_rel) or rel == target_rel:
-                return Path(full)
-
-        # Last resort: any file with the same basename.
+        # Suffix match. The decrypter may write WhatsApp shared media under
+        # an extra prefix (e.g. "media/Media/foo.jpg" when the relpath in the
+        # DB is just "Media/foo.jpg"). A suffix match can ONLY succeed among
+        # files that share the basename, so restrict the scan to that bucket
+        # (by_basename, already indexed) instead of walking every entry in
+        # by_relpath. The old full-index scan was O(index_size) PER attachment
+        # — on a large iPhone backup (200k+ decrypted files × tens of
+        # thousands of attachments) that is billions of comparisons and the
+        # extractor appears to hang for hours. Bounding it to same-basename
+        # candidates makes it effectively O(1).
         candidates = by_basename.get(target_name)
         if candidates:
+            suffix = "/" + target_rel
+            for full in candidates:
+                f = full.replace(os.sep, "/")
+                if f.endswith(suffix):
+                    return Path(full)
+            # Same basename but no path-suffix match — best effort.
             return Path(candidates[0])
         return None
 
