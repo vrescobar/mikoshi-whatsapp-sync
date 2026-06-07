@@ -702,12 +702,31 @@ gc_local_exports() {
 
     local count
     count=$(echo "$stale_jsons" | wc -l | xargs)
-    log "Shredding $count old export(s)"
-    echo "$stale_jsons" | xargs -I{} shred -vfz -n 3 {} 2>/dev/null || true
+    # Portable delete: shred when available (Linux/jetson), else plain rm.
+    # macOS has no `shred`, and overwrite-on-delete is meaningless on APFS/SSD
+    # anyway. Exports are regenerable artifacts (never source data) and the
+    # data itself is safe in Mikoshi + the iPhone backup, so rm is correct.
+    # NOTE: the old `shred` (no -u, no rm) never actually removed the files,
+    # so on every platform stale exports used to accumulate — fixed here.
+    if command -v shred >/dev/null 2>&1; then
+        log "Securely shredding $count old export(s)"
+        echo "$stale_jsons" | while IFS= read -r f; do
+            [[ -n "$f" ]] || continue
+            shred -vfz -n 3 "$f" 2>/dev/null || true
+            rm -f "$f" 2>/dev/null || true
+        done
+    else
+        log "Removing $count old export(s)"
+        echo "$stale_jsons" | while IFS= read -r f; do
+            [[ -n "$f" ]] || continue
+            rm -f "$f" 2>/dev/null || true
+        done
+    fi
 
     python3 - <<PYEOF
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -715,6 +734,11 @@ exports = Path("$EXPORTS_DIR")
 attachments = Path("$ATTACHMENTS_DIR")
 if not attachments.exists():
     raise SystemExit(0)
+
+# `shred` only exists on Linux (jetson). On macOS it isn't installed — calling
+# it raised FileNotFoundError and aborted the whole GC. Use it when present,
+# otherwise just unlink (these attachments are already pushed to Mikoshi).
+_shred = shutil.which("shred")
 
 referenced = set()
 for j in exports.glob("whatsapp_export_*.json"):
@@ -732,8 +756,9 @@ for j in exports.glob("whatsapp_export_*.json"):
 removed = 0
 for f in attachments.iterdir():
     if f.is_file() and f.name not in referenced:
-        subprocess.run(["shred", "-vfz", "-n", "3", str(f)],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if _shred:
+            subprocess.run([_shred, "-vfz", "-n", "3", str(f)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             f.unlink(missing_ok=True)
         except Exception:
