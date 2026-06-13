@@ -150,10 +150,17 @@ def _to_json_safe(snap: dict) -> dict[str, Any]:
 
     sched = snap.get("schedule_info")
     if sched:
+        # `hour` is legitimately None for hourly schedules — preserve it as
+        # null rather than coercing to 0 (int(None) used to crash here, and
+        # forcing 0 would mis-render hourly as "daily at 00:MM"). `frequency`
+        # must round-trip too: the renderer keys off it, and dropping it made
+        # a cached hourly schedule fall back to the "daily" branch.
+        raw_hour = sched.get("hour")
         out["schedule_info"] = {
             "enabled": bool(sched.get("enabled")),
-            "hour": int(sched.get("hour", 0)),
-            "minute": int(sched.get("minute", 0)),
+            "frequency": sched.get("frequency", "daily"),
+            "hour": int(raw_hour) if raw_hour is not None else None,
+            "minute": int(sched.get("minute") or 0),
             "next_fire_iso": sched.get("next_fire_iso"),
         }
     else:

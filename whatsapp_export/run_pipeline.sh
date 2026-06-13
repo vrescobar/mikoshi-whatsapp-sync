@@ -192,7 +192,18 @@ fi
 
 mkdir -p "$LOG_DIR" "$EXPORTS_DIR" "$ATTACHMENTS_DIR"
 
-if [[ "$TEMP_DIR_IS_EXTERNAL" == true ]]; then
+# The external backup workspace ($TEMP_DIR) is only touched by the iPhone
+# phases (backup → decrypt → extract from the encrypted backup). A Mac-only
+# sync (MIKOSHI_SOURCES set without iphone_backup) reads the WhatsApp DB
+# straight off the Mac and never needs that drive — so don't abort or even
+# mkdir into it just because the external drive isn't mounted. Otherwise
+# `mkdir -p` would silently create a local dir shadowing the mount point.
+NEEDS_BACKUP_WORKSPACE=true
+if [[ -n "${MIKOSHI_SOURCES:-}" && ",${MIKOSHI_SOURCES}," != *",iphone_backup,"* ]]; then
+    NEEDS_BACKUP_WORKSPACE=false
+fi
+
+if [[ "$TEMP_DIR_IS_EXTERNAL" == true && "$NEEDS_BACKUP_WORKSPACE" == true ]]; then
     parent="$(dirname "$TEMP_DIR")"
     if [[ ! -d "$parent" ]]; then
         echo "ERROR: MIKOSHI_BACKUP_DIR parent does not exist: $parent"
@@ -200,7 +211,9 @@ if [[ "$TEMP_DIR_IS_EXTERNAL" == true ]]; then
         exit 1
     fi
 fi
-mkdir -p "$TEMP_DIR"
+if [[ "$NEEDS_BACKUP_WORKSPACE" == true ]]; then
+    mkdir -p "$TEMP_DIR"
+fi
 
 exec > >(tee -a "$PIPELINE_LOG") 2>&1
 
@@ -209,7 +222,7 @@ error() { echo -e "${RED}[ERROR $(date '+%Y-%m-%d %H:%M:%S')]${NC} $1" >&2; }
 warn()  { echo -e "${YELLOW}[WARN $(date '+%Y-%m-%d %H:%M:%S')]${NC} $1"; }
 info()  { echo -e "${BLUE}[INFO]${NC} $1"; }
 
-if [[ "$TEMP_DIR_IS_EXTERNAL" == true ]]; then
+if [[ "$TEMP_DIR_IS_EXTERNAL" == true && "$NEEDS_BACKUP_WORKSPACE" == true ]]; then
     log "Using external backup dir: $TEMP_DIR"
     free_gb=$(df -g "$TEMP_DIR" | awk 'NR==2 {print $4}')
     log "  Free space: ${free_gb} GB"
@@ -723,19 +736,26 @@ gc_local_exports() {
         done
     fi
 
-    python3 - <<PYEOF
+    # NOTE: quoted heredoc delimiter ('PYEOF') so bash does NOT expand the
+    # body. The comments below mention `shred` in backticks; with an unquoted
+    # delimiter bash command-substituted those backticks and ran a bare
+    # `shred`, leaking "shred: missing file operand" on every GC. Paths are
+    # passed via the environment instead of "$EXPORTS_DIR" interpolation,
+    # which is also safer against odd characters in the path.
+    MIKOSHI_GC_EXPORTS="$EXPORTS_DIR" MIKOSHI_GC_ATTACHMENTS="$ATTACHMENTS_DIR" \
+    python3 - <<'PYEOF'
 import json
 import os
 import shutil
 import subprocess
 from pathlib import Path
 
-exports = Path("$EXPORTS_DIR")
-attachments = Path("$ATTACHMENTS_DIR")
+exports = Path(os.environ["MIKOSHI_GC_EXPORTS"])
+attachments = Path(os.environ["MIKOSHI_GC_ATTACHMENTS"])
 if not attachments.exists():
     raise SystemExit(0)
 
-# `shred` only exists on Linux (jetson). On macOS it isn't installed — calling
+# shred only exists on Linux (jetson). On macOS it isn't installed — calling
 # it raised FileNotFoundError and aborted the whole GC. Use it when present,
 # otherwise just unlink (these attachments are already pushed to Mikoshi).
 _shred = shutil.which("shred")
