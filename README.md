@@ -21,6 +21,7 @@ The server side lives **inside Mikoshi** itself (`src/ingestion/`, exposed at
 | `pipeline_state.py` | Shared state helpers: cursor cache, drift detection, plan computation, `best_from_phase`. Used by the TUI and the cron path so they agree. |
 | `mikoshi-whatsapp.sh` | Single entrypoint: TUI by default, `sync`/`status`/`test-auth`/`purge-extracted`/`reset-backup`/`verify-backup`. |
 | `tui.py` | Interactive menu — Sync, Inspect (drift), Favorites, Setup & verify, Tools. |
+| `gui/` | Native macOS menu-bar app — scopes Full Disk Access to one signed app, controls sync/schedule/favorites/config. See [gui/README.md](whatsapp_export/gui/README.md). |
 
 ## Quick start
 
@@ -220,6 +221,24 @@ rather than failing.
 The lock file (`.pipeline.lock`) prevents concurrent runs. Stale locks
 are detected and reclaimed automatically (the pre-redesign behaviour
 required manual `rm` after a `kill -9`).
+
+## Menu-bar app (Full Disk Access, scoped)
+
+Syncing the `mac_live` source reads the Mac WhatsApp database, which macOS
+protects behind Full Disk Access — hence the recurring *"…would like to access
+data from other apps"* prompt. Granting FDA to `/bin/bash` would leak that access
+to **every** script you run. The native menu-bar app in [`gui/`](whatsapp_export/gui/)
+exists to scope the grant to **one code-signed app**: FDA goes to `Mikoshi.app`
+only, and its child sync processes (manual *and* the launchd-scheduled
+`--sync-now` runs) inherit it, while your Terminal stays unprivileged.
+
+```bash
+cd whatsapp_export/gui && ./install.sh
+```
+
+It also gives a tray UI for sync/pause/resume, a chat-browser favorites picker,
+and a config editor. Full details and the one-time signing-cert step are in
+[gui/README.md](whatsapp_export/gui/README.md).
 
 ## Schema
 
