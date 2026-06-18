@@ -135,10 +135,20 @@ final class StatusVC: NSViewController {
 // MARK: - Favorites tab
 
 final class FavoritesVC: NSViewController, NSTableViewDataSource, NSTableViewDelegate,
-                         NSTextFieldDelegate {
+                         NSTextFieldDelegate, NSSearchFieldDelegate {
+    private enum SortKey: String { case name, count, jid, selected }
+
+    /// Every chat read from the DB. `chats` is the filtered + sorted view that
+    /// the table actually renders; selection is tracked by JID so it survives
+    /// any reorder or filter.
+    private var allChats: [Chat] = []
     private var chats: [Chat] = []
     private var selected = Set<String>()
+    private var sortKey: SortKey = .count
+    private var sortAscending = false
+
     private let table = NSTableView()
+    private let searchField = NSSearchField()
     private let thresholdField = NSTextField(string: "")
     private let thresholdPreview = NSTextField(labelWithString: "")
     private let status = NSTextField(labelWithString: "")
@@ -147,19 +157,29 @@ final class FavoritesVC: NSViewController, NSTableViewDataSource, NSTableViewDel
         table.dataSource = self
         table.delegate = self
         table.usesAlternatingRowBackgroundColors = true
-        let cols: [(String, String, CGFloat)] = [
-            ("on", "✓", 30), ("name", "Chat", 240),
-            ("count", "Messages", 90), ("jid", "JID", 200),
+        table.allowsColumnSelection = false
+        // (id, title, width, sort key). Clicking a header sorts by that key and
+        // toggles direction — "Messages" descending shows the chattiest first.
+        let cols: [(String, String, CGFloat, SortKey)] = [
+            ("on", "✓", 30, .selected), ("name", "Chat", 240, .name),
+            ("count", "Messages", 90, .count), ("jid", "JID", 200, .jid),
         ]
-        for (id, title, w) in cols {
+        for (id, title, w, key) in cols {
             let c = NSTableColumn(identifier: .init(id))
             c.title = title; c.width = w
+            c.sortDescriptorPrototype = NSSortDescriptor(key: key.rawValue, ascending: true)
             table.addTableColumn(c)
         }
+        table.sortDescriptors = [NSSortDescriptor(key: SortKey.count.rawValue, ascending: false)]
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
         scroll.documentView = table
         scroll.translatesAutoresizingMaskIntoConstraints = false
+
+        searchField.placeholderString = "Search name or number (fuzzy)"
+        searchField.delegate = self
+        searchField.sendsWholeSearchString = false
+        searchField.sendsSearchStringImmediately = true
 
         thresholdField.placeholderString = "e.g. 100 (blank = off)"
         thresholdField.widthAnchor.constraint(equalToConstant: 110).isActive = true
@@ -174,11 +194,13 @@ final class FavoritesVC: NSViewController, NSTableViewDataSource, NSTableViewDel
 
         let stack = vstack([
             label("Pick the chats to sync", bold: true),
+            searchField,
             scroll,
             thresholdRow,
             NSStackView(views: [save, reload]),
             status,
         ])
+        searchField.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32).isActive = true
         scroll.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32).isActive = true
         scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 280).isActive = true
 
@@ -200,14 +222,64 @@ final class FavoritesVC: NSViewController, NSTableViewDataSource, NSTableViewDel
         selected = state.jids
         thresholdField.stringValue = state.dmMinMessages.map(String.init) ?? ""
         do {
-            chats = try ChatDB.listChats()
-            status.stringValue = "\(chats.count) chats · \(selected.count) selected"
+            allChats = try ChatDB.listChats()
+            applyView()
         } catch {
+            allChats = []
             chats = []
+            table.reloadData()
             status.stringValue = "Cannot read chats: \(error). Check Full Disk Access."
         }
         updateThresholdPreview()
+    }
+
+    // MARK: search + sort
+
+    /// Filter `allChats` by the (fuzzy) search term, sort by the active column,
+    /// and refresh the table. Selection is by JID, so it is unaffected.
+    private func applyView() {
+        let needle = searchField.stringValue.trimmingCharacters(in: .whitespaces)
+        let filtered = needle.isEmpty ? allChats : allChats.filter {
+            Fuzzy.matches(needle, $0.name) || Fuzzy.matches(needle, $0.jid)
+        }
+        chats = filtered.sorted(by: ordersBefore)
         table.reloadData()
+        updateStatus()
+    }
+
+    private func ordersBefore(_ a: Chat, _ b: Chat) -> Bool {
+        let asc = sortAscending
+        switch sortKey {
+        case .name:
+            let r = a.name.folded.compare(b.name.folded)
+            if r != .orderedSame { return asc == (r == .orderedAscending) }
+            return a.msgCount > b.msgCount
+        case .jid:
+            if a.jid != b.jid { return asc == (a.jid < b.jid) }
+            return a.msgCount > b.msgCount
+        case .count:
+            if a.msgCount != b.msgCount { return asc == (a.msgCount < b.msgCount) }
+            return a.name.folded < b.name.folded
+        case .selected:
+            let sa = selected.contains(a.jid), sb = selected.contains(b.jid)
+            if sa != sb { return asc == (!sa && sb) }
+            return a.msgCount > b.msgCount   // tie-break: chattiest first
+        }
+    }
+
+    func tableView(_ tableView: NSTableView,
+                   sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
+        guard let d = tableView.sortDescriptors.first,
+              let key = d.key.flatMap(SortKey.init(rawValue:)) else { return }
+        sortKey = key
+        sortAscending = d.ascending
+        applyView()
+    }
+
+    private func updateStatus() {
+        let shown = chats.count, total = allChats.count
+        let scope = shown == total ? "\(total) chats" : "\(shown) of \(total) chats"
+        status.stringValue = "\(scope) · \(selected.count) selected"
     }
 
     /// Parse the threshold field. Returns `.some(nil)` when blank (rule off),
@@ -228,15 +300,20 @@ final class FavoritesVC: NSViewController, NSTableViewDataSource, NSTableViewDel
         }
         thresholdPreview.textColor = .secondaryLabelColor
         guard let t = value else {
-            thresholdPreview.stringValue = chats.isEmpty ? "" : "rule off"
+            thresholdPreview.stringValue = allChats.isEmpty ? "" : "rule off"
             return
         }
-        let n = chats.filter { !$0.isGroup && $0.msgCount >= t }.count
+        // Count over the full set, not the current search filter.
+        let n = allChats.filter { !$0.isGroup && $0.msgCount >= t }.count
         thresholdPreview.stringValue = "→ \(n) DM\(n == 1 ? "" : "s") auto-synced"
     }
 
     func controlTextDidChange(_ obj: Notification) {
-        if (obj.object as? NSTextField) === thresholdField { updateThresholdPreview() }
+        switch obj.object as? NSTextField {
+        case thresholdField: updateThresholdPreview()
+        case searchField: applyView()
+        default: break
+        }
     }
 
     @objc private func save() {
@@ -273,9 +350,36 @@ final class FavoritesVC: NSViewController, NSTableViewDataSource, NSTableViewDel
     }
 
     @objc private func toggle(_ sender: NSButton) {
+        guard chats.indices.contains(sender.tag) else { return }
         let jid = chats[sender.tag].jid
         if sender.state == .on { selected.insert(jid) } else { selected.remove(jid) }
-        status.stringValue = "\(chats.count) chats · \(selected.count) selected"
+        updateStatus()
+    }
+}
+
+// MARK: - fuzzy matching
+
+private extension String {
+    /// Case- and diacritic-insensitive form for forgiving comparisons.
+    var folded: String {
+        folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+    }
+}
+
+private enum Fuzzy {
+    /// True when every character of `needle` appears, in order (not necessarily
+    /// adjacent), in `hay` — the classic subsequence fuzzy match. Folding makes
+    /// it case/accent-insensitive, so "jose" matches "José" and "vctr" matches
+    /// "Víctor". Membership only; ordering is handled by the column sort.
+    static func matches(_ needle: String, _ hay: String) -> Bool {
+        let n = Array(needle.folded), h = Array(hay.folded)
+        if n.isEmpty { return true }
+        var i = 0
+        for ch in h where ch == n[i] {
+            i += 1
+            if i == n.count { return true }
+        }
+        return false
     }
 }
 
