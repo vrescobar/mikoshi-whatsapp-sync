@@ -152,6 +152,7 @@ final class FavoritesVC: NSViewController, NSTableViewDataSource, NSTableViewDel
     private let thresholdField = NSTextField(string: "")
     private let thresholdPreview = NSTextField(labelWithString: "")
     private let status = NSTextField(labelWithString: "")
+    private let effectiveLabel = NSTextField(labelWithString: "")
 
     override func loadView() {
         table.dataSource = self
@@ -181,6 +182,24 @@ final class FavoritesVC: NSViewController, NSTableViewDataSource, NSTableViewDel
         searchField.sendsWholeSearchString = false
         searchField.sendsSearchStringImmediately = true
 
+        // Right-click a row to copy its JID/name (handy for pasting into the
+        // server or a config). Acts on table.clickedRow.
+        let rowMenu = NSMenu()
+        rowMenu.addItem(NSMenuItem(title: "Copy JID", action: #selector(copyJID), keyEquivalent: ""))
+        rowMenu.addItem(NSMenuItem(title: "Copy name", action: #selector(copyName), keyEquivalent: ""))
+        rowMenu.items.forEach { $0.target = self }
+        table.menu = rowMenu
+
+        // Bulk actions operate on the *shown* (filtered) rows, so you can fuzzy-
+        // search a cohort and tick them all at once.
+        let selectShown = NSButton(title: "Select shown", target: self, action: #selector(selectShown))
+        let clearShown = NSButton(title: "Clear shown", target: self, action: #selector(clearShown))
+        let topN = NSButton(title: "Top N…", target: self, action: #selector(selectTopN))
+        let bulkRow = NSStackView(views: [selectShown, clearShown, topN])
+
+        effectiveLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        effectiveLabel.textColor = .secondaryLabelColor
+
         thresholdField.placeholderString = "e.g. 100 (blank = off)"
         thresholdField.widthAnchor.constraint(equalToConstant: 110).isActive = true
         thresholdField.delegate = self
@@ -196,9 +215,11 @@ final class FavoritesVC: NSViewController, NSTableViewDataSource, NSTableViewDel
             label("Pick the chats to sync", bold: true),
             searchField,
             scroll,
+            bulkRow,
             thresholdRow,
             NSStackView(views: [save, reload]),
             status,
+            effectiveLabel,
         ])
         searchField.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32).isActive = true
         scroll.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32).isActive = true
@@ -280,6 +301,60 @@ final class FavoritesVC: NSViewController, NSTableViewDataSource, NSTableViewDel
         let shown = chats.count, total = allChats.count
         let scope = shown == total ? "\(total) chats" : "\(shown) of \(total) chats"
         status.stringValue = "\(scope) · \(selected.count) selected"
+        let eff = effectiveSyncCount()
+        effectiveLabel.stringValue = allChats.isEmpty
+            ? ""
+            : "Effective sync set: \(eff) contact\(eff == 1 ? "" : "s") (explicit picks ∪ threshold rule)"
+    }
+
+    /// The set that will actually sync = explicit picks ∪ DMs meeting a valid
+    /// threshold. Mirrors favorites.py.effective_jids so the count is honest.
+    private func effectiveSyncCount() -> Int {
+        var set = selected
+        if case .some(.some(let t)) = parsedThreshold() {
+            for c in allChats where !c.isGroup && c.msgCount >= t { set.insert(c.jid) }
+        }
+        return set.count
+    }
+
+    // MARK: bulk actions & copy
+
+    @objc private func selectShown() { chats.forEach { selected.insert($0.jid) }; applyView() }
+    @objc private func clearShown() { chats.forEach { selected.remove($0.jid) }; applyView() }
+
+    @objc private func selectTopN() {
+        let alert = NSAlert()
+        alert.messageText = "Select top N by message count"
+        alert.informativeText = searchField.stringValue.trimmingCharacters(in: .whitespaces).isEmpty
+            ? "Ticks the N chattiest contacts."
+            : "Ticks the N chattiest contacts among the current search results."
+        let tf = NSTextField(string: "50")
+        tf.frame = NSRect(x: 0, y: 0, width: 80, height: 24)
+        alert.accessoryView = tf
+        alert.addButton(withTitle: "Select")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn,
+              let n = Int(tf.stringValue.trimmingCharacters(in: .whitespaces)), n > 0 else { return }
+        for c in chats.sorted(by: { $0.msgCount > $1.msgCount }).prefix(n) {
+            selected.insert(c.jid)
+        }
+        applyView()
+    }
+
+    @objc private func copyJID() {
+        guard chats.indices.contains(table.clickedRow) else { return }
+        copyToPasteboard(chats[table.clickedRow].jid)
+    }
+
+    @objc private func copyName() {
+        guard chats.indices.contains(table.clickedRow) else { return }
+        copyToPasteboard(chats[table.clickedRow].name)
+    }
+
+    private func copyToPasteboard(_ s: String) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(s, forType: .string)
     }
 
     /// Parse the threshold field. Returns `.some(nil)` when blank (rule off),
@@ -310,7 +385,7 @@ final class FavoritesVC: NSViewController, NSTableViewDataSource, NSTableViewDel
 
     func controlTextDidChange(_ obj: Notification) {
         switch obj.object as? NSTextField {
-        case thresholdField: updateThresholdPreview()
+        case thresholdField: updateThresholdPreview(); updateStatus()
         case searchField: applyView()
         default: break
         }
