@@ -120,7 +120,7 @@ enum Schedule {
             if on { try SMAppService.mainApp.register() }
             else { try SMAppService.mainApp.unregister() }
         } catch {
-            NSLog("Mikoshi: login item toggle failed: \(error)")
+            NSLog("mikoshi-sync: login item toggle failed: \(error)")
         }
     }
 }

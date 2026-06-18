@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# Build Mikoshi.app — a single-binary AppKit menu-bar app, no Xcode project.
+# Build mikoshi-sync.app — a single-binary AppKit menu-bar app, no Xcode project.
 #
-# Output: gui/build/Mikoshi.app, code-signed with a stable identity so the
+# Output: gui/build/mikoshi-sync.app, code-signed with a stable identity so the
 # Full Disk Access grant survives rebuilds. Set MIKOSHI_SIGN_ID to the name of
 # a self-signed Code Signing certificate (see README); without it we fall back
 # to an ad-hoc signature (works, but TCC forgets the grant on every rebuild).
@@ -11,7 +11,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 HERE="$(pwd)"
 BUILD="$HERE/build"
-APP="$BUILD/Mikoshi.app"
+APP="$BUILD/mikoshi-sync.app"
 BIN_NAME="mikoshi-tray"
 SIGN_ID="${MIKOSHI_SIGN_ID:-Mikoshi Self-Signed}"
 BUNDLE_ID="com.mikoshi.tray"

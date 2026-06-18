@@ -10,7 +10,7 @@ final class PrefsWindowController: NSWindowController {
             contentRect: NSRect(x: 0, y: 0, width: 620, height: 480),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered, defer: false)
-        window.title = "Mikoshi WhatsApp Sync"
+        window.title = "mikoshi-sync"
         window.center()
 
         let tabs = NSTabViewController()
@@ -309,16 +309,16 @@ final class PermissionsVC: NSViewController {
 
     override func loadView() {
         let instructions = """
-        Mikoshi reads the Mac WhatsApp database, which macOS protects behind \
+        mikoshi-sync reads the Mac WhatsApp database, which macOS protects behind \
         Full Disk Access. Grant it to THIS app only — that keeps the access \
-        scoped to Mikoshi instead of to your shell.
+        scoped to mikoshi-sync instead of to your shell.
 
         1. Click the button below to open Full Disk Access.
-        2. Click +, then add Mikoshi (in ~/Applications).
+        2. Click +, then add mikoshi-sync (in ~/Applications).
         3. Turn its switch on.
-        4. Quit and reopen Mikoshi from the menu bar.
+        4. Quit and reopen mikoshi-sync from the menu bar.
 
-        Only Mikoshi gains access — your Terminal and other CLI tools do not.
+        Only mikoshi-sync gains access — your Terminal and other CLI tools do not.
         """
         let body = NSTextField(wrappingLabelWithString: instructions)
         body.preferredMaxLayoutWidth = 560
@@ -350,10 +350,10 @@ final class PermissionsVC: NSViewController {
             state.stringValue = "ℹ︎ WhatsApp for Mac not found — Full Disk Access not required for iPhone-only sync."
             state.textColor = .secondaryLabelColor
         } else if Permissions.hasFullDiskAccess() {
-            state.stringValue = "✓ Granted — Mikoshi can read the WhatsApp database."
+            state.stringValue = "✓ Granted — mikoshi-sync can read the WhatsApp database."
             state.textColor = .systemGreen
         } else {
-            state.stringValue = "🔒 Not granted — add Mikoshi to Full Disk Access below."
+            state.stringValue = "🔒 Not granted — add mikoshi-sync to Full Disk Access below."
             state.textColor = .systemRed
         }
     }
