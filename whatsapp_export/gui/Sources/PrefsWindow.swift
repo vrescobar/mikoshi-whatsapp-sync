@@ -134,11 +134,13 @@ final class StatusVC: NSViewController {
 
 // MARK: - Favorites tab
 
-final class FavoritesVC: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
+final class FavoritesVC: NSViewController, NSTableViewDataSource, NSTableViewDelegate,
+                         NSTextFieldDelegate {
     private var chats: [Chat] = []
     private var selected = Set<String>()
     private let table = NSTableView()
     private let thresholdField = NSTextField(string: "")
+    private let thresholdPreview = NSTextField(labelWithString: "")
     private let status = NSTextField(labelWithString: "")
 
     override func loadView() {
@@ -159,10 +161,13 @@ final class FavoritesVC: NSViewController, NSTableViewDataSource, NSTableViewDel
         scroll.documentView = table
         scroll.translatesAutoresizingMaskIntoConstraints = false
 
-        thresholdField.placeholderString = "e.g. 600 (blank = off)"
-        thresholdField.widthAnchor.constraint(equalToConstant: 160).isActive = true
+        thresholdField.placeholderString = "e.g. 100 (blank = off)"
+        thresholdField.widthAnchor.constraint(equalToConstant: 110).isActive = true
+        thresholdField.delegate = self
+        thresholdPreview.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        thresholdPreview.textColor = .secondaryLabelColor
         let thresholdRow = NSStackView(views: [
-            label("Auto-include DMs with ≥ N messages:"), thresholdField])
+            label("Auto-include DMs with ≥ N messages:"), thresholdField, thresholdPreview])
 
         let save = NSButton(title: "Save & apply", target: self, action: #selector(save))
         let reload = NSButton(title: "Reload chats", target: self, action: #selector(reload))
@@ -201,16 +206,50 @@ final class FavoritesVC: NSViewController, NSTableViewDataSource, NSTableViewDel
             chats = []
             status.stringValue = "Cannot read chats: \(error). Check Full Disk Access."
         }
+        updateThresholdPreview()
         table.reloadData()
     }
 
+    /// Parse the threshold field. Returns `.some(nil)` when blank (rule off),
+    /// `.some(.some(n))` for a valid n ≥ 1, and `nil` when the text is invalid.
+    private func parsedThreshold() -> Int?? {
+        let raw = thresholdField.stringValue.trimmingCharacters(in: .whitespaces)
+        if raw.isEmpty { return .some(nil) }
+        if let t = Int(raw), t >= 1 { return .some(.some(t)) }
+        return nil
+    }
+
+    /// Live feedback: how many DMs the current threshold would auto-include.
+    private func updateThresholdPreview() {
+        guard let value = parsedThreshold() else {
+            thresholdPreview.stringValue = "⚠︎ whole number ≥ 1"
+            thresholdPreview.textColor = .systemRed
+            return
+        }
+        thresholdPreview.textColor = .secondaryLabelColor
+        guard let t = value else {
+            thresholdPreview.stringValue = chats.isEmpty ? "" : "rule off"
+            return
+        }
+        let n = chats.filter { !$0.isGroup && $0.msgCount >= t }.count
+        thresholdPreview.stringValue = "→ \(n) DM\(n == 1 ? "" : "s") auto-synced"
+    }
+
+    func controlTextDidChange(_ obj: Notification) {
+        if (obj.object as? NSTextField) === thresholdField { updateThresholdPreview() }
+    }
+
     @objc private func save() {
-        let threshold = Int(thresholdField.stringValue.trimmingCharacters(in: .whitespaces))
+        guard let threshold = parsedThreshold() else {
+            status.stringValue = "⚠︎ Threshold must be a whole number ≥ 1 (or blank to turn it off)."
+            return
+        }
         FavoritesStore.save(selectedJIDs: selected, dmMinMessages: threshold, chats: chats)
         // Re-bootstrap the agent so the next scheduled run picks up the change
         // (preserving paused state — the wrapper re-reads the file regardless).
         try? Schedule.reapply()
-        status.stringValue = "Saved \(selected.count) favorite(s). Applied."
+        let rule = threshold.map { " · auto-syncing DMs ≥ \($0)" } ?? ""
+        status.stringValue = "Saved \(selected.count) favorite(s)\(rule). Applied."
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { chats.count }
