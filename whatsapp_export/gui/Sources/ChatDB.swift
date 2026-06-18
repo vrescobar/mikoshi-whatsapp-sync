@@ -47,14 +47,20 @@ enum ChatDB {
         }
         defer { sqlite3_close(db) }
 
+        // Group by JID, not by session primary key: the same ZCONTACTJID can
+        // appear in more than one ZWACHATSESSION row, and downstream code keys
+        // chats by JID (favorites are matched by JID). Collapsing here keeps
+        // each contact a single row with its summed message count and prevents
+        // duplicate JIDs from reaching the JID→… dictionaries that would
+        // otherwise fatal-trap when saving favorites.
         let sql = """
             SELECT s.ZCONTACTJID AS jid,
-                   COALESCE(s.ZPARTNERNAME, s.ZCONTACTJID) AS name,
+                   COALESCE(MAX(s.ZPARTNERNAME), s.ZCONTACTJID) AS name,
                    COUNT(m.Z_PK) AS cnt
             FROM ZWACHATSESSION s
             LEFT JOIN ZWAMESSAGE m ON m.ZCHATSESSION = s.Z_PK
             WHERE s.ZCONTACTJID IS NOT NULL
-            GROUP BY s.Z_PK
+            GROUP BY s.ZCONTACTJID
             ORDER BY cnt DESC
         """
         var stmt: OpaquePointer?

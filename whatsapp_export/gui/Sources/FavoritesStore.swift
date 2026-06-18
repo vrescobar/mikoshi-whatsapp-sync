@@ -48,10 +48,17 @@ enum FavoritesStore {
     /// Groups (@g.us) are NEVER pruned.
     static func save(selectedJIDs: Set<String>, dmMinMessages: Int?,
                      chats: [Chat]) {
-        let countByJID = Dictionary(uniqueKeysWithValues: chats.map { ($0.jid, $0.msgCount) })
-        let nameByJID = Dictionary(uniqueKeysWithValues: chats.map { ($0.jid, $0.name) })
+        // Build JID-keyed lookups with a last-wins merge. `uniqueKeysWithValues`
+        // fatal-traps on duplicate keys, and duplicate JIDs are possible (a JID
+        // reused across chat sessions, or a malformed favorites file), so a
+        // crash here would silently kill the app on save. Never trap on data.
+        let countByJID = Dictionary(chats.map { ($0.jid, $0.msgCount) },
+                                    uniquingKeysWith: max)
+        let nameByJID = Dictionary(chats.map { ($0.jid, $0.name) },
+                                   uniquingKeysWith: { _, new in new })
         let prior = load()
-        let priorByJID = Dictionary(uniqueKeysWithValues: prior.favorites.map { ($0.jid, $0) })
+        let priorByJID = Dictionary(prior.favorites.map { ($0.jid, $0) },
+                                    uniquingKeysWith: { first, _ in first })
 
         var kept: [[String: Any]] = []
         for jid in selectedJIDs {
