@@ -228,7 +228,7 @@ Syncing the `mac_live` source reads the Mac WhatsApp database, which macOS
 protects behind Full Disk Access — hence the recurring *"…would like to access
 data from other apps"* prompt. Granting FDA to `/bin/bash` would leak that access
 to **every** script you run. The native menu-bar app in [`gui/`](whatsapp_export/gui/)
-exists to scope the grant to **one code-signed app**: FDA goes to `Mikoshi.app`
+exists to scope the grant to **one code-signed app**: FDA goes to `mikoshi-sync.app`
 only, and its child sync processes (manual *and* the launchd-scheduled
 `--sync-now` runs) inherit it, while your Terminal stays unprivileged.
 

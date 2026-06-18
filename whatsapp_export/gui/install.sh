@@ -9,7 +9,8 @@ HERE="$(pwd)"
 REPO_DIR="$(cd .. && pwd)"          # the whatsapp_export directory
 BUNDLE_ID="com.mikoshi.tray"
 DEST="$HOME/Applications"
-APP="$DEST/Mikoshi.app"
+APP="$DEST/mikoshi-sync.app"
+LEGACY_APP="$DEST/Mikoshi.app"   # pre-rename bundle name
 LABEL="com.mikoshi.sync"
 
 echo "==> Building"
@@ -17,8 +18,11 @@ echo "==> Building"
 
 echo "==> Installing to $DEST"
 mkdir -p "$DEST"
-rm -rf "$APP"
-cp -R "$HERE/build/Mikoshi.app" "$APP"
+# Drop the old Mikoshi.app so we don't leave two copies behind. The bundle
+# identifier is unchanged (com.mikoshi.tray), so the Full Disk Access grant
+# carries over to the renamed bundle.
+rm -rf "$APP" "$LEGACY_APP"
+cp -R "$HERE/build/mikoshi-sync.app" "$APP"
 
 echo "==> Recording repo path for the app"
 # The bundle can't infer where the repo lives; record it (read by Paths.swift).
@@ -51,7 +55,7 @@ echo "==> Launching the app (registers the login item on first run)"
 open "$APP"
 
 echo "==> Opening Full Disk Access settings"
-echo "    Add 'Mikoshi' (in ~/Applications), enable it, then relaunch from the menu bar."
+echo "    Add 'mikoshi-sync' (in ~/Applications), enable it, then relaunch from the menu bar."
 open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" || true
 
 cat <<EOF
@@ -59,6 +63,6 @@ cat <<EOF
 Done. Next steps:
   1. In the Full Disk Access list, click + and add: $APP
   2. Toggle it on.
-  3. Quit Mikoshi from the menu bar and reopen it (or run 'open $APP').
+  3. Quit mikoshi-sync from the menu bar and reopen it (or run 'open $APP').
   4. Use the menu-bar icon → "Sync now" to verify no TCC prompt appears.
 EOF

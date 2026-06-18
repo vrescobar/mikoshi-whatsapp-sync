@@ -31,7 +31,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Dry run (no push)", action: #selector(dryRun), keyEquivalent: ""))
         menu.addItem(pauseResumeItem)
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Open Mikoshi…", action: #selector(openPrefs), keyEquivalent: ","))
+        menu.addItem(NSMenuItem(title: "Open mikoshi-sync…", action: #selector(openPrefs), keyEquivalent: ","))
         menu.addItem(NSMenuItem(title: "View last log", action: #selector(viewLog), keyEquivalent: ""))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -56,7 +56,7 @@ final class AppController: NSObject, NSApplicationDelegate {
             symbol = "checkmark.seal"
         }
         if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Mikoshi")
+            button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "mikoshi-sync")
             button.image?.isTemplate = true
         }
 
@@ -99,7 +99,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         do {
             if sched.enabled { try Schedule.pause() } else { try Schedule.resume() }
         } catch {
-            NSLog("Mikoshi: pause/resume failed: \(error)")
+            NSLog("mikoshi-sync: pause/resume failed: \(error)")
         }
         refresh()
     }

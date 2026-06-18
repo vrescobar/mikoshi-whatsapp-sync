@@ -3,9 +3,9 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleName</key>
-	<string>Mikoshi</string>
+	<string>mikoshi-sync</string>
 	<key>CFBundleDisplayName</key>
-	<string>Mikoshi WhatsApp Sync</string>
+	<string>mikoshi-sync</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.mikoshi.tray</string>
 	<key>CFBundleExecutable</key>

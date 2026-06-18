@@ -1,4 +1,4 @@
-# Mikoshi menu-bar app
+# mikoshi-sync menu-bar app
 
 A tiny native macOS menu-bar app that drives the WhatsApp sync pipeline and —
 the whole point — **scopes Full Disk Access to one signed app instead of to your
@@ -16,7 +16,7 @@ The tempting fix — granting Full Disk Access (FDA) to `/bin/bash` — is **too
 broad**: every script you ever run would silently inherit that access. TCC keys
 grants to a **code-signed bundle identity**, not a path, so the only way to scope
 FDA to exactly one process is a signed `.app`. This app is that bundle. Grant FDA
-to `Mikoshi.app` alone and:
+to `mikoshi-sync.app` alone and:
 
 - Its child processes (`mikoshi-whatsapp.sh` → `python3` → `gtimeout`) inherit the
   grant — no prompt, including for the WhatsApp container.
@@ -25,7 +25,7 @@ to `Mikoshi.app` alone and:
 
 Scheduled syncs run under the **same** identity: the `com.mikoshi.sync` launchd
 agent is repointed from `/bin/bash … sync` to
-`Mikoshi.app/Contents/MacOS/mikoshi-tray --sync-now`, so one FDA grant covers both
+`mikoshi-sync.app/Contents/MacOS/mikoshi-tray --sync-now`, so one FDA grant covers both
 manual and automatic runs while keeping launchd's wake-from-sleep behaviour.
 
 ## Dependencies
@@ -57,21 +57,21 @@ cd whatsapp_export/gui
 
 Then, in the Full Disk Access list that opens:
 
-1. Click **+** and add `~/Applications/Mikoshi.app`.
+1. Click **+** and add `~/Applications/mikoshi-sync.app`.
 2. Toggle it **on**.
-3. Quit Mikoshi from the menu bar and reopen it (`open ~/Applications/Mikoshi.app`).
+3. Quit mikoshi-sync from the menu bar and reopen it (`open ~/Applications/mikoshi-sync.app`).
 
 Verify with the menu-bar icon → **Sync now**: it should run with no TCC prompt.
 
-To build without installing: `./build.sh` → `gui/build/Mikoshi.app`.
+To build without installing: `./build.sh` → `gui/build/mikoshi-sync.app`.
 
 ## What the app does
 
 Menu-bar icon (idle ✓ / syncing ⟳ / FDA-missing 🔒) with: last-sync time,
 messages-on-server, **Sync now**, **Dry run**, **Pause/Resume schedule**, **Open
-Mikoshi…**, **View last log**.
+mikoshi-sync…**, **View last log**.
 
-The window (**Open Mikoshi…**) has four tabs:
+The window (**Open mikoshi-sync…**) has four tabs:
 
 | Tab | Does |
 |---|---|
@@ -105,4 +105,4 @@ Pause then Resume) to repoint the agent back at the signed binary. Simplest rule
 ```
 
 Leaves `~/.mikoshi-ingest.conf` and `~/.mikoshi-favorites.json` intact. Remove the
-stale `Mikoshi` row from the Full Disk Access list manually (macOS keeps it).
+stale `mikoshi-sync` row from the Full Disk Access list manually (macOS keeps it).
