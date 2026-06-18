@@ -76,7 +76,7 @@ The window (**Open mikoshi-sync…**) has four tabs:
 | Tab | Does |
 |---|---|
 | **Status** | Last commit, drift, iPhone reachability, next scheduled fire, latest log tail. |
-| **Favorites** | Browses `ChatStorage.sqlite` (name · JID · message count), tick chats to sync, set the `dm_min_messages` threshold. Writes `~/.mikoshi-favorites.json` with the same group-never-prune rule as `favorites.py`, then re-bootstraps the agent. |
+| **Favorites** | Browses `ChatStorage.sqlite` (name · JID · message count) with **fuzzy search** (name or number) and **sortable columns**. Tick chats individually or in bulk — **Select/Clear shown** act on the current filter, **Top N…** picks the chattiest. Set the `dm_min_messages` threshold (live preview of how many DMs it pulls in); an **effective sync set** line shows the real count (explicit ∪ rule). Right-click a row to copy its JID/name. Writes `~/.mikoshi-favorites.json` with the same group-never-prune rule as `favorites.py`, then re-bootstraps the agent. |
 | **Config** | Edits `~/.mikoshi-ingest.conf` (server URL/token, backup dir, sources, timeouts) and the Keychain backup password. Saved `0600`. |
 | **Permissions** | Detects FDA by probing the WhatsApp DB; deep-links to the settings pane with step-by-step instructions. |
 
