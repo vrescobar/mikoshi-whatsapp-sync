@@ -999,6 +999,14 @@ def compute_plan_if_possible(
     ``compute_plan`` so each entry gets a ``per_source`` breakdown.
     """
     db = find_existing_chatstorage()
+    if not db and selected_sources == ["mac_live"]:
+        try:
+            from sources import get_source
+            mac = get_source("mac_live")
+            if mac.is_available():
+                db = mac.db_path()
+        except (ImportError, KeyError):
+            pass
     if not db:
         return None
     cfg = load_ingest_conf()
@@ -1014,6 +1022,8 @@ def compute_plan_if_possible(
         scope = _scope_jids_for_mode(scope_mode, db)
 
     extra_dbs = _extra_dbs_for_sources(selected_sources)
+    if selected_sources == ["mac_live"]:
+        extra_dbs = None
     return pipeline_state.compute_plan(
         db, cache, srv, scope_jids=scope, extra_dbs=extra_dbs,
     )
