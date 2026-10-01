@@ -667,7 +667,7 @@ def compute_plan(
     ``?mode=ro&immutable=1`` so a live writer (the Catalyst app on
     ``mac_live``) doesn't see our reads.
     """
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     _ = _media_size_expr(cur)  # not used in COUNT but proves the table exists

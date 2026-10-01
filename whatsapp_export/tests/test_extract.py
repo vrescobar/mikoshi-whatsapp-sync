@@ -1,6 +1,7 @@
 """Tests for extract_messages.py — incremental/full/full-contact + filters."""
 
 import json
+import sqlite3
 from datetime import datetime, timezone
 
 import pytest
@@ -255,6 +256,17 @@ class TestGroupParticipants:
         jids = {p["jid"] for p in group["participants"]}
         assert "alice@s.whatsapp.net" in jids
 
+    def test_group_message_uses_member_relation_as_author(
+        self, synthetic_db, extracted_root, output_path, attachments_dir, state_file
+    ):
+        result = run_extract(
+            synthetic_db, extracted_root, output_path, attachments_dir, state_file,
+            mode="full",
+        )
+        group = next(c for c in result["chats"] if c["is_group"])
+        message = next(m for m in group["messages"] if m["external_id"] == "wa:STANZA-402")
+        assert message["from_jid"] == "alice@s.whatsapp.net"
+
     def test_one_to_one_no_participants(
         self, synthetic_db, extracted_root, output_path, attachments_dir, state_file
     ):
@@ -265,6 +277,131 @@ class TestGroupParticipants:
         alice = next(c for c in result["chats"] if c["name"] == "Alice")
         assert alice["is_group"] is False
         assert alice["participants"] == []
+
+
+class TestGroupAuthorship:
+    """Group authors come from ZGROUPMEMBER, names from ZWAPROFILEPUSHNAME.
+
+    Mirrors the real Catalyst schema: ZFROMJID holds the group JID, and
+    ZWAMESSAGE.ZPUSHNAME / ZWAGROUPMEMBER.ZFIRSTNAME hold base64 protobuf
+    blobs rather than names.
+    """
+
+    BLOB = "CJOW9NEGIABIAZABAPABAtgC9sOmkp+ilQM="
+
+    @pytest.fixture
+    def authorship_db(self, tmp_path):
+        from conftest import _ios_ts
+
+        db_path = tmp_path / "authorship.sqlite"
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE ZWACHATSESSION (
+                Z_PK INTEGER PRIMARY KEY, ZCONTACTJID TEXT,
+                ZPARTNERNAME TEXT, ZLASTMESSAGEDATE REAL
+            );
+            CREATE TABLE ZWAMESSAGE (
+                Z_PK INTEGER PRIMARY KEY, ZCHATSESSION INTEGER, ZTEXT TEXT,
+                ZMESSAGEDATE REAL, ZFROMJID TEXT, ZTOJID TEXT, ZISFROMME INTEGER,
+                ZMESSAGETYPE INTEGER, ZPUSHNAME TEXT, ZSTANZAID TEXT,
+                ZGROUPMEMBER INTEGER
+            );
+            CREATE TABLE ZWAMEDIAITEM (
+                Z_PK INTEGER PRIMARY KEY, ZMESSAGE INTEGER, ZMEDIALOCALPATH TEXT,
+                ZVCARDSTRING TEXT, ZTITLE TEXT, ZMEDIASIZE INTEGER
+            );
+            CREATE TABLE ZWAGROUPMEMBER (
+                Z_PK INTEGER PRIMARY KEY, ZCHATSESSION INTEGER, ZMEMBERJID TEXT,
+                ZCONTACTNAME TEXT, ZFIRSTNAME TEXT
+            );
+            CREATE TABLE ZWAPROFILEPUSHNAME (
+                Z_PK INTEGER PRIMARY KEY, ZJID TEXT, ZPUSHNAME TEXT
+            );
+            """
+        )
+        ts = _ios_ts(2026, 6, 25)
+        conn.executemany(
+            "INSERT INTO ZWACHATSESSION VALUES (?, ?, ?, ?)",
+            [(1, "120363@g.us", "Team", ts), (2, "dave@s.whatsapp.net", "Dave", ts)],
+        )
+        conn.executemany(
+            "INSERT INTO ZWAGROUPMEMBER VALUES (?, 1, ?, '', ?)",
+            [(1, "111@lid", "+CgAQtKbByQY="), (2, "222@s.whatsapp.net", "+CgAQg43qzgY=")],
+        )
+        conn.executemany(
+            "INSERT INTO ZWAPROFILEPUSHNAME VALUES (?, ?, ?)",
+            [(1, "111@lid", "Carla"), (2, "dave@s.whatsapp.net", "Dave")],
+        )
+        conn.executemany(
+            "INSERT INTO ZWAMESSAGE VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+            [
+                # group, authored by Carla (has a push name)
+                (1, 1, "reu?", ts + 1, "120363@g.us", None, 0, self.BLOB, "G-AUTHOR", 1),
+                # group, authored by a member without a push name
+                (2, 1, "yo voy", ts + 2, "120363@g.us", None, 0, self.BLOB, "G-NONAME", 2),
+                # group, no ZGROUPMEMBER: author unknown
+                (3, 1, "??", ts + 3, "120363@g.us", None, 0, self.BLOB, "G-UNKNOWN", None),
+                # group, sent by me
+                (4, 1, "vale", ts + 4, None, "120363@g.us", 1, "IAA=", "G-MINE", None),
+                # DM from Dave
+                (5, 2, "hola", ts + 5, "dave@s.whatsapp.net", None, 0, "IAA=", "DM-1", None),
+            ],
+        )
+        conn.commit()
+        conn.close()
+        return db_path
+
+    @pytest.fixture
+    def exported(self, authorship_db, extracted_root, output_path, attachments_dir, state_file):
+        data = run_extract(
+            authorship_db, extracted_root, output_path, attachments_dir, state_file,
+            mode="full",
+        )
+        by_id = {m["external_id"]: m for c in data["chats"] for m in c["messages"]}
+        return data, by_id
+
+    def test_group_message_with_author(self, exported):
+        _, msgs = exported
+        msg = msgs["wa:G-AUTHOR"]
+        assert msg["from_jid"] == "111@lid"
+        assert msg["push_name"] == "Carla"
+
+    def test_group_author_without_push_name_is_null_not_blob(self, exported):
+        _, msgs = exported
+        msg = msgs["wa:G-NONAME"]
+        assert msg["from_jid"] == "222@s.whatsapp.net"
+        assert msg["push_name"] is None
+
+    def test_group_message_without_author_is_null(self, exported):
+        _, msgs = exported
+        msg = msgs["wa:G-UNKNOWN"]
+        assert msg["from_jid"] is None
+        assert msg["push_name"] is None
+
+    def test_my_group_message_keeps_jid_and_drops_blob(self, exported):
+        _, msgs = exported
+        msg = msgs["wa:G-MINE"]
+        assert msg["is_from_me"] is True
+        assert msg["from_jid"] is None
+        assert msg["push_name"] is None
+
+    def test_dm_keeps_jid_and_names_sender(self, exported):
+        _, msgs = exported
+        msg = msgs["wa:DM-1"]
+        assert msg["from_jid"] == "dave@s.whatsapp.net"
+        assert msg["push_name"] == "Dave"
+
+    def test_external_ids_unchanged(self, exported):
+        _, msgs = exported
+        assert msgs["wa:G-AUTHOR"]["legacy_external_id"] == "ios:1"
+        assert msgs["wa:G-UNKNOWN"]["legacy_external_id"] == "ios:3"
+
+    def test_participant_names_from_profile_push_name(self, exported):
+        data, _ = exported
+        group = next(c for c in data["chats"] if c["is_group"])
+        names = {p["jid"]: p["name"] for p in group["participants"]}
+        assert names == {"111@lid": "Carla", "222@s.whatsapp.net": None}
 
 
 class TestSystemMessages:

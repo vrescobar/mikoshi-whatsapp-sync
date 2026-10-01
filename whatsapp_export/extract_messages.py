@@ -281,19 +281,29 @@ def fetch_group_participants(cursor, chat_pk):
     """
     if not table_exists(cursor, "ZWAGROUPMEMBER"):
         return []
+    push_name_select = "NULL as push_name"
+    push_name_join = ""
+    if table_exists(cursor, "ZWAPROFILEPUSHNAME"):
+        push_name_select = "pp.ZPUSHNAME as push_name"
+        push_name_join = "LEFT JOIN ZWAPROFILEPUSHNAME pp ON pp.ZJID = gm.ZMEMBERJID"
     try:
         rows = cursor.execute(
             """
             SELECT
-                ZMEMBERJID as jid,
-                ZCONTACTNAME as name
-            FROM ZWAGROUPMEMBER
-            WHERE ZCHATSESSION = ?
+                gm.ZMEMBERJID as jid,
+                gm.ZCONTACTNAME as contact_name,
+                """ + push_name_select + """
+            FROM ZWAGROUPMEMBER gm
+            """ + push_name_join + """
+            WHERE gm.ZCHATSESSION = ?
             """,
             (chat_pk,),
         ).fetchall()
         return [
-            {"jid": r["jid"], "name": r["name"]}
+            {
+                "jid": r["jid"],
+                "name": _clean_name(r["push_name"]) or _clean_name(r["contact_name"]),
+            }
             for r in rows
             if r["jid"]
         ]
@@ -303,6 +313,20 @@ def fetch_group_participants(cursor, chat_pk):
 
 def is_group_chat(jid):
     return bool(jid) and jid.endswith("@g.us")
+
+
+def _clean_name(value):
+    """Return a display name as plain text, or None when it is empty.
+
+    Current WhatsApp builds store protobuf blobs (base64) in columns that
+    look like names: ZWAMESSAGE.ZPUSHNAME and ZWAGROUPMEMBER.ZFIRSTNAME.
+    Only ZWAPROFILEPUSHNAME.ZPUSHNAME and ZWAGROUPMEMBER.ZCONTACTNAME are
+    read as names, and empty strings are normalised to None.
+    """
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
 
 
 def _resolve_media_size_expr(cursor) -> str:
@@ -330,6 +354,18 @@ def _resolve_media_size_expr(cursor) -> str:
     return "NULL as media_size"
 
 
+def _message_group_member_expr(cursor) -> str:
+    """Return the author foreign-key expression when this DB exposes it.
+
+    Modern WhatsApp Core Data rows put the conversation JID in ``ZFROMJID``
+    for group messages. The actual author is the ``ZGROUPMEMBER`` relation.
+    Older schemas do not carry that column, so preserve the message as
+    unattributed rather than inventing an author from the group roster.
+    """
+    cols = {row["name"].upper() for row in cursor.execute("PRAGMA table_info(ZWAMESSAGE)").fetchall()}
+    return "m.ZGROUPMEMBER" if "ZGROUPMEMBER" in cols else "NULL"
+
+
 def extract_messages(
     db_path,
     extracted_root,
@@ -344,11 +380,48 @@ def extract_messages(
     favorite_jids=None,
     dm_min_messages=None,
 ):
+    # The Catalyst container may briefly hold a lock that blocks a URI
+    # read-only open. Keep SQLite's proven live-DB open path, then make this
+    # connection query-only before inspecting any data.
     conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA query_only = ON")
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
     media_size_expr = _resolve_media_size_expr(cursor)
+    group_member_expr = _message_group_member_expr(cursor)
+    group_member_join = ""
+    group_member_select = "NULL as group_member_jid, NULL as group_member_name"
+    if table_exists(cursor, "ZWAGROUPMEMBER"):
+        group_member_join = (
+            "LEFT JOIN ZWAGROUPMEMBER gm "
+            f"ON gm.Z_PK = {group_member_expr} AND gm.ZCHATSESSION = m.ZCHATSESSION"
+        )
+        # The author's display name lives in ZWAPROFILEPUSHNAME, keyed by
+        # the member JID. ZWAMESSAGE.ZPUSHNAME holds a protobuf blob on
+        # current builds, so it is never used for group authors.
+        if table_exists(cursor, "ZWAPROFILEPUSHNAME"):
+            group_member_select = (
+                "gm.ZMEMBERJID as group_member_jid, "
+                "COALESCE(NULLIF(pp.ZPUSHNAME, ''), NULLIF(gm.ZCONTACTNAME, '')) "
+                "as group_member_name"
+            )
+            group_member_join += (
+                " LEFT JOIN ZWAPROFILEPUSHNAME pp ON pp.ZJID = gm.ZMEMBERJID"
+            )
+        else:
+            group_member_select = (
+                "gm.ZMEMBERJID as group_member_jid, "
+                "NULLIF(gm.ZCONTACTNAME, '') as group_member_name"
+            )
+
+    # Same lookup for 1-1 senders: ZWAMESSAGE.ZPUSHNAME is a protobuf blob,
+    # so the sender's display name comes from ZWAPROFILEPUSHNAME by ZFROMJID.
+    sender_name_select = "NULL as sender_name"
+    sender_name_join = ""
+    if table_exists(cursor, "ZWAPROFILEPUSHNAME"):
+        sender_name_select = "NULLIF(sp.ZPUSHNAME, '') as sender_name"
+        sender_name_join = "LEFT JOIN ZWAPROFILEPUSHNAME sp ON sp.ZJID = m.ZFROMJID"
 
     # Expand favorite_jids with the DM-threshold rule before building the
     # chats query. The rule means "any 1-on-1 chat with N+ messages": it's
@@ -487,7 +560,8 @@ def extract_messages(
                 m.ZTOJID as to_jid,
                 m.ZISFROMME as is_from_me,
                 m.ZMESSAGETYPE as msg_type,
-                m.ZPUSHNAME as push_name,
+                """ + group_member_select + """,
+                """ + sender_name_select + """,
                 mi.Z_PK as media_pk,
                 mi.ZMEDIALOCALPATH as media_path,
                 mi.ZVCARDSTRING as media_mime,
@@ -495,6 +569,8 @@ def extract_messages(
                 """ + media_size_expr + """
             FROM ZWAMESSAGE m
             LEFT JOIN ZWAMEDIAITEM mi ON mi.ZMESSAGE = m.Z_PK
+            """ + group_member_join + """
+            """ + sender_name_join + """
             WHERE m.ZCHATSESSION = ? AND m.ZMESSAGEDATE > ?
             ORDER BY m.ZMESSAGEDATE ASC
             """,
@@ -538,15 +614,33 @@ def extract_messages(
             legacy_id = f"ios:{m['msg_pk']}"
             external_id = f"wa:{stanza_id}" if stanza_id else legacy_id
 
+            # In group messages ZFROMJID repeats the group's JID.
+            # ZGROUPMEMBER is the only per-message author evidence; when it
+            # is missing the author is unknown (null), never the group.
+            # push_name is never taken from ZWAMESSAGE.ZPUSHNAME (a protobuf
+            # blob on current builds): my own messages carry none, and other
+            # senders get their ZWAPROFILEPUSHNAME entry when there is one.
+            from_jid = m["from_jid"]
+            push_name = None
+            if m["is_from_me"]:
+                pass
+            elif is_group_chat(chat_jid):
+                from_jid = m["group_member_jid"]
+                if is_group_chat(from_jid):
+                    from_jid = None
+                push_name = _clean_name(m["group_member_name"]) if from_jid else None
+            else:
+                push_name = _clean_name(m["sender_name"])
+
             msg_obj = {
                 "id": m["msg_pk"],
                 "external_id": external_id,
                 "legacy_external_id": legacy_id if external_id != legacy_id else None,
                 "timestamp": ios_timestamp_to_iso(msg_ts),
-                "from_jid": m["from_jid"],
+                "from_jid": from_jid,
                 "to_jid": m["to_jid"],
                 "is_from_me": bool(m["is_from_me"]),
-                "push_name": m["push_name"],
+                "push_name": push_name,
                 "text": m["text"],
                 "type": msg_type,
                 "attachment": None,
