@@ -94,6 +94,16 @@ def load_config() -> dict[str, str]:
     return cfg
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never rewrite POSTs as GETs or forward bearer tokens to another origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_HTTP_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def http_request(
     url: str,
     method: str,
@@ -107,9 +117,11 @@ def http_request(
     if content_type:
         req.add_header("Content-Type", content_type)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _HTTP_OPENER.open(req, timeout=timeout) as resp:
             return resp.status, resp.read()
     except urllib.error.HTTPError as exc:
+        if 300 <= exc.code < 400:
+            return exc.code, json.dumps({"location": exc.headers.get("Location", "")}).encode("utf-8")
         return exc.code, exc.read()
 
 
@@ -215,6 +227,14 @@ def decode_auth_error(status: int, body: dict) -> str:
     blob = json.dumps(body).lower() if isinstance(body, dict) else str(body).lower()
 
     base = f"[ERROR] Server returned {status}"
+    if 300 <= status < 400:
+        return (
+            f"{base}: ingestion URL redirects to {body.get('location', '(unknown)')}.\n"
+            "  Set MIKOSHI_URL in ~/.mikoshi-ingest.conf (or the app's Config tab)\n"
+            "  to the direct server base URL, without /api/ingest/v1/… .\n"
+            "  Redirects are not followed: they can discard POST bodies or expose the token."
+        )
+
 
     if status == 401:
         if "token" in blob and ("expir" in blob or "revok" in blob):
@@ -287,7 +307,8 @@ def decode_socket_error(body: dict) -> str:
         return (
             f"{base}\n"
             "  The Mikoshi server (or a proxy in front of it) closed the connection mid-upload.\n"
-            "  Most often a body-size limit on the server. Workarounds:\n"
+            "  Check whether MIKOSHI_URL redirects (run ./mikoshi-whatsapp.sh test-auth).\n"
+            "  A server body-size limit can also cause this. Workarounds:\n"
             "    1. Narrow the scope (TUI → Sync → per-chat).\n"
             "    2. Lower MIKOSHI_BATCH_BYTES (default 50MB) to force smaller batches.\n"
             "    3. On jetson, raise maxRequestBodySize on Bun.serve()."
@@ -883,6 +904,11 @@ def main() -> int:
     if not args.attachments_dir.exists():
         print(f"[ERROR] Attachments dir not found: {args.attachments_dir}", file=sys.stderr)
         return 2
+
+    auth_ok, auth_message = test_auth(url, token)
+    if not auth_ok:
+        print(auth_message, file=sys.stderr)
+        return 1
 
     manifest = json.loads(args.manifest.read_text())
     if manifest.get("schema_version") != "1.2":

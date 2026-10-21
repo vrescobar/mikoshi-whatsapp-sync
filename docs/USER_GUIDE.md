@@ -33,6 +33,14 @@ both sources doesn't double-count messages.
    `MIKOSHI_CLIENT_ID`, `KEEP_LOCAL_EXPORTS`,
    `MIKOSHI_PRESERVE_EXTRACTED=true`.
 
+   Use the **direct HTTPS base URL**, not an HTTP address that redirects.
+   A 301/302 redirect can turn a POST into a GET or close the connection
+   during a large upload (`Broken pipe`). The client checks authentication
+   before uploading and refuses redirects rather than forwarding your token.
+   If `test-auth` reports a redirect, set `MIKOSHI_URL` to the destination
+   base URL (omit `/api/ingest/v1/...`). The macOS app's Config tab edits
+   this same file, so the correction applies to CLI, manual and scheduled syncs.
+
 3. **Validate.** Run `./mikoshi-whatsapp.sh test-auth` — should print
    "OK — <url> accepts this token (cursor endpoint reachable)."
 

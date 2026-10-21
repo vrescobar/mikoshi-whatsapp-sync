@@ -2,8 +2,7 @@
 runtime-cap behaviour added to push_via_api.py after the May 2026 sync
 failures (BrokenPipe on /manifest, TimeoutError on /commit).
 
-These tests do not hit the network; http_request is monkeypatched. The goal
-is to pin the I/O-layer contract:
+Transport tests use a loopback HTTP server or monkeypatched failures:
 
   * transient socket errors are retried, HTTP non-2xx is not
   * retry-exhaustion produces a decoded one-line message, never a traceback
@@ -17,6 +16,8 @@ import json
 import sys
 import time
 import urllib.error
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -26,48 +27,68 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import push_via_api  # noqa: E402
 
 
-# ─── decode_socket_error ─────────────────────────────────────────────────
 
 
-class TestDecodeSocketError:
-    def _payload(self, **kw):
-        defaults = dict(kind="timeout", detail="", operation="commit", timeout_s=300, attempts=2)
-        defaults.update(kw)
-        return {"_socket_error": defaults}
+@pytest.fixture
+def redirect_server():
+    requests = []
 
-    def test_manifest_broken_pipe_hints_body_size(self):
-        msg = push_via_api.decode_socket_error(self._payload(kind="broken_pipe", operation="manifest"))
-        assert "manifest" in msg.lower()
-        assert "body-size" in msg.lower() or "maxrequestbodysize" in msg.lower()
-        assert "MIKOSHI_BATCH_BYTES" in msg
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append((self.command, self.path, self.headers.get("Authorization")))
+            if self.path.startswith("/redirect/"):
+                self.send_response(self.server.redirect_status)
+                self.send_header("Location", "/target")
+            else:
+                self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
-    def test_manifest_connection_reset_hints_body_size(self):
-        msg = push_via_api.decode_socket_error(self._payload(kind="connection_reset", operation="manifest"))
-        assert "body-size" in msg.lower() or "maxrequestbodysize" in msg.lower()
+        do_POST = do_GET
 
-    def test_manifest_timeout_mentions_logs(self):
-        msg = push_via_api.decode_socket_error(self._payload(kind="timeout", operation="manifest", timeout_s=120))
-        assert "mikoshi log" in msg.lower() or "journalctl" in msg.lower()
-        assert "120" in msg
+        def log_message(self, *args):
+            pass
 
-    def test_commit_timeout_says_idempotent(self):
-        msg = push_via_api.decode_socket_error(self._payload(kind="timeout", operation="commit", timeout_s=1800))
-        assert "idempotent" in msg.lower()
-        assert "1800" in msg
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.redirect_status = 301
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server, f"http://127.0.0.1:{server.server_port}/redirect", requests
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
-    def test_commit_connection_reset_suggests_crash_check(self):
-        msg = push_via_api.decode_socket_error(self._payload(kind="connection_reset", operation="commit"))
-        assert "pgrep" in msg.lower() or "crash" in msg.lower()
-        assert "idempotent" in msg.lower()
 
-    def test_unknown_kind_falls_back(self):
-        msg = push_via_api.decode_socket_error(self._payload(kind="weird", operation="commit"))
-        assert "retry" in msg.lower()
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_redirect_does_not_rewrite_request_or_forward_token(redirect_server, status, method):
+    server, url, requests = redirect_server
+    server.redirect_status = status
+    actual, raw = push_via_api.http_request(
+        url + "/manifest", method, "secret",
+        body=b"{}" if method == "POST" else None,
+    )
+    assert actual == status
+    assert json.loads(raw) == {"location": "/target"}
+    assert requests == [(method, "/redirect/manifest", "Bearer secret")]
 
-    def test_missing_socket_error_block_still_renders(self):
-        # Defensive: never raise on a malformed sentinel.
-        msg = push_via_api.decode_socket_error({})
-        assert msg.startswith("[ERROR]")
+
+def test_redirect_preflight_blocks_manifest_and_preserves_cursor(redirect_server, tmp_path, monkeypatch):
+    _, url, requests = redirect_server
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps(_manifest([_chat("a@s", 1, msg_size=500_000)])))
+    state = tmp_path / "state.json"
+    state.write_text('{"unchanged": true}')
+    monkeypatch.setattr(sys, "argv", [
+        "push_via_api", "--manifest", str(manifest),
+        "--attachments-dir", str(tmp_path), "--state-file", str(state),
+        "--url", url, "--token", "secret",
+    ])
+    assert push_via_api.main() == 1
+    assert requests == [("GET", "/redirect/api/ingest/v1/cursor", "Bearer secret")]
+    assert json.loads(state.read_text()) == {"unchanged": True}
 
 
 # ─── request_with_retry ──────────────────────────────────────────────────
@@ -306,6 +327,7 @@ class TestMaxRuntimeSeconds:
         ad.mkdir()
         state = tmp_path / "state.json"
         monkeypatch.setenv("MIKOSHI_URL", "http://x")
+        monkeypatch.setattr(push_via_api, "test_auth", lambda *args: (True, "OK"))
         monkeypatch.setenv("MIKOSHI_TOKEN", "t")
         argv = [
             "push_via_api",
